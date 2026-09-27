@@ -25,7 +25,7 @@ start = Math.max(0, Math.min(start, total - dur));
 
 const gif = outPath(`${slug}.gif`);
 // Grain and gradients are what make GIFs heavy: scale with area averaging and
-// denoise first, then trade dither, frame rate, palette and length for size.
+// a light spatial denoise (no temporal pass: it ghosts on hard cuts) first, then trade dither, frame rate, palette and length for size.
 const tries = [
   { fps: 15, colors: 256, dither: 'bayer:bayer_scale=3' },
   { fps: 12, colors: 256, dither: 'bayer:bayer_scale=2' },
@@ -38,7 +38,7 @@ const tries = [
 ];
 for (const t of tries) {
   const d = Math.min(dur, t.dur ?? dur);
-  const vf = `fps=${t.fps},scale=960:-1:flags=area,hqdn3d=8:8:12:12,split[a][b];` +
+  const vf = `fps=${t.fps},scale=960:-1:flags=area,hqdn3d=4:4:0:0,split[a][b];` +
     `[a]palettegen=max_colors=${t.colors}:stats_mode=diff[p];[b][p]paletteuse=dither=${t.dither}:diff_mode=rectangle`;
   const r = await run('ffmpeg', ['-y', '-loglevel', 'error', '-ss', String(start), '-t', String(d), '-i', mp4, '-an', '-filter_complex', vf, '-loop', '0', gif]);
   if (r.code !== 0) fail(`ffmpeg: ${r.stderr}`);

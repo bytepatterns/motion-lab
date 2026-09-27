@@ -1,0 +1,659 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BytePatterns Launch Film — motion-lab</title>
+<style>
+  /* Player chrome. The piece itself lives entirely in the canvas. */
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  body { display: grid; place-items: center; font: 500 15px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #fff; }
+  canvas { display: block; width: min(100vw, calc(100vh * 16 / 9)); height: auto; aspect-ratio: 16 / 9; }
+  #sound { position: fixed; left: 16px; bottom: 16px; padding: 8px 14px; border: 1px solid rgba(255,255,255,.35); border-radius: 999px;
+           background: rgba(0,0,0,.55); color: #fff; font: inherit; cursor: pointer; }
+  #sound[hidden] { display: none; }
+</style>
+</head>
+<body>
+<canvas id="stage" width="1920" height="1080" aria-label="A 24-second launch film for BytePatterns, 300 free animated lessons"></canvas>
+<button id="sound" type="button">Click for sound</button>
+<script>
+'use strict';
+/* ==========================================================================
+   BYTEPATTERNS LAUNCH FILM — 24 s, 100 BPM (one beat = 18 frames, bar = 72).
+   0    "Stop reading."  a paragraph turns into bars, the bars sort themselves
+   108  wordmark         the sorted bars become the underline of "BytePatterns"
+   216  product          lesson card, animation card, quiz card slide in and play
+   468  proof            300 tiles light up as the counter reaches 300
+   612  end card         tagline + bytepatterns.com
+   Every claim is true of the live site: 300 lessons, 29 modules, free, no account.
+   ========================================================================== */
+const W = 1920, H = 1080, FPS = 30, FRAMES = 720, BEAT = 18, BAR = 72;
+const cv = document.getElementById('stage');
+const ctx = cv.getContext('2d');
+const FONT = 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
+const MONO = 'ui-monospace, "Cascadia Code", Consolas, Menlo, monospace';
+
+// Brand tokens (dark theme) — the only colours in this piece.
+const BP = {
+  canvas: '#0B0D10', surface: '#12161B', surfaceRaised: '#1B222A', border: '#2B333D',
+  text1: '#F7FAFC', text2: '#C7D0D9', text3: '#9AA7B4', text4: '#7B8896',
+  primary: '#FF6B4A', primaryInk: '#1A0E0A', secondary: '#B69CFF', secondaryInk: '#160F2D',
+};
+const rgba = (hex, a) => { const n = parseInt(hex.slice(1), 16); return `rgba(${n >> 16 & 255},${n >> 8 & 255},${n & 255},${a})`; };
+
+// ---- helpers -------------------------------------------------------------
+function mulberry32(a) { return function () { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a);
+  t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const lerp = (a, b, t) => a + (b - a) * t;
+const prog = (f, a, b) => clamp((f - a) / (b - a));
+const E = {
+  outCubic: t => 1 - Math.pow(1 - t, 3),
+  inCubic: t => t * t * t,
+  inOutCubic: t => t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2,
+  outExpo: t => t === 1 ? 1 : 1 - Math.pow(2, -10 * t),
+  inExpo: t => t === 0 ? 0 : Math.pow(2, 10 * t - 10),
+  inOutExpo: t => t === 0 ? 0 : t === 1 ? 1 : t < .5 ? Math.pow(2, 20 * t - 10) / 2 : (2 - Math.pow(2, -20 * t + 10)) / 2,
+  outBack: t => 1 + 1.70158 * 1.2 * Math.pow(t - 1, 3) + 1.70158 * 1.2 * Math.pow(t - 1, 2) - 0.0 * t,
+};
+function font(size, weight = 800, fam = FONT) { ctx.font = `${weight} ${size}px ${fam}`; }
+function resetCtx() {
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
+  ctx.filter = 'none'; ctx.shadowBlur = 0; ctx.shadowColor = 'transparent'; ctx.shadowOffsetY = 0;
+  ctx.letterSpacing = '0px'; ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic'; ctx.lineCap = 'butt';
+}
+function wrap(text, maxW) {
+  const words = text.split(' '), lines = []; let line = '';
+  for (const w of words) { const t = line ? line + ' ' + w : w; if (ctx.measureText(t).width > maxW && line) { lines.push(line); line = w; } else line = t; }
+  if (line) lines.push(line);
+  return lines;
+}
+function rr(x, y, w, h, r) { ctx.beginPath(); ctx.roundRect(x, y, w, h, r); }
+
+// ---- background ----------------------------------------------------------
+function background(f) {
+  ctx.fillStyle = BP.canvas; ctx.fillRect(0, 0, W, H);
+  // two slow brand glows
+  const gx = W * 0.25 + Math.sin(f / 90) * 120, gy = H * 0.3;
+  let g = ctx.createRadialGradient(gx, gy, 0, gx, gy, 900);
+  g.addColorStop(0, rgba(BP.secondary, 0.07)); g.addColorStop(1, rgba(BP.secondary, 0));
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  const hx = W * 0.8 + Math.cos(f / 110) * 100, hy = H * 0.8;
+  g = ctx.createRadialGradient(hx, hy, 0, hx, hy, 800);
+  g.addColorStop(0, rgba(BP.primary, 0.06)); g.addColorStop(1, rgba(BP.primary, 0));
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  // dot grid
+  ctx.fillStyle = rgba(BP.border, 0.55);
+  for (let y = 30; y < H; y += 60) for (let x = 30; x < W; x += 60) ctx.fillRect(x - 1, y - 1, 2, 2);
+}
+
+// ---- wordmark ------------------------------------------------------------
+const WORD = 'BytePatterns';
+function wordmark(x, y, size, alpha = 1, rise = null) {
+  font(size, 800); ctx.letterSpacing = (-size * 0.025) + 'px'; ctx.textBaseline = 'alphabetic';
+  ctx.fillStyle = BP.text1;
+  if (!rise) { ctx.globalAlpha = alpha; ctx.fillText(WORD, x, y); ctx.globalAlpha = 1; ctx.letterSpacing = '0px'; return; }
+  let cx = x;
+  for (let i = 0; i < WORD.length; i++) {
+    const ch = WORD[i], t = rise(i);
+    const w = ctx.measureText(ch).width + (-size * 0.025);
+    if (t > 0) {
+      ctx.save(); ctx.beginPath(); ctx.rect(cx - 20, y - size * 1.1, w + 40, size * 1.35); ctx.clip();
+      ctx.globalAlpha = alpha; ctx.fillText(ch, cx, y + (1 - t) * size * 1.1); ctx.restore();
+    }
+    cx += w;
+  }
+  ctx.letterSpacing = '0px';
+}
+function wordmarkWidth(size) { font(size, 800); ctx.letterSpacing = (-size * 0.025) + 'px'; const w = ctx.measureText(WORD).width; ctx.letterSpacing = '0px'; return w; }
+
+// ---- 0  stop reading -----------------------------------------------------
+const PARA = 'Bubble sort steps through the list again and again. On every pass it compares each pair of neighbours and swaps them ' +
+  'when they are out of order, so the largest remaining value drifts to the end, one position per comparison. After the first ' +
+  'pass the last element is in its final place; after the second pass, the last two are. The algorithm stops when a full pass ' +
+  'makes no swaps. In the worst case a list of n elements needs about n²/2 comparisons, which is why the method is taught far ' +
+  'more often than it is used. Reading this takes longer than watching it happen.';
+const PARA_X = 300, PARA_Y = 380, PARA_LH = 66, PARA_W = 1320;
+let paraLines = null;
+function paragraph() {
+  if (!paraLines) { font(40, 400); paraLines = wrap(PARA, PARA_W); }   // pure: depends only on the font
+  return paraLines;
+}
+function barOrder(n) {                     // a seeded shuffle of target widths
+  const r = mulberry32(42), a = Array.from({ length: n }, (_, i) => i);
+  for (let i = n - 1; i > 0; i--) { const j = Math.floor(r() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; }
+  return a;                                 // a[line] = rank (0 = shortest)
+}
+function sceneRead(f) {
+  const lines = paragraph(), n = lines.length, rank = barOrder(n);
+  const toBar = E.inOutCubic(prog(f, 34, 54));
+  const out = E.inExpo(prog(f, 100, 116));
+  // text lines -> bars -> sorted bars
+  for (let i = 0; i < n; i++) {
+    const y0 = PARA_Y + i * PARA_LH;
+    font(40, 400);
+    const lw = ctx.measureText(lines[i]).width;
+    const targetW = 220 + (rank[i] / (n - 1)) * (PARA_W - 220);
+    const sortT = E.outExpo(prog(f, 62 + rank[i] * 2.4, 80 + rank[i] * 2.4));
+    const y = lerp(y0, PARA_Y + rank[i] * PARA_LH, sortT);
+    // text, dissolving
+    if (toBar < 1) {
+      ctx.globalAlpha = (1 - toBar) * (0.85 + 0.15 * prog(f, 0, 10));
+      ctx.fillStyle = BP.text4; ctx.textBaseline = 'middle'; ctx.fillText(lines[i], PARA_X, y0 + (f < 34 ? -f * 0.4 : -13.6));
+      ctx.globalAlpha = 1;
+    }
+    if (toBar > 0) {
+      const bw = lerp(lw, targetW, toBar), bh = lerp(6, 34, toBar);
+      const moving = sortT > 0 && sortT < 0.98;
+      let col = BP.text4;
+      if (f >= 62) col = moving ? BP.primary : sortT >= 0.98 ? BP.secondary : BP.text4;
+      // collapse into the wordmark underline
+      const cy = lerp(y, 596, out), cx = lerp(PARA_X, W / 2 - 330, out), cw = lerp(bw, 660, out), ch = lerp(bh, 8, out);
+      ctx.globalAlpha = toBar;
+      ctx.fillStyle = out > 0 ? BP.primary : col;
+      rr(cx, cy - ch / 2, cw, ch, ch / 2); ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+  }
+  // headline: "Stop reading." -> "Start seeing."
+  const hy = 230;
+  const swap = E.inOutExpo(prog(f, 52, 66));
+  font(120, 800); ctx.letterSpacing = '-3px'; ctx.textBaseline = 'middle';
+  ctx.save(); ctx.beginPath(); ctx.rect(0, hy - 90, W, 180); ctx.clip();
+  const enter = E.outExpo(prog(f, 0, 16));
+  ctx.globalAlpha = lerp(0.35, 1, enter) * (1 - swap);
+  ctx.fillStyle = BP.text1; ctx.fillText('Stop reading.', PARA_X, hy + (1 - enter) * 40 - swap * 180);
+  const strike = E.outExpo(prog(f, 40, 52));
+  if (strike > 0 && swap < 1) {
+    const sw = ctx.measureText('Stop reading.').width;
+    ctx.fillStyle = BP.primary; ctx.fillRect(PARA_X - 10, hy + 4 - swap * 180, (sw + 20) * strike, 10);
+  }
+  ctx.globalAlpha = 1 - out;
+  ctx.fillStyle = BP.primary; ctx.fillText('Start seeing.', PARA_X, hy + 180 - swap * 180 - out * 120);
+  ctx.restore(); ctx.letterSpacing = '0px'; ctx.globalAlpha = 1;
+}
+
+// ---- 108  wordmark -------------------------------------------------------
+function sceneWordmark(f) {
+  const l = f - 108;
+  const shrink = E.inOutCubic(prog(f, 188, 214));
+  const big = 180, small = 40;
+  const size = lerp(big, small, shrink);
+  const wBig = wordmarkWidth(big);
+  const x = lerp(W / 2 - wBig / 2, 96, shrink), y = lerp(560, 88, shrink);
+  const riseT = (i) => E.outExpo(prog(l, 4 + i * 1.6, 20 + i * 1.6));
+  wordmark(x, y, size, 1, shrink > 0 ? null : riseT);
+  // underline (the sorted bars, collapsed)
+  const ul = 1 - E.inCubic(prog(f, 170, 190));
+  if (ul > 0) {
+    const uw = lerp(660, wBig, E.outExpo(prog(l, 0, 20))) * ul;
+    ctx.fillStyle = BP.primary; rr(W / 2 - uw / 2, 592, uw, 8, 4); ctx.fill();
+  }
+  // subline
+  const sub = E.outCubic(prog(l, 26, 44)) * (1 - E.inCubic(prog(f, 176, 192)));
+  if (sub > 0) {
+    font(44, 500); ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillStyle = BP.text2; ctx.globalAlpha = sub;
+    ctx.fillText('Algorithms, data structures and system design — animated.', W / 2, 700 + (1 - sub) * 20);
+    ctx.globalAlpha = 1; ctx.textAlign = 'left';
+  }
+}
+function header(f, alpha) {
+  if (alpha <= 0) return;
+  wordmark(96, 88, 40, alpha);
+  font(28, 600); ctx.textAlign = 'right'; ctx.textBaseline = 'alphabetic'; ctx.fillStyle = BP.text3; ctx.globalAlpha = alpha;
+  ctx.fillText('bytepatterns.com', W - 96, 86); ctx.globalAlpha = 1; ctx.textAlign = 'left';
+}
+
+// ---- 216  product cards --------------------------------------------------
+const CARD_W = 540, CARD_H = 620, CARD_Y = 290, GAP = 48;
+const CARD_X = (W - (3 * CARD_W + 2 * GAP)) / 2;
+function cardShell(k, f, draw) {
+  const start = 222 + k * 30;
+  const t = E.outExpo(prog(f, start, start + 26));
+  const leave = E.inExpo(prog(f, 440 + k * 4, 462 + k * 4));
+  if (t <= 0 || leave >= 1) return;
+  const x = CARD_X + k * (CARD_W + GAP), y = CARD_Y + (1 - t) * 760 - leave * 900;
+  const float = Math.sin((f - start) / 26 + k) * 5;
+  ctx.save();
+  ctx.translate(x + CARD_W / 2, y + CARD_H / 2 + float);
+  ctx.rotate((1 - t) * (k - 1) * 0.12 + leave * (k - 1) * -0.06);
+  ctx.translate(-CARD_W / 2, -CARD_H / 2);
+  ctx.shadowColor = 'rgba(0,0,0,0.55)'; ctx.shadowBlur = 60; ctx.shadowOffsetY = 24;
+  ctx.fillStyle = BP.surface; rr(0, 0, CARD_W, CARD_H, 28); ctx.fill();
+  ctx.shadowColor = 'transparent'; ctx.shadowBlur = 0; ctx.shadowOffsetY = 0;
+  ctx.strokeStyle = BP.border; ctx.lineWidth = 2; rr(1, 1, CARD_W - 2, CARD_H - 2, 27); ctx.stroke();
+  draw(f - start);
+  ctx.restore();
+}
+function eyebrow(text, y, col = BP.text3) {
+  font(22, 700); ctx.letterSpacing = '3px'; ctx.fillStyle = col; ctx.textBaseline = 'alphabetic'; ctx.fillText(text, 40, y); ctx.letterSpacing = '0px';
+}
+function title(text, y) { font(52, 800); ctx.letterSpacing = '-1px'; ctx.fillStyle = BP.text1; ctx.fillText(text, 40, y); ctx.letterSpacing = '0px'; }
+function pill(x, y, w, h, fill, stroke) { rr(x, y, w, h, h / 2); if (fill) { ctx.fillStyle = fill; ctx.fill(); } if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = 2; ctx.stroke(); } }
+
+// card 1 — a lesson, with bubble sort running in it
+const BS = (() => {
+  const a = [5, 2, 7, 1, 6, 3, 8, 4], steps = [];
+  let pos = a.map((_, i) => i);          // pos[slot] = bar id
+  const vals = a.slice();
+  const n = a.length;
+  for (let p = 0; p < n - 1; p++) for (let j = 0; j < n - 1 - p; j++) {
+    const sw = vals[pos[j]] > vals[pos[j + 1]];
+    steps.push({ order: pos.slice(), j, swap: sw, locked: n - p });
+    if (sw) [pos[j], pos[j + 1]] = [pos[j + 1], pos[j]];
+  }
+  return { vals, steps, final: pos.slice() };
+})();
+const BS_START = 34, BS_STEP = 4.2;
+function lessonCard(l) {
+  eyebrow('SORTING · LESSON 2', 64);
+  title('Bubble Sort', 128);
+  font(26, 500); ctx.fillStyle = BP.text3; ctx.fillText('4 min  ·  animated  ·  quiz', 40, 172);
+  // stage
+  ctx.fillStyle = BP.canvas; rr(40, 206, CARD_W - 80, 250, 18); ctx.fill();
+  const s = Math.floor((l - BS_START) / BS_STEP), lt = ((l - BS_START) % BS_STEP) / BS_STEP;
+  const done = s >= BS.steps.length;
+  const st = l < BS_START ? { order: BS.steps[0].order, j: -1, swap: false, locked: 99 } : done ? null : BS.steps[s];
+  const order = done ? BS.final : st.order;
+  const n = order.length, bw = 42, gap = (CARD_W - 80 - 40 - n * bw) / (n - 1);
+  const slotX = (k) => 60 + k * (bw + gap);
+  for (let k = 0; k < n; k++) {
+    const id = order[k];
+    let x = slotX(k), lift = 0;
+    const active = !done && st.j >= 0 && (k === st.j || k === st.j + 1);
+    if (active && st.swap) {
+      const e = E.inOutCubic(clamp(lt * 1.4));
+      x = lerp(slotX(k), slotX(k === st.j ? st.j + 1 : st.j), e);
+      lift = Math.sin(e * Math.PI) * (k === st.j ? -18 : 18);
+    }
+    const h = 26 * BS.vals[id];
+    const locked = done || k >= st.locked;
+    ctx.fillStyle = active ? BP.primary : locked ? BP.secondary : BP.text4;
+    rr(x, 436 - h + lift, bw, h, 8); ctx.fill();
+  }
+  // progress + button
+  const p = clamp((l - BS_START) / (BS.steps.length * BS_STEP));
+  pill(40, 490, CARD_W - 80, 10, BP.surfaceRaised); if (p > 0) pill(40, 490, (CARD_W - 80) * p, 10, BP.primary);
+  font(24, 600); ctx.fillStyle = BP.text3; ctx.fillText(done ? 'Sorted in 7 passes' : `Comparisons: ${Math.max(0, Math.min(BS.steps.length, s + 1))}`, 40, 540);
+  pill(CARD_W - 40 - 200, 522, 200, 60, BP.primary);
+  font(26, 700); ctx.fillStyle = BP.primaryInk; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText('Continue →', CARD_W - 140, 553); ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+}
+
+// card 2 — an animation: binary search, step by step
+const BIN = [3, 8, 12, 19, 23, 31, 40, 47, 56], TARGET = 47;
+const BIN_STEPS = (() => { const s = []; let lo = 0, hi = BIN.length - 1;
+  while (lo <= hi) { const mid = (lo + hi) >> 1; s.push({ lo, hi, mid }); if (BIN[mid] === TARGET) break; if (BIN[mid] < TARGET) lo = mid + 1; else hi = mid - 1; }
+  return s; })();
+function animationCard(l) {
+  eyebrow('SEARCHING · ANIMATION', 64);
+  title('Binary Search', 128);
+  font(26, 500); ctx.fillStyle = BP.text3; ctx.fillText(`Find ${TARGET} in a sorted array`, 40, 172);
+  const k = clamp(Math.floor((l - 30) / 26), -1, BIN_STEPS.length - 1);
+  const found = l >= 30 + BIN_STEPS.length * 26 - 6;
+  const st = k >= 0 ? BIN_STEPS[k] : { lo: 0, hi: BIN.length - 1, mid: -1 };
+  const cw = 48, cg = 4, x0 = 40 + (CARD_W - 80 - (BIN.length * cw + (BIN.length - 1) * cg)) / 2, cy = 250;
+  for (let i = 0; i < BIN.length; i++) {
+    const x = x0 + i * (cw + cg);
+    const inRange = i >= st.lo && i <= st.hi;
+    const isMid = i === st.mid;
+    const hit = found && isMid;
+    ctx.globalAlpha = inRange ? 1 : 0.28;
+    ctx.fillStyle = hit ? BP.secondary : isMid ? BP.primary : BP.surfaceRaised;
+    rr(x, cy, cw, 64, 10); ctx.fill();
+    if (!isMid) { ctx.strokeStyle = BP.border; ctx.lineWidth = 2; rr(x + 1, cy + 1, cw - 2, 62, 9); ctx.stroke(); }
+    font(26, 700, MONO); ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillStyle = hit ? BP.secondaryInk : isMid ? BP.primaryInk : BP.text1;
+    ctx.fillText(String(BIN[i]), x + cw / 2, cy + 33);
+    ctx.globalAlpha = 1;
+  }
+  // pointers
+  const pt = (i, label, col, row) => {
+    const x = x0 + i * (cw + cg) + cw / 2;
+    ctx.fillStyle = col; ctx.beginPath(); ctx.moveTo(x, cy + 76); ctx.lineTo(x - 9, cy + 90); ctx.lineTo(x + 9, cy + 90); ctx.fill();
+    font(24, 700, MONO); ctx.textAlign = 'center'; ctx.textBaseline = 'top'; ctx.fillText(label, x, cy + 96 + row * 30);
+  };
+  if (k >= 0) {
+    pt(st.lo, 'lo', BP.text2, 0); pt(st.hi, 'hi', BP.text2, st.hi === st.lo ? 1 : 0);
+    pt(st.mid, 'mid', found ? BP.secondary : BP.primary, st.mid === st.lo || st.mid === st.hi ? 1 : 0);
+  }
+  ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+  // caption
+  font(28, 600); ctx.fillStyle = found ? BP.secondary : BP.text2;
+  const cap = k < 0 ? 'lo = 0, hi = 8' : found ? `Found ${TARGET} in ${BIN_STEPS.length} steps` :
+    `${BIN[st.mid]} ${BIN[st.mid] < TARGET ? '<' : '>'} ${TARGET}: drop the ${BIN[st.mid] < TARGET ? 'left' : 'right'} half`;
+  ctx.fillText(cap, 40, 440);
+  // player controls
+  const p = clamp(l / (30 + BIN_STEPS.length * 26));
+  ctx.fillStyle = BP.surfaceRaised; ctx.beginPath(); ctx.arc(70, 540, 30, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = BP.text1;
+  if (found) { ctx.fillRect(60, 527, 7, 26); ctx.fillRect(74, 527, 7, 26); }
+  else { ctx.beginPath(); ctx.moveTo(62, 524); ctx.lineTo(86, 540); ctx.lineTo(62, 556); ctx.fill(); }
+  pill(120, 535, CARD_W - 160 - 90, 10, BP.surfaceRaised); pill(120, 535, (CARD_W - 250) * p, 10, BP.primary);
+  ctx.fillStyle = BP.text1; ctx.beginPath(); ctx.arc(120 + (CARD_W - 250) * p, 540, 12, 0, Math.PI * 2); ctx.fill();
+  font(24, 600, MONO); ctx.fillStyle = BP.text3; ctx.textAlign = 'right'; ctx.fillText(`${Math.max(0, k + 1)}/${BIN_STEPS.length}`, CARD_W - 40, 549);
+  ctx.textAlign = 'left';
+}
+
+// card 3 — a quiz question, answered
+const QUIZ_CLICK = 120;
+function quizCard(l) {
+  eyebrow('QUICK CHECK · 1 OF 3', 64, BP.secondary);
+  font(36, 700); ctx.fillStyle = BP.text1;
+  const q = wrap('Binary search on 1,000,000 sorted items. At most how many steps?', CARD_W - 80);
+  q.forEach((line, i) => ctx.fillText(line, 40, 124 + i * 46));
+  const opts = ['1,000', '20', '500,000'];
+  const answered = l >= QUIZ_CLICK;
+  const oy = (i) => 124 + q.length * 46 + 30 + i * 86;
+  opts.forEach((o, i) => {
+    const right = i === 1, y = oy(i);
+    const sel = answered && right;
+    const e = sel ? E.outBack(prog(l, QUIZ_CLICK, QUIZ_CLICK + 12)) : 0;
+    ctx.save(); ctx.translate(CARD_W / 2, y + 34); ctx.scale(1 + 0.03 * Math.sin(e * Math.PI), 1 + 0.03 * Math.sin(e * Math.PI)); ctx.translate(-CARD_W / 2, -(y + 34));
+    rr(40, y, CARD_W - 80, 68, 16);
+    ctx.fillStyle = sel ? rgba(BP.secondary, 0.16) : BP.surfaceRaised; ctx.fill();
+    ctx.strokeStyle = sel ? BP.secondary : BP.border; ctx.lineWidth = sel ? 3 : 2; ctx.stroke();
+    font(30, 700, MONO); ctx.fillStyle = sel ? BP.secondary : BP.text1; ctx.textBaseline = 'middle';
+    ctx.fillText(o, 70, y + 35);
+    if (sel) {                                           // check mark, drawn on
+      const c = prog(l, QUIZ_CLICK + 2, QUIZ_CLICK + 12);
+      ctx.strokeStyle = BP.secondary; ctx.lineWidth = 6; ctx.lineCap = 'round'; ctx.beginPath();
+      const px = CARD_W - 90, py = y + 35;
+      ctx.moveTo(px - 16, py); ctx.lineTo(px - 16 + 12 * clamp(c * 2), py + 12 * clamp(c * 2));
+      if (c > 0.5) ctx.lineTo(px - 4 + 22 * clamp(c * 2 - 1), py + 12 - 26 * clamp(c * 2 - 1));
+      ctx.stroke(); ctx.lineCap = 'butt';
+    }
+    ctx.restore(); ctx.textBaseline = 'alphabetic';
+  });
+  const fb = E.outCubic(prog(l, QUIZ_CLICK + 6, QUIZ_CLICK + 18));
+  if (fb > 0) {
+    font(28, 600); ctx.fillStyle = BP.secondary; ctx.globalAlpha = fb;
+    ctx.fillText('Correct — log₂ 1,000,000 ≈ 20', 40, oy(3) + 40);
+    ctx.globalAlpha = 1;
+  }
+  // the pointer that answers
+  const m = E.inOutCubic(prog(l, QUIZ_CLICK - 30, QUIZ_CLICK - 4));
+  const px = lerp(CARD_W + 60, 250, m), py = lerp(CARD_H + 60, oy(1) + 44, m);
+  const press = answered ? 1 - prog(l, QUIZ_CLICK, QUIZ_CLICK + 4) * 0.12 : 1;
+  if (m > 0) {
+    if (answered) { const r = prog(l, QUIZ_CLICK, QUIZ_CLICK + 14); ctx.strokeStyle = rgba(BP.secondary, 1 - r); ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(px, py, 10 + 40 * r, 0, Math.PI * 2); ctx.stroke(); }
+    ctx.save(); ctx.translate(px, py); ctx.scale(press, press);
+    ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(0, 38); ctx.lineTo(10, 29); ctx.lineTo(18, 46); ctx.lineTo(25, 43); ctx.lineTo(17, 26); ctx.lineTo(30, 26); ctx.closePath();
+    ctx.fillStyle = BP.text1; ctx.fill(); ctx.strokeStyle = BP.canvas; ctx.lineWidth = 2; ctx.stroke(); ctx.restore();
+  }
+}
+function sceneProduct(f) {
+  header(f, 1);
+  const h = E.outExpo(prog(f, 214, 234)) * (1 - E.inCubic(prog(f, 436, 452)));
+  if (h > 0) {
+    font(60, 800); ctx.letterSpacing = '-1.5px'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.globalAlpha = h; ctx.fillStyle = BP.text1;
+    ctx.fillText('Every lesson is an animation you can play.', W / 2, 200 + (1 - h) * 24);
+    ctx.globalAlpha = 1; ctx.letterSpacing = '0px'; ctx.textAlign = 'left';
+  }
+  cardShell(0, f, lessonCard);
+  cardShell(1, f, animationCard);
+  cardShell(2, f, quizCard);
+}
+
+// ---- 468  proof: 300 ----------------------------------------------------
+const COLS = 20, ROWS = 15, TILE = 26, TGAP = 8;
+function sceneProof(f) {
+  header(f, 1);
+  const l = f - 468;
+  const count = Math.round(300 * E.inOutCubic(prog(l, 10, 76)));
+  const enter = E.outExpo(prog(l, 0, 20));
+  const leave = E.inExpo(prog(f, 596, 614));
+  ctx.save(); ctx.translate(0, leave * -60); ctx.globalAlpha = 1 - leave;
+  // number
+  font(300, 800); ctx.letterSpacing = '-10px'; ctx.textBaseline = 'alphabetic'; ctx.fillStyle = BP.primary;
+  ctx.save(); ctx.beginPath(); ctx.rect(0, 250, 1000, 330); ctx.clip();
+  ctx.fillText(String(count), 150, 540 + (1 - enter) * 300); ctx.restore();
+  ctx.letterSpacing = '-1.5px';
+  const t2 = E.outExpo(prog(l, 8, 28));
+  font(76, 800); ctx.fillStyle = BP.text1; ctx.globalAlpha = (1 - leave) * t2;
+  ctx.fillText('free animated lessons', 150 + (1 - t2) * 40, 660);
+  ctx.letterSpacing = '0px';
+  const t3 = E.outExpo(prog(l, 40, 60));
+  font(38, 600); ctx.fillStyle = BP.text2; ctx.globalAlpha = (1 - leave) * t3;
+  ctx.fillText('29 modules  ·  no account needed', 150 + (1 - t3) * 40, 740);
+  ctx.globalAlpha = 1 - leave;
+  // tiles
+  const gx = 1100, gy = 290;
+  for (let i = 0; i < 300; i++) {
+    const c = i % COLS, r = Math.floor(i / COLS);
+    const x = gx + c * (TILE + TGAP), y = gy + r * (TILE + TGAP);
+    const appear = E.outCubic(prog(l, 2 + (c + r) * 0.5, 14 + (c + r) * 0.5));
+    if (appear <= 0) continue;
+    const lit = i < count;
+    const fresh = lit && i >= count - 24 && l < 78;
+    const s = TILE * (0.6 + 0.4 * appear);
+    ctx.globalAlpha = (1 - leave) * appear;
+    if (lit) { ctx.fillStyle = fresh ? BP.primary : BP.secondary; rr(x + (TILE - s) / 2, y + (TILE - s) / 2, s, s, 6); ctx.fill(); }
+    else { ctx.strokeStyle = BP.border; ctx.lineWidth = 2; rr(x + 1 + (TILE - s) / 2, y + 1 + (TILE - s) / 2, s - 2, s - 2, 6); ctx.stroke(); }
+  }
+  ctx.restore(); ctx.globalAlpha = 1;
+}
+
+// ---- 612  end card -------------------------------------------------------
+function sceneEnd(f) {
+  const l = f - 612;
+  const fadeOut = 1 - 0.75 * E.inOutCubic(prog(f, 700, 719));
+  const size = 150, ww = wordmarkWidth(size);
+  wordmark(W / 2 - ww / 2, 470, size, fadeOut, (i) => E.outExpo(prog(l, 2 + i * 1.2, 18 + i * 1.2)));
+  const t = E.outExpo(prog(l, 18, 36));
+  font(60, 700); ctx.letterSpacing = '-1px'; ctx.textBaseline = 'middle';
+  const a = 'Stop reading. ', b = 'Start seeing.';
+  const wa = ctx.measureText(a).width, wb = ctx.measureText(b).width, x0 = W / 2 - (wa + wb) / 2;
+  ctx.globalAlpha = t * fadeOut; ctx.fillStyle = BP.text2; ctx.fillText(a, x0, 590 + (1 - t) * 20);
+  ctx.fillStyle = BP.primary; ctx.fillText(b, x0 + wa, 590 + (1 - t) * 20);
+  ctx.letterSpacing = '0px';
+  const u = E.outBack(prog(l, 34, 50));
+  if (u > 0) {
+    font(44, 700); const tw = ctx.measureText('bytepatterns.com').width;
+    const pw = tw + 110, ph = 84, px = W / 2 - pw / 2, py = 690;
+    ctx.save(); ctx.translate(W / 2, py + ph / 2); ctx.scale(u, u); ctx.translate(-W / 2, -(py + ph / 2));
+    ctx.globalAlpha = fadeOut;
+    pill(px, py, pw, ph, BP.surfaceRaised, BP.border);
+    ctx.fillStyle = BP.primary; ctx.beginPath(); ctx.arc(px + 44, py + ph / 2, 9, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = BP.text1; ctx.textBaseline = 'middle'; ctx.fillText('bytepatterns.com', px + 72, py + ph / 2 + 2);
+    ctx.restore();
+  }
+  const s = E.outCubic(prog(l, 46, 62));
+  font(30, 500); ctx.textAlign = 'center'; ctx.fillStyle = BP.text3; ctx.globalAlpha = s * fadeOut;
+  ctx.fillText('300 animated lessons  ·  free  ·  no account', W / 2, 840);
+  ctx.globalAlpha = 1; ctx.textAlign = 'left';
+}
+
+// ---- frame ---------------------------------------------------------------
+function draw(f) {
+  resetCtx();
+  background(f);
+  if (f < 116) sceneRead(f);
+  if (f >= 108 && f < 216) sceneWordmark(f);
+  if (f >= 214 && f < 470) sceneProduct(f);
+  else if (f >= 470 && f < 614) sceneProof(f);
+  if (f >= 612) sceneEnd(f);
+  resetCtx();
+}
+
+// ---- sound ---------------------------------------------------------------
+async function renderAudio() {
+  const SR = 48000, LEN = Math.round(SR * FRAMES / FPS);
+  const ac = new OfflineAudioContext(2, LEN, SR);
+  const T = (fr) => fr / FPS;
+  const rng = mulberry32(300);
+  const noise = ac.createBuffer(2, SR * 2, SR);
+  for (let c = 0; c < 2; c++) { const d = noise.getChannelData(c); for (let i = 0; i < d.length; i++) d[i] = rng() * 2 - 1; }
+  const comp = ac.createDynamicsCompressor();
+  comp.threshold.value = -18; comp.knee.value = 10; comp.ratio.value = 3; comp.attack.value = 0.005; comp.release.value = 0.2;
+  const master = ac.createGain(); master.gain.value = 0.8;
+  comp.connect(master).connect(ac.destination);
+  const bus = ac.createGain(); bus.connect(comp);
+  const verb = ac.createConvolver(), ir = ac.createBuffer(2, SR * 2.8, SR);
+  for (let c = 0; c < 2; c++) { const d = ir.getChannelData(c); for (let i = 0; i < d.length; i++) d[i] = (rng() * 2 - 1) * Math.pow(1 - i / d.length, 3.5); }
+  verb.buffer = ir;
+  const wet = ac.createGain(); wet.gain.value = 0.28; verb.connect(wet).connect(comp);
+  const send = ac.createGain(); send.connect(verb);
+  const out = (node, pan = 0, rev = 0) => {
+    const p = ac.createStereoPanner(); p.pan.value = pan; node.connect(p).connect(bus);
+    if (rev > 0) { const s = ac.createGain(); s.gain.value = rev; node.connect(s).connect(send); }
+  };
+  const noiseSrc = (at, dur) => { const s = ac.createBufferSource(); s.buffer = noise; s.loop = true; s.start(at, (at * 5.1) % 1.5, dur + 0.05); return s; };
+  const env = (g, at, a, peak, d) => { g.gain.setValueAtTime(0.0001, at); g.gain.linearRampToValueAtTime(peak, at + a); g.gain.exponentialRampToValueAtTime(0.0001, at + a + d); };
+
+  function pad(at, dur, freqs, v = 1) {
+    const lp = ac.createBiquadFilter(), g = ac.createGain();
+    lp.type = 'lowpass'; lp.frequency.setValueAtTime(700, at); lp.frequency.linearRampToValueAtTime(1500, at + dur / 2); lp.frequency.linearRampToValueAtTime(800, at + dur);
+    g.gain.setValueAtTime(0.0001, at); g.gain.linearRampToValueAtTime(0.022 * v, at + 0.8); g.gain.setValueAtTime(0.022 * v, at + dur - 0.6); g.gain.linearRampToValueAtTime(0.0001, at + dur + 0.4);
+    lp.connect(g); out(g, 0, 0.6);
+    freqs.forEach((fq, i) => { for (const dt of [-7, 7]) {
+      const o = ac.createOscillator(); o.type = 'sawtooth'; o.frequency.value = fq; o.detune.value = dt + i;
+      o.connect(lp); o.start(at); o.stop(at + dur + 0.5);
+    } });
+  }
+  function kick(at, v = 1) {
+    const o = ac.createOscillator(), g = ac.createGain();
+    o.frequency.setValueAtTime(120, at); o.frequency.exponentialRampToValueAtTime(45, at + 0.1);
+    env(g, at, 0.004, 0.7 * v, 0.35); o.connect(g); out(g); o.start(at); o.stop(at + 0.4);
+  }
+  function hat(at, v = 1, pan = 0.3) {
+    const n = noiseSrc(at, 0.06), hp = ac.createBiquadFilter(), g = ac.createGain();
+    hp.type = 'highpass'; hp.frequency.value = 8000; env(g, at, 0.002, 0.12 * v, 0.04);
+    n.connect(hp).connect(g); out(g, pan);
+  }
+  function clap(at, v = 1) {
+    const n = noiseSrc(at, 0.2), bp = ac.createBiquadFilter(), g = ac.createGain();
+    bp.type = 'bandpass'; bp.frequency.value = 1500; bp.Q.value = 1; env(g, at, 0.003, 0.3 * v, 0.16);
+    n.connect(bp).connect(g); out(g, 0, 0.5);
+  }
+  function bass(at, freq, dur, v = 1) {
+    const o = ac.createOscillator(), g = ac.createGain(), lp = ac.createBiquadFilter();
+    o.type = 'triangle'; o.frequency.value = freq; lp.type = 'lowpass'; lp.frequency.value = 600;
+    env(g, at, 0.01, 0.34 * v, dur); o.connect(lp).connect(g); out(g); o.start(at); o.stop(at + dur + 0.05);
+  }
+  function blip(at, freq, v = 1, pan = 0, len = 0.16) {
+    const o = ac.createOscillator(), o2 = ac.createOscillator(), g = ac.createGain();
+    o.type = 'sine'; o2.type = 'sine'; o.frequency.value = freq; o2.frequency.value = freq * 2.01;
+    const g2 = ac.createGain(); g2.gain.value = 0.25;
+    env(g, at, 0.003, 0.09 * v, len); o.connect(g); o2.connect(g2).connect(g); out(g, pan, 0.35);
+    o.start(at); o2.start(at); o.stop(at + len + 0.05); o2.stop(at + len + 0.05);
+  }
+  function bell(at, freq, v = 1, pan = 0) {                   // FM bell for the logo moments
+    const car = ac.createOscillator(), mod = ac.createOscillator(), mg = ac.createGain(), g = ac.createGain();
+    car.frequency.value = freq; mod.frequency.value = freq * 3.5;
+    mg.gain.setValueAtTime(freq * 2.2, at); mg.gain.exponentialRampToValueAtTime(freq * 0.05, at + 1.6);
+    mod.connect(mg).connect(car.frequency);
+    env(g, at, 0.004, 0.12 * v, 2.2); car.connect(g); out(g, pan, 0.6);
+    car.start(at); mod.start(at); car.stop(at + 2.4); mod.stop(at + 2.4);
+  }
+  function whoosh(at, dur, f0, f1, v = 1, p0 = -0.5, p1 = 0.5) {
+    const n = noiseSrc(at, dur), bp = ac.createBiquadFilter(), g = ac.createGain(), p = ac.createStereoPanner();
+    bp.type = 'bandpass'; bp.Q.value = 1.2; bp.frequency.setValueAtTime(f0, at); bp.frequency.exponentialRampToValueAtTime(f1, at + dur);
+    g.gain.setValueAtTime(0.0001, at); g.gain.exponentialRampToValueAtTime(0.3 * v, at + dur * 0.75); g.gain.exponentialRampToValueAtTime(0.0001, at + dur);
+    p.pan.setValueAtTime(p0, at); p.pan.linearRampToValueAtTime(p1, at + dur);
+    n.connect(bp).connect(g).connect(p).connect(bus);
+  }
+  function thock(at, v = 1, pan = 0) {                        // a card landing
+    const o = ac.createOscillator(), g = ac.createGain();
+    o.frequency.setValueAtTime(220, at); o.frequency.exponentialRampToValueAtTime(90, at + 0.08);
+    env(g, at, 0.002, 0.35 * v, 0.12); o.connect(g); out(g, pan, 0.2); o.start(at); o.stop(at + 0.16);
+  }
+  function tick(at, freq, v = 1) {
+    const n = noiseSrc(at, 0.02), bp = ac.createBiquadFilter(), g = ac.createGain();
+    bp.type = 'bandpass'; bp.frequency.value = freq; bp.Q.value = 6; env(g, at, 0.001, 0.35 * v, 0.02);
+    n.connect(bp).connect(g); out(g, 0.15);
+  }
+
+  // D minor world: F  Am  Dm  Bb (two bars each), pads throughout
+  const prog4 = [[174.61, 220, 261.63, 329.63], [220, 261.63, 329.63, 392], [146.83, 220, 261.63, 349.23], [116.54, 233.08, 293.66, 349.23]];
+  const roots = [87.31, 110, 73.42, 58.27];
+  for (let b = 0; b < 10; b += 2) pad(T(b * BAR), T(2 * BAR), prog4[(b / 2) % 4], b === 0 ? 0.8 : 1);
+  // groove from the product scene to the end card
+  for (let fr = 216; fr < 612; fr += BEAT) {
+    const inBar = (fr % BAR) / BEAT, chord = Math.floor(fr / (2 * BAR)) % 4;
+    kick(T(fr), inBar === 0 ? 1 : 0.8);
+    if (fr >= 324 && (inBar === 1 || inBar === 3)) clap(T(fr), 0.8);
+    hat(T(fr + 9), 1, 0.3); if (fr >= 468) { hat(T(fr + 4.5), 0.5, -0.3); hat(T(fr + 13.5), 0.5, -0.3); }
+    if (inBar === 0 || inBar === 2) bass(T(fr), roots[chord], 0.5);
+  }
+  // 0: the paragraph becomes bars, the bars land in order
+  whoosh(T(30), T(24), 300, 3000, 0.9);
+  whoosh(T(48), T(18), 2000, 500, 0.6, 0.5, -0.5);
+  const pent = [293.66, 349.23, 392, 440, 523.25, 587.33, 698.46, 783.99, 880, 1046.5, 1174.66];
+  { const n = paragraph().length; for (let r = 0; r < n; r++) blip(T(64 + r * 2.4), pent[Math.min(r, pent.length - 1)], 0.8, (r / n - 0.5)); }
+  // 108: wordmark
+  whoosh(T(96), T(16), 400, 6000, 1);
+  bell(T(112), 587.33, 1, -0.2); bell(T(114), 880, 0.7, 0.2);
+  for (let i = 0; i < 12; i++) tick(T(112 + i * 1.6), 2400 + i * 120, 0.5);
+  whoosh(T(186), T(28), 5000, 400, 0.7);
+  // 216: cards land; their animations make their own small sounds
+  for (let k = 0; k < 3; k++) { whoosh(T(214 + k * 30), T(14), 600, 4000, 0.8, (k - 1) * 0.6, (k - 1) * 0.6); thock(T(230 + k * 30), 0.9, (k - 1) * 0.5); }
+  BS.steps.forEach((s, i) => { const at = 222 + BS_START + i * BS_STEP; if (at < 440) blip(T(at), s.swap ? 659.25 : 440, s.swap ? 0.55 : 0.3, -0.5, 0.08); });
+  BIN_STEPS.forEach((s, i) => blip(T(252 + 30 + i * 26), 523.25 * Math.pow(2, i / 4), 0.8, 0));
+  blip(T(252 + 30 + BIN_STEPS.length * 26 - 6), 1046.5, 0.8, 0);
+  tick(T(282 + QUIZ_CLICK), 3000, 1.2);
+  blip(T(282 + QUIZ_CLICK + 2), 698.46, 1, 0.5); blip(T(282 + QUIZ_CLICK + 6), 1046.5, 1, 0.5, 0.4);
+  whoosh(T(436), T(26), 3000, 300, 0.9);
+  // 468: the count to 300
+  for (let fr = 478; fr < 544; fr += 2) {
+    const c = E.inOutCubic(prog(fr, 478, 544));
+    tick(T(fr), 1800 + c * 2400, 0.35 + 0.3 * c);
+  }
+  blip(T(544), 880, 1.1, 0); blip(T(546), 1318.51, 0.8, 0.3, 0.5);
+  // 612: end card
+  whoosh(T(594), T(20), 300, 5000, 0.9);
+  bell(T(614), 349.23, 1.2, -0.2); bell(T(614), 523.25, 0.9, 0.2); bell(T(650), 698.46, 0.6, 0);
+  pad(T(612), T(108), [174.61, 261.63, 329.63, 440], 1.1);
+  return ac.startRendering();
+}
+
+window.__motion = {
+  title: 'BytePatterns Launch Film',
+  description: 'A 24-second launch film: a paragraph turns into sorted bars, product cards play their own lessons, and 300 tiles light up.',
+  fps: FPS, width: W, height: H, frames: FRAMES,
+  poster: 425,
+  gifStart: 0,
+  seek(i) { draw(Math.max(0, Math.min(FRAMES - 1, Math.floor(i)))); },
+  audio: renderAudio,
+};
+
+/* ==========================================================================
+   PLAYER — identical in every piece; keep as is.
+   Autoplays and loops, starts sound on the first click, ?frame=N pauses on a
+   frame. When the renderer sets window.__MOTION_RENDER__ it stays out of the way.
+   ========================================================================== */
+(function player() {
+  const M = window.__motion, btn = document.getElementById('sound');
+  const dur = M.frames / M.fps;
+  if (window.__MOTION_RENDER__) { btn.hidden = true; M.seek(0); return; }
+  const q = new URLSearchParams(location.search);
+  if (q.has('frame')) { btn.hidden = true; M.seek(+q.get('frame') || 0); return; }
+  let t0 = performance.now(), ac = null, src = null, buf = null, paused = false, pausedAt = 0;
+  const clock = () => ac && src ? (ac.currentTime - t0) : (performance.now() - t0) / 1000;
+  function loop() {
+    if (!paused) M.seek(Math.floor(((clock() % dur) + dur) % dur * M.fps));
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+  btn.addEventListener('click', async () => {
+    if (src) { src.stop(); src = null; btn.textContent = 'Click for sound'; t0 = performance.now(); return; }
+    btn.textContent = 'Loading sound…';
+    ac = ac || new AudioContext({ sampleRate: 48000 });
+    buf = buf || await M.audio();
+    await ac.resume();
+    src = ac.createBufferSource(); src.buffer = buf; src.loop = true; src.connect(ac.destination);
+    t0 = ac.currentTime + 0.05; src.start(t0);        // picture restarts from frame 0 in sync with the sound
+    btn.textContent = 'Sound on — click to mute';
+  });
+  addEventListener('keydown', e => {
+    if (e.code !== 'Space') return;
+    e.preventDefault(); paused = !paused;
+    if (ac) paused ? ac.suspend() : ac.resume();
+    if (!ac) { if (paused) pausedAt = performance.now(); else t0 += performance.now() - pausedAt; }
+  });
+})();
+</script>
+</body>
+</html>

@@ -9,6 +9,78 @@ No timeline editor, no stock footage, no samples, no fonts to download. Each pie
 Click a preview to open the piece live in your browser (click once more there for sound).
 
 <!-- gallery:start -->
+<table>
+<tr>
+<td width="50%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/01-showreel/"><img src="out/01-showreel.gif" width="100%" alt="Motion Showreel — animated preview"></a>
+<br><b>01 · Motion Showreel</b> <sub>18 s</sub>
+<br>Eighteen seconds of kinetic type, shape morphs, a dive through a letter and a tunnel warp, cut to a synthesized 120 BPM beat.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/01-showreel/">open in browser</a> · <a href="out/01-showreel.png">still</a> · <a href="projects/01-showreel/index.html">source</a></sub>
+</td>
+<td width="50%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/02-product-launch/"><img src="out/02-product-launch.gif" width="100%" alt="BytePatterns Launch Film — animated preview"></a>
+<br><b>02 · BytePatterns Launch Film</b> <sub>24 s</sub>
+<br>A 24-second launch film: a paragraph turns into sorted bars, product cards play their own lessons, and 300 tiles light up.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/02-product-launch/">open in browser</a> · <a href="out/02-product-launch.png">still</a> · <a href="projects/02-product-launch/index.html">source</a></sub>
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/03-history-of-sorting/"><img src="out/03-history-of-sorting.gif" width="100%" alt="A Short History of Sorting — animated preview"></a>
+<br><b>03 · A Short History of Sorting</b> <sub>30 s</sub>
+<br>Merge sort, Shellsort, quicksort, heapsort and Timsort, 1945 to 2002, each one running for real on a row of bars.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/03-history-of-sorting/">open in browser</a> · <a href="out/03-history-of-sorting.png">still</a> · <a href="projects/03-history-of-sorting/index.html">source</a></sub>
+</td>
+<td width="50%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/04-fourier-epicycles/"><img src="out/04-fourier-epicycles.gif" width="100%" alt="Fourier Epicycles — animated preview"></a>
+<br><b>04 · Fourier Epicycles</b> <sub>20 s</sub>
+<br>Spinning circles add up to a square wave as the series grows from 1 to 31 terms, and you hear the same sum.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/04-fourier-epicycles/">open in browser</a> · <a href="out/04-fourier-epicycles.png">still</a> · <a href="projects/04-fourier-epicycles/index.html">source</a></sub>
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/05-double-pendulum/"><img src="out/05-double-pendulum.gif" width="100%" alt="Same Start, Different Fate — animated preview"></a>
+<br><b>05 · Same Start, Different Fate</b> <sub>24 s</sub>
+<br>Three double pendulums released 0.001 rad apart move as one, then split apart around the twelve-second mark.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/05-double-pendulum/">open in browser</a> · <a href="out/05-double-pendulum.png">still</a> · <a href="projects/05-double-pendulum/index.html">source</a></sub>
+</td>
+<td width="50%" valign="top">
+<em>not rendered yet</em>
+<br><b>06 · Murmuration</b> <sub>24 s</sub>
+<br>2,400 starlings follow three local rules at dusk, dodge a hawk and draw a letter in the sky.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/06-murmuration/">open in browser</a> · <a href="projects/06-murmuration/index.html">source</a></sub>
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top">
+<em>not rendered yet</em>
+<br><b>07 · Raymarch City</b> <sub>20 s</sub>
+<br>A camera flight through a neon city that exists only as a distance function in one fragment shader.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/07-raymarch-city/">open in browser</a> · <a href="projects/07-raymarch-city/index.html">source</a></sub>
+</td>
+<td width="50%" valign="top">
+<em>not rendered yet</em>
+<br><b>08 · Neon Breakout</b> <sub>20 s</sub>
+<br>A neon Breakout level that plays itself: deterministic physics, multi-ball, a fire-ball and every brick cleared.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/08-neon-breakout/">open in browser</a> · <a href="projects/08-neon-breakout/index.html">source</a></sub>
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top">
+<em>not rendered yet</em>
+<br><b>09 · Sorting Race</b> <sub>28 s</sub>
+<br>Eight sorting algorithms sort the same 64 numbers side by side, paced by their real comparison counts.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/09-sorting-race/">open in browser</a> · <a href="projects/09-sorting-race/index.html">source</a></sub>
+</td>
+<td width="50%" valign="top">
+<em>not rendered yet</em>
+<br><b>10 · Signal</b> <sub>20 s</sub>
+<br>A documentary title sequence: one trace, a pulse that keeps quickening, then silence and the title.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/10-title-sequence/">open in browser</a> · <a href="projects/10-title-sequence/index.html">source</a></sub>
+</td>
+</tr>
+</table>
 <!-- gallery:end -->
 
 ## Quick start
