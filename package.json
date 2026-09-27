@@ -1,0 +1,28 @@
+{
+  "name": "motion-lab",
+  "version": "1.0.0",
+  "description": "Motion graphics drawn entirely in code — one HTML file per piece, every frame deterministic, sound synthesized in the same file.",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "author": "teambytepatterns",
+  "repository": "github:bytepatterns/motion-lab",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "render": "node tools/render.mjs",
+    "still": "node tools/still.mjs",
+    "gif": "node tools/gif.mjs",
+    "verify": "node tools/verify.mjs",
+    "readme": "node tools/build-readme.mjs",
+    "all": "node tools/all.mjs",
+    "postinstall": "playwright install chromium"
+  },
+  "devDependencies": {
+    "playwright": "1.62.1"
+  },
+  "motionLab": {
+    "pagesBase": "https://bytepatterns.github.io/motion-lab/"
+  }
+}
