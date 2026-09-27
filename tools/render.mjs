@@ -1,6 +1,6 @@
-// node tools/render.mjs <NN-slug> [--workers 4] [--keep-frames] [--range 0:90]
+// node tools/render.mjs <NN-slug> [--variant vertical] [--workers 4] [--keep-frames] [--range 0:90]
 //
-// Opens the piece headless at 1920x1080 (deviceScaleFactor 1), calls seek(i)
+// Opens the piece headless (deviceScaleFactor 1), calls seek(i)
 // for every frame, captures canvas.toDataURL('image/png') and pipes the PNGs
 // straight into ffmpeg (h264, yuv420p, crf 18). The soundtrack from audio() is
 // written as a 48 kHz stereo WAV and muxed in. Output: out/NN-slug.mp4
@@ -9,21 +9,25 @@
 //                 is pure in i, so frames can be drawn out of order
 // --keep-frames   also write every PNG to out/frames/NN-slug/
 // --range a:b     render only frames a..b-1 (quick previews; still full audio)
+// --variant name  render __motion.variants.<name> instead (e.g. vertical, 1080x1920)
+//                 -> out/NN-slug.<name>.mp4
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import {
-  resolveSlug, parseArgs, launch, openPiece, grabFrame, grabAudio, writeWav, outPath, checkTools, fmtBytes, fmtTime, log, fail,
+  resolveSlug, parseArgs, launch, openPiece, grabFrame, grabAudio, writeWav, outPath, outName, specOf, checkTools, fmtBytes, fmtTime, log, fail,
 } from './lib.mjs';
 
 const { pos, flags } = parseArgs();
 const slug = resolveSlug(pos[0]);
+const variant = typeof flags.variant === 'string' ? flags.variant : null;
+specOf(variant);
 await checkTools();
 
 const t0 = Date.now();
 const browser = await launch();
-const main = await openPiece(browser, slug);
+const main = await openPiece(browser, slug, { variant });
 const { meta } = main;
 if (!(meta.frames > 0) || !(meta.fps > 0)) fail(`${slug}: __motion.frames / fps missing`);
 if (main.errors.length) log(`warning: page errors: ${main.errors.join(' | ')}`);
@@ -35,10 +39,10 @@ if (flags.range) {
 }
 const total = to - from;
 const workers = Math.max(1, Math.min(total, Number(flags.workers) || Math.min(4, Math.max(1, Math.floor(os.cpus().length / 2)))));
-log(`${slug}: "${meta.title}" — ${meta.frames} frames @ ${meta.fps} fps (${(meta.frames / meta.fps).toFixed(2)} s), rendering ${from}..${to - 1} with ${workers} worker(s)`);
+log(`${slug}${variant ? ' [' + variant + ']' : ''}: "${meta.title}" — ${meta.width}x${meta.height}, ${meta.frames} frames @ ${meta.fps} fps (${(meta.frames / meta.fps).toFixed(2)} s), rendering ${from}..${to - 1} with ${workers} worker(s)`);
 
 // ---- audio --------------------------------------------------------------
-const framesDir = outPath('frames', slug, '.keep');
+const framesDir = outPath('frames', slug + (variant ? '.' + variant : ''), '.keep');
 fs.rmSync(path.dirname(framesDir), { recursive: true, force: true });
 fs.mkdirSync(path.dirname(framesDir), { recursive: true });
 const wav = path.join(path.dirname(framesDir), 'audio.wav');
@@ -52,7 +56,7 @@ if (meta.hasAudio) {
 } else log('warning: no __motion.audio() — rendering a silent video');
 
 // ---- ffmpeg -------------------------------------------------------------
-const mp4 = outPath(`${slug}${flags.range ? '.preview' : ''}.mp4`);
+const mp4 = outPath(outName(slug + (flags.range ? '.preview' : ''), variant, 'mp4'));
 const ffArgs = ['-y', '-loglevel', 'error', '-f', 'image2pipe', '-framerate', String(meta.fps), '-c:v', 'png', '-i', '-'];
 if (hasAudio) ffArgs.push('-ss', String(from / meta.fps), '-i', wav);
 ffArgs.push('-map', '0:v');
@@ -65,7 +69,7 @@ ff.stdin.on('error', () => {});
 
 // ---- frames -------------------------------------------------------------
 const pages = [main.page];
-for (let w = 1; w < workers; w++) pages.push((await openPiece(browser, slug)).page);
+for (let w = 1; w < workers; w++) pages.push((await openPiece(browser, slug, { variant })).page);
 const ready = new Map();
 let nextToTake = from, nextToWrite = from, lastPct = -1;
 let wake = null;

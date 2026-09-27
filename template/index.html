@@ -87,13 +87,20 @@ window.__motion = {
 /* ==========================================================================
    PLAYER — identical in every piece; keep as is.
    Autoplays and loops, starts sound on the first click, ?frame=N pauses on a
-   frame. When the renderer sets window.__MOTION_RENDER__ it stays out of the way.
+   frame, ?variant=vertical plays the vertical cut (if the piece has one).
+   When the renderer sets window.__MOTION_RENDER__ it stays out of the way.
    ========================================================================== */
 (function player() {
-  const M = window.__motion, btn = document.getElementById('sound');
+  const btn = document.getElementById('sound'), q = new URLSearchParams(location.search);
+  let M = window.__motion;
+  const V = !window.__MOTION_RENDER__ && M.variants && M.variants[q.get('variant')];
+  if (V) {                                                // show the variant's own canvas instead
+    M = Object.assign({}, M, V);
+    V.canvas.style.cssText = `width:min(100vw,calc(100vh*${V.width}/${V.height}));height:auto;aspect-ratio:${V.width}/${V.height}`;
+    document.querySelector('canvas').replaceWith(V.canvas);
+  }
   const dur = M.frames / M.fps;
   if (window.__MOTION_RENDER__) { btn.hidden = true; M.seek(0); return; }
-  const q = new URLSearchParams(location.search);
   if (q.has('frame')) { btn.hidden = true; M.seek(+q.get('frame') || 0); return; }
   let t0 = performance.now(), ac = null, src = null, buf = null, paused = false, pausedAt = 0;
   const clock = () => ac && src ? (ac.currentTime - t0) : (performance.now() - t0) / 1000;

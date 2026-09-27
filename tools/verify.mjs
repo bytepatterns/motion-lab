@@ -1,6 +1,7 @@
-// node tools/verify.mjs <NN-slug>
+// node tools/verify.mjs <NN-slug> [--variant vertical]
 //
-// Checks a piece against CONTRACT.md and its render in out/NN-slug.mp4.
+// Checks a piece against CONTRACT.md and its render in out/NN-slug.mp4
+// (with --variant vertical: __motion.variants.vertical and out/NN-slug.vertical.mp4).
 // Exits 1 if any check fails.
 //
 //  file      single file: no external src/href or CSS imports, has a <title>
@@ -10,15 +11,20 @@
 //  audio     2 ch, 48 kHz, frames/fps seconds, not silent, does not clip
 //  mp4       h264 1920x1080 yuv420p, duration = frames/fps +-0.1 s, audio stream present
 //  luma      every frame of the mp4: not near-black, not a flat colour
+//  safe      vertical only: on the sampled frames no content pixel (luma > 70,
+//            3 in a row) lies outside the platform-safe area x 60..900, y 230..1400
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import {
-  resolveSlug, parseArgs, launch, openPiece, grabAudio, pieceFile, outPath, run, ffprobe, checkTools, fmtBytes, log,
+  resolveSlug, parseArgs, launch, openPiece, grabAudio, pieceFile, outPath, outName, specOf, run, ffprobe, checkTools, fmtBytes, log,
 } from './lib.mjs';
 
-const { pos } = parseArgs();
+const { pos, flags } = parseArgs();
 const slug = resolveSlug(pos[0]);
+const variant = typeof flags.variant === 'string' ? flags.variant : null;
+const spec = specOf(variant);
+const WH = `${spec.width}x${spec.height}`;
 await checkTools();
 
 const results = [];
@@ -35,11 +41,11 @@ check('file', 'size', true, fmtBytes(Buffer.byteLength(html)));
 
 // ---- page -------------------------------------------------------------
 const browser = await launch();
-const piece = await openPiece(browser, slug, { instrument: true });
+const piece = await openPiece(browser, slug, { instrument: true, variant });
 const { page, meta } = piece;
 check('page', 'no page errors on load', piece.errors.length === 0, piece.errors.slice(0, 2).join(' | '));
-check('page', 'fps 30, 1920x1080', meta.fps === 30 && meta.width === 1920 && meta.height === 1080, `${meta.fps} fps ${meta.width}x${meta.height}`);
-check('page', 'frames 450..900', Number.isInteger(meta.frames) && meta.frames >= 450 && meta.frames <= 900, `${meta.frames} frames = ${(meta.frames / meta.fps).toFixed(2)} s`);
+check('page', `fps 30, ${WH}`, meta.fps === 30 && meta.width === spec.width && meta.height === spec.height, `${meta.fps} fps ${meta.width}x${meta.height}`);
+check('page', `frames ${spec.minFrames}..${spec.maxFrames}`, Number.isInteger(meta.frames) && meta.frames >= spec.minFrames && meta.frames <= spec.maxFrames, `${meta.frames} frames = ${(meta.frames / meta.fps).toFixed(2)} s`);
 check('page', 'title + description', typeof meta.title === 'string' && meta.title.length > 2 && typeof meta.description === 'string' && meta.description.length > 10, meta.title);
 check('page', '<title> matches __motion.title', meta.docTitle.toLowerCase().includes(String(meta.title).toLowerCase()), meta.docTitle);
 check('page', 'audio() defined', meta.hasAudio);
@@ -47,7 +53,7 @@ const canvasInfo = await page.evaluate(() => {
   const c = window.__motion.canvas || document.querySelector('canvas');
   return c ? { w: c.width, h: c.height } : null;
 });
-check('page', 'canvas 1920x1080 backing store', canvasInfo && canvasInfo.w === 1920 && canvasInfo.h === 1080, JSON.stringify(canvasInfo));
+check('page', `canvas ${WH} backing store`, canvasInfo && canvasInfo.w === spec.width && canvasInfo.h === spec.height, JSON.stringify(canvasInfo));
 
 // ---- frames -----------------------------------------------------------
 const N = meta.frames;
@@ -85,6 +91,44 @@ const nondet = stats.out.filter((s) => !s.same);
 check('frames', 'deterministic seek (re-draw out of order)', nondet.length === 0, nondet.map((s) => 'f' + s.i).join(', '));
 check('frames', 'no Math.random / Date.now / performance.now in seek', stats.clock === 0, stats.clock ? `${stats.clock} calls` : '');
 
+// ---- safe area (variants that have one) ---------------------------------
+// The same rule as a full-clip layout check, on the sampled frames: a pixel is
+// content when its luma is above 70 and it ends a run of 3 such pixels in a row.
+if (spec.safe) {
+  const LUMA = 70, RUN = 3;
+  const safe = await page.evaluate(({ frames, S, LUMA, RUN }) => {
+    const M = window.__motion, c = M.canvas;
+    const probe = document.createElement('canvas'); probe.width = c.width; probe.height = c.height;
+    const p = probe.getContext('2d', { willReadFrequently: true });
+    const out = [];
+    for (const i of frames) {
+      M.seek(i);
+      p.clearRect(0, 0, c.width, c.height); p.drawImage(c, 0, 0);
+      const d = p.getImageData(0, 0, c.width, c.height).data, w = c.width, h = c.height;
+      let outside = 0, minX = w, maxX = -1, minY = h, maxY = -1;
+      for (let y = 0; y < h; y++) {
+        let run = 0;
+        for (let x = 0; x < w; x++) {
+          const o = (y * w + x) * 4, L = 0.2126 * d[o] + 0.7152 * d[o + 1] + 0.0722 * d[o + 2];
+          if (L <= LUMA) { run = 0; continue; }
+          if (++run < RUN) continue;
+          const px = x - RUN + 1;
+          if (px < minX) minX = px; if (x > maxX) maxX = x; if (y < minY) minY = y; if (y > maxY) maxY = y;
+          if (px < S.left || x > S.right || y < S.top || y > S.bottom) outside++;
+        }
+      }
+      out.push({ i, outside, minX, maxX, minY, maxY });
+    }
+    return out;
+  }, { frames: sample, S: spec.safe, LUMA, RUN });
+  const S = spec.safe, bad = safe.filter((r) => r.outside > 0);
+  const box = (r) => `f${r.i}: ${r.outside} px outside, content x ${r.minX}..${r.maxX} y ${r.minY}..${r.maxY}`;
+  const all = safe.reduce((a, r) => ({ minX: Math.min(a.minX, r.minX), maxX: Math.max(a.maxX, r.maxX), minY: Math.min(a.minY, r.minY), maxY: Math.max(a.maxY, r.maxY) }),
+    { minX: 1e9, maxX: -1, minY: 1e9, maxY: -1 });
+  check('safe', `content inside x ${S.left}..${S.right}, y ${S.top}..${S.bottom} (${safe.length} frames, luma > ${LUMA})`, bad.length === 0,
+    bad.length ? bad.slice(0, 3).map(box).join(' | ') : `content x ${all.minX}..${all.maxX}, y ${all.minY}..${all.maxY}`);
+}
+
 // ---- audio ------------------------------------------------------------
 if (meta.hasAudio) {
   const a = await grabAudio(page);
@@ -98,15 +142,15 @@ if (meta.hasAudio) {
 await browser.close();
 
 // ---- mp4 --------------------------------------------------------------
-const mp4 = outPath(`${slug}.mp4`);
+const mp4 = outPath(outName(slug, variant, 'mp4'));
 if (!fs.existsSync(mp4)) {
-  check('mp4', 'exists', false, `run: node tools/render.mjs ${slug}`);
+  check('mp4', 'exists', false, `run: node tools/render.mjs ${slug}${variant ? ' --variant ' + variant : ''}`);
 } else {
   const pr = await ffprobe(mp4);
   const v = pr.streams.find((s) => s.codec_type === 'video');
   const au = pr.streams.find((s) => s.codec_type === 'audio');
   const dur = Number(pr.format.duration), want = N / meta.fps;
-  check('mp4', 'h264 1920x1080 yuv420p', v && v.codec_name === 'h264' && v.width === 1920 && v.height === 1080 && v.pix_fmt === 'yuv420p',
+  check('mp4', `h264 ${WH} yuv420p`, v && v.codec_name === 'h264' && v.width === spec.width && v.height === spec.height && v.pix_fmt === 'yuv420p',
     v ? `${v.codec_name} ${v.width}x${v.height} ${v.pix_fmt}` : 'no video');
   check('mp4', 'duration = frames/fps (+-0.1 s)', Math.abs(dur - want) <= 0.1, `${dur.toFixed(3)} s vs ${want.toFixed(3)} s, ${v?.nb_frames} frames`);
   check('mp4', 'audio stream present', !!au, au ? `${au.codec_name} ${au.sample_rate} Hz ${au.channels} ch` : 'none');
@@ -119,7 +163,7 @@ if (!fs.existsSync(mp4)) {
   check('mp4', 'size', true, fmtBytes(fs.statSync(mp4).size));
 
   // ---- luma, every frame ----------------------------------------------
-  const w = 160, h = 90, fs_ = w * h;
+  const w = spec.width > spec.height ? 160 : 90, h = spec.width > spec.height ? 90 : 160, fs_ = w * h;
   const raw = await run('ffmpeg', ['-v', 'error', '-i', mp4, '-vf', `scale=${w}:${h}:flags=area,format=gray`, '-f', 'rawvideo', '-'], { raw: true });
   const n = Math.floor(raw.stdout.length / fs_);
   const flat = [], dark = [];
@@ -139,7 +183,7 @@ if (!fs.existsSync(mp4)) {
 
 // ---- report -----------------------------------------------------------
 let failed = 0;
-log(`\nverify ${slug} — "${meta.title}"`);
+log(`\nverify ${slug}${variant ? ' [' + variant + ']' : ''} — "${meta.title}"`);
 for (const r of results) {
   if (!r.ok) failed++;
   log(`  ${r.ok ? 'PASS' : 'FAIL'}  ${r.group.padEnd(6)} ${r.name}${r.detail ? `  (${r.detail})` : ''}`);

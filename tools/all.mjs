@@ -1,7 +1,9 @@
-// node tools/all.mjs [NN-slug ...] [--skip-render] [--workers N]
+// node tools/all.mjs [NN-slug ...] [--variant vertical] [--skip-render] [--workers N]
 //
 // For every piece (or the ones named): render -> still -> gif -> verify, then
 // rebuilds the README gallery. Prints a summary and exits 1 if anything failed.
+// --variant vertical does the same for each piece's vertical cut
+// (out/NN-slug.vertical.*); pieces without that variant are reported as FAIL.
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 import { ROOT, listProjects, resolveSlug, parseArgs, log } from './lib.mjs';
@@ -18,10 +20,11 @@ for (const slug of slugs) {
   log(`\n=== ${slug} ===`);
   const row = { slug };
   const w = flags.workers ? ['--workers', String(flags.workers)] : [];
-  row.render = flags['skip-render'] ? 'skip' : (await node('render.mjs', [slug, ...w])) === 0 ? 'ok' : 'FAIL';
-  row.still = (await node('still.mjs', [slug])) === 0 ? 'ok' : 'FAIL';
-  row.gif = row.render === 'FAIL' ? 'skip' : (await node('gif.mjs', [slug])) === 0 ? 'ok' : 'FAIL';
-  row.verify = (await node('verify.mjs', [slug])) === 0 ? 'ok' : 'FAIL';
+  const v = typeof flags.variant === 'string' ? ['--variant', flags.variant] : [];
+  row.render = flags['skip-render'] ? 'skip' : (await node('render.mjs', [slug, ...v, ...w])) === 0 ? 'ok' : 'FAIL';
+  row.still = (await node('still.mjs', [slug, ...v])) === 0 ? 'ok' : 'FAIL';
+  row.gif = row.render === 'FAIL' ? 'skip' : (await node('gif.mjs', [slug, ...v])) === 0 ? 'ok' : 'FAIL';
+  row.verify = (await node('verify.mjs', [slug, ...v])) === 0 ? 'ok' : 'FAIL';
   summary.push(row);
 }
 await node('build-readme.mjs', []);

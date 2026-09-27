@@ -33,7 +33,7 @@
    ========================================================================== */
 const W = 1920, H = 1080, FPS = 30, FRAMES = 600;          // 20 s
 const cv = document.getElementById('stage');
-const ctx = cv.getContext('2d');
+let ctx = cv.getContext('2d');                                   // the vertical cut points it at its own canvas
 const FONT = 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
 
 // ---- helpers -------------------------------------------------------------
@@ -84,9 +84,6 @@ function camAt(t) {
 }
 
 // ---- WebGL -----------------------------------------------------------------
-const gcv = document.createElement('canvas'); gcv.width = W; gcv.height = H;
-const gl = gcv.getContext('webgl2', { preserveDrawingBuffer: true, antialias: false, alpha: false, premultipliedAlpha: false });
-const HALF = !!(gl && gl.getExtension('EXT_color_buffer_float'));
 
 const VS = `#version 300 es
 in vec2 a; out vec2 v_uv;
@@ -308,60 +305,70 @@ void main(){
   o = vec4(col * u_fade, 1.0);
 }`;
 
-function compile(type, src) { const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
-  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s)); return s; }
-function program(fs) { const p = gl.createProgram(); gl.attachShader(p, compile(gl.VERTEX_SHADER, VS)); gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
-  gl.bindAttribLocation(p, 0, 'a'); gl.linkProgram(p); if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
-  const u = {}; const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
-  for (let k = 0; k < n; k++) { const nm = gl.getActiveUniform(p, k).name; u[nm] = gl.getUniformLocation(p, nm); }
-  return { p, u }; }
+// One renderer per output size: the landscape frame, and (only when it is asked
+// for) the vertical cut. Same shaders, same uniforms; only the target size differs.
+function makeCity(w, h) {
+  const gcv = document.createElement('canvas'); gcv.width = w; gcv.height = h;
+  const gl = gcv.getContext('webgl2', { preserveDrawingBuffer: true, antialias: false, alpha: false, premultipliedAlpha: false });
+  const HALF = !!(gl && gl.getExtension('EXT_color_buffer_float'));
+  function compile(type, src) { const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s)); return s; }
+  function program(fs) { const p = gl.createProgram(); gl.attachShader(p, compile(gl.VERTEX_SHADER, VS)); gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+    gl.bindAttribLocation(p, 0, 'a'); gl.linkProgram(p); if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+    const u = {}; const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+    for (let k = 0; k < n; k++) { const nm = gl.getActiveUniform(p, k).name; u[nm] = gl.getUniformLocation(p, nm); }
+    return { p, u }; }
 
-let GLX = null;
-function initGL() {
-  if (GLX || !gl) return GLX;
-  const scene = program(SCENE_FS), post = program(POST_FS);
-  const vb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, vb);
-  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
-  gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
-  const tex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, tex);
-  const levels = Math.floor(Math.log2(Math.max(W, H))) + 1;
-  gl.texStorage2D(gl.TEXTURE_2D, levels, HALF ? gl.RGBA16F : gl.RGBA8, W, H);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-  const fb = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
-  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
-  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-  GLX = { scene, post, tex, fb };
-  return GLX;
-}
+  let GLX = null;
+  function initGL() {
+    if (GLX || !gl) return GLX;
+    const scene = program(SCENE_FS), post = program(POST_FS);
+    const vb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, vb);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+    const tex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, tex);
+    const levels = Math.floor(Math.log2(Math.max(w, h))) + 1;
+    gl.texStorage2D(gl.TEXTURE_2D, levels, HALF ? gl.RGBA16F : gl.RGBA8, w, h);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    const fb = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    GLX = { scene, post, tex, fb };
+    return GLX;
+  }
 
-function renderGL(f) {
-  const X = initGL();
-  const t = f / FPS;
-  const [x, y, z, ly, roll] = camAt(t);
-  const [x2, , z2] = camAt(Math.min(20, t + 0.2));
-  const speed = Math.hypot(x2 - x, z2 - z) / 0.2;                                 // units per second
-  const flash = 0.55 * (1 - E.outCubic(prog(f, 0, 9)));          // hook: a neon flash that clears in 0.3 s
-  const fade = 1 - 0.75 * E.inCubic(prog(f, 585, 599));
-  gl.viewport(0, 0, W, H);
-  gl.bindFramebuffer(gl.FRAMEBUFFER, X.fb);
-  gl.useProgram(X.scene.p);
-  const U = X.scene.u;
-  gl.uniform2f(U.u_res, W, H); gl.uniform1f(U.u_time, t); gl.uniform1i(U.u_steps, 120); gl.uniform1i(U.u_rsteps, 64);
-  gl.uniform3f(U.u_ro, x, y, z); gl.uniform3f(U.u_ta, x * 0.4, y + ly, z + 24);
-  gl.uniform1f(U.u_roll, roll); gl.uniform1f(U.u_kick, kickEnv(t));
-  gl.uniform1f(U.u_fl, lerp(1.55, 1.15, clamp((speed - 12) / 30)));
-  gl.drawArrays(gl.TRIANGLES, 0, 3);
-  gl.bindTexture(gl.TEXTURE_2D, X.tex); gl.generateMipmap(gl.TEXTURE_2D);
-  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-  gl.useProgram(X.post.p);
-  const P = X.post.u;
-  gl.activeTexture(gl.TEXTURE0); gl.uniform1i(P.u_scene, 0);
-  gl.uniform1f(P.u_frame, f); gl.uniform1f(P.u_ca, 0.003 + 0.006 * clamp((speed - 15) / 30) + 0.004 * kickEnv(t));
-  gl.uniform1f(P.u_fade, fade); gl.uniform1f(P.u_flash, flash);
-  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  function renderGL(f) {
+    const X = initGL();
+    const t = f / FPS;
+    const [x, y, z, ly, roll] = camAt(t);
+    const [x2, , z2] = camAt(Math.min(20, t + 0.2));
+    const speed = Math.hypot(x2 - x, z2 - z) / 0.2;                                 // units per second
+    const flash = 0.55 * (1 - E.outCubic(prog(f, 0, 9)));          // hook: a neon flash that clears in 0.3 s
+    const fade = 1 - 0.75 * E.inCubic(prog(f, 585, 599));
+    gl.viewport(0, 0, w, h);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, X.fb);
+    gl.useProgram(X.scene.p);
+    const U = X.scene.u;
+    gl.uniform2f(U.u_res, w, h); gl.uniform1f(U.u_time, t); gl.uniform1i(U.u_steps, 120); gl.uniform1i(U.u_rsteps, 64);
+    gl.uniform3f(U.u_ro, x, y, z); gl.uniform3f(U.u_ta, x * 0.4, y + ly, z + 24);
+    gl.uniform1f(U.u_roll, roll); gl.uniform1f(U.u_kick, kickEnv(t));
+    gl.uniform1f(U.u_fl, lerp(1.55, 1.15, clamp((speed - 12) / 30)));
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    gl.bindTexture(gl.TEXTURE_2D, X.tex); gl.generateMipmap(gl.TEXTURE_2D);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.useProgram(X.post.p);
+    const P = X.post.u;
+    gl.activeTexture(gl.TEXTURE0); gl.uniform1i(P.u_scene, 0);
+    gl.uniform1f(P.u_frame, f); gl.uniform1f(P.u_ca, 0.003 + 0.006 * clamp((speed - 15) / 30) + 0.004 * kickEnv(t));
+    gl.uniform1f(P.u_fade, fade); gl.uniform1f(P.u_flash, flash);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+  }
+  return { canvas: gcv, gl, render: renderGL };
 }
+const CITY = makeCity(W, H), gcv = CITY.canvas, gl = CITY.gl;
+const renderGL = CITY.render;
 
 // ---- type ------------------------------------------------------------------
 function text(str, x, y, size, weight, color, alpha, spacing = 0, align = 'left') {
@@ -560,6 +567,193 @@ async function renderAudio() {
   return buf;
 }
 
+/* ==========================================================================
+   VERTICAL CUT — shared block, identical in every piece.
+   1080x1920 for Reels, Shorts and TikTok (__motion.variants.vertical). The
+   piece's own scene code is re-used and recomposed for a phone: everything a
+   viewer must read stays inside the area no platform covers (x 60..900,
+   y 230..1400); outside it there is only dimmed texture.
+   ========================================================================== */
+const VW = 1080, VH = 1920, SAFE = { x: 60, y: 230, w: 840, h: 1170, r: 900, b: 1400 };
+const vcv = document.createElement('canvas'); vcv.width = VW; vcv.height = VH;
+const vx = vcv.getContext('2d', { willReadFrequently: true });   // CPU raster: identical pixels on every redraw
+const VL = 96, VR = 864;                                          // text column inside the safe area
+
+function vReset() {
+  vx.setTransform(1, 0, 0, 1, 0, 0); vx.globalAlpha = 1; vx.globalCompositeOperation = 'source-over';
+  vx.filter = 'none'; vx.shadowBlur = 0; vx.shadowColor = 'transparent'; vx.letterSpacing = '0px'; vx.setLineDash([]);
+  vx.textAlign = 'left'; vx.textBaseline = 'alphabetic'; vx.lineCap = 'butt'; vx.lineJoin = 'miter';
+}
+/** Canvas text on the vertical frame; `max` shrinks the size until the line fits. */
+function vText(str, x, y, { size = 40, weight = 700, color = '#FFFFFF', align = 'left', spacing = 0, alpha = 1, fam = FONT, max = 0 } = {}) {
+  if (alpha <= 0.002 || !str) return size;
+  vx.font = `${weight} ${size}px ${fam}`; vx.letterSpacing = spacing + 'px';
+  if (max) { const w = vx.measureText(str).width; if (w > max) { size = size * max / w; vx.font = `${weight} ${size}px ${fam}`; } }
+  vx.textAlign = align; vx.textBaseline = 'alphabetic';
+  const a0 = vx.globalAlpha; vx.globalAlpha = a0 * alpha; vx.fillStyle = color;
+  vx.fillText(str, x + (align === 'center' ? spacing / 2 : align === 'right' ? spacing : 0), y);   // tracking is added after the last glyph too
+  vx.globalAlpha = a0; vx.letterSpacing = '0px';
+  return size;
+}
+/** Word-wraps with the given font; returns the lines. */
+function vWrap(str, maxW, size, weight = 700, fam = FONT) {
+  vx.font = `${weight} ${size}px ${fam}`; vx.letterSpacing = '0px';
+  const words = str.split(' '), lines = []; let cur = '';
+  for (const w of words) { const t = cur ? cur + ' ' + w : w; if (vx.measureText(t).width > maxW && cur) { lines.push(cur); cur = w; } else cur = t; }
+  if (cur) lines.push(cur);
+  return lines;
+}
+/** Fade envelope with a small rise: [alpha, dy]. */
+function vEnv(v, a, b, fin = 8, fout = 8) {
+  const i = E.outCubic(prog(v, a, a + fin)), o = 1 - E.inCubic(prog(v, b - fout, b));
+  return [Math.min(i, o), (1 - i) * 22 - (1 - o) * 10];
+}
+/** Which segment of a cut list a vertical frame is in: segs = [{ at, src, len }] in frames. */
+function vSeg(segs, v) {
+  let k = 0; while (k < segs.length - 1 && v >= segs[k + 1].at) k++;
+  const s = segs[k];
+  return { k, s, local: v - s.at, src: s.src + (v - s.at) };
+}
+/** Dims everything outside the safe area to a quiet texture (brightness x 0.2), with a soft inner edge. */
+function vShade(rgb, a = 0.8, feather = 40) {
+  vx.save(); vx.setTransform(1, 0, 0, 1, 0, 0); vx.globalAlpha = 1; vx.globalCompositeOperation = 'source-over';
+  vx.fillStyle = `rgba(${rgb},${a})`;
+  vx.beginPath(); vx.rect(0, 0, VW, VH); vx.rect(SAFE.x, SAFE.y, SAFE.w, SAFE.h); vx.fill('evenodd');
+  const strip = (x0, y0, x1, y1, rx, ry, rw, rh) => {
+    const g = vx.createLinearGradient(x0, y0, x1, y1);
+    g.addColorStop(0, `rgba(${rgb},${a})`); g.addColorStop(1, `rgba(${rgb},0)`);
+    vx.fillStyle = g; vx.fillRect(rx, ry, rw, rh);
+  };
+  strip(SAFE.x, 0, SAFE.x + feather, 0, SAFE.x, SAFE.y, feather, SAFE.h);
+  strip(SAFE.r, 0, SAFE.r - feather, 0, SAFE.r - feather, SAFE.y, feather, SAFE.h);
+  strip(0, SAFE.y, 0, SAFE.y + feather, SAFE.x, SAFE.y, SAFE.w, feather);
+  strip(0, SAFE.b, 0, SAFE.b - feather, SAFE.x, SAFE.b - feather, SAFE.w, feather);
+  vx.restore();
+}
+/** Series tag at the top of the safe area, e.g. MADE IN CODE · 04. */
+function vTag(label, color, alpha = 1) {
+  vText('MADE IN CODE', VL, 292, { size: 28, weight: 800, color, spacing: 5, alpha });
+  vx.font = `800 28px ${FONT}`; vx.letterSpacing = '5px';
+  const w = vx.measureText('MADE IN CODE').width; vx.letterSpacing = '0px';
+  vText('·  ' + label, VL + w + 14, 292, { size: 28, weight: 600, color: 'rgba(255,255,255,0.72)', spacing: 3, alpha, max: VR - VL - w - 14 });
+}
+/** Big hook lines, left-aligned from y0; visible from frame 0, settles in a few frames. */
+function vHook(v, lines, y0, { size = 84, lh = 1.08, color = '#FFFFFF', accent = null, weight = 800, spacing = -1.5, alpha = 1 } = {}) {
+  const k = E.outExpo(prog(v, -6, 12));
+  lines.forEach((ln, i) => {
+    const kk = E.outExpo(prog(v, -12 + i * 2, 8 + i * 2));
+    vText(ln, VL, y0 + i * size * lh + (1 - kk) * 30, { size, weight, spacing, color: accent && i === lines.length - 1 ? accent : color, alpha: alpha * Math.max(0.25, kk), max: VR - VL });
+  });
+  return k;
+}
+/** Closing card, the last 60 frames: piece title, "drawn in code · bytepatterns.com". l = frames into the card. */
+function vEndCard(l, { title, line = '', ink = '#FFFFFF', dim = 'rgba(255,255,255,0.66)', accent = '#FFFFFF', scrim = '0,0,0', a = 0.84 }) {
+  const k = E.outCubic(prog(l, 0, 12));
+  vx.save(); vx.setTransform(1, 0, 0, 1, 0, 0);
+  vx.fillStyle = `rgba(${scrim},${a * k})`; vx.fillRect(0, 0, VW, VH);
+  vx.restore();
+  const t1 = E.outExpo(prog(l, 3, 19)), t2 = E.outExpo(prog(l, 11, 27)), t3 = E.outExpo(prog(l, 19, 35));
+  vx.fillStyle = accent; vx.globalAlpha = t1; vx.fillRect(VL, 742, 88 * t1, 7); vx.globalAlpha = 1;
+  const size = vText(title, VL, 850 + (1 - t1) * 40, { size: 92, weight: 800, color: ink, spacing: -2, alpha: t1, max: VR - VL });
+  const y2 = 850 + Math.max(size, 60) * 0.25 + 70;
+  vx.font = `600 44px ${FONT}`;
+  const lead = 'drawn in code  ·  ', lw = vx.measureText(lead).width;
+  vText(lead, VL, y2 + (1 - t2) * 24, { size: 44, weight: 600, color: dim, alpha: t2 });
+  vText('bytepatterns.com', VL + lw, y2 + (1 - t2) * 24, { size: 44, weight: 800, color: accent, alpha: t2 });
+  if (line) vText(line, VL, y2 + 72 + (1 - t3) * 18, { size: 32, weight: 500, color: dim, alpha: t3, max: VR - VL });
+}
+/** Seeks a cut. The first frame a page draws is drawn twice: the very first read of a
+ *  GPU-backed source canvas can come out a shade different from every later one. */
+let vWarm = false;
+function vSeek(draw, i, frames) {
+  const f = Math.max(0, Math.min(frames - 1, Math.floor(i)));
+  if (!vWarm) { vWarm = true; draw(f); }
+  draw(f);
+}
+/** The soundtrack of a cut: the piece's own audio() spliced to the same segments as the picture. */
+async function vAudio(segs, frames, { xf = 0.025, fadeOut = 0.6, extra = null } = {}) {
+  const src = await renderAudio();
+  const SR = 48000, dur = frames / FPS, ac = new OfflineAudioContext(2, Math.round(SR * dur), SR);
+  const out = ac.createGain(); out.connect(ac.destination);
+  out.gain.setValueAtTime(1, 0); out.gain.setValueAtTime(1, dur - fadeOut); out.gain.linearRampToValueAtTime(0, dur - 0.01);
+  segs.forEach((s, k) => {
+    const at = s.at / FPS, off = s.src / FPS, d = s.len / FPS;
+    const pre = k === 0 ? 0 : Math.min(xf, off), post = k === segs.length - 1 ? 0 : xf;
+    const b = ac.createBufferSource(), g = ac.createGain(); b.buffer = src;
+    g.gain.setValueAtTime(pre ? 0 : 1, at - pre);
+    if (pre) g.gain.linearRampToValueAtTime(1, at + pre);
+    if (post) { g.gain.setValueAtTime(1, at + d - post); g.gain.linearRampToValueAtTime(0, at + d + post); }
+    b.connect(g).connect(out); b.start(at - pre, off - pre, d + pre + post);
+  });
+  if (extra) extra(ac, out);
+  const buf = await ac.startRendering();
+  let peak = 0; for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) peak = Math.max(peak, Math.abs(d[i])); }
+  if (peak > 0.9) for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) d[i] *= 0.9 / peak; }
+  return buf;
+}
+/** A soft three-partial bell, for the closing card. */
+function vChime(ac, dest, at, freq, vol = 0.08) {
+  for (const [mul, v, dec] of [[1, 1, 1.8], [2.01, 0.35, 0.8], [3.02, 0.12, 0.4]]) {
+    const o = ac.createOscillator(), g = ac.createGain(); o.type = 'sine'; o.frequency.value = freq * mul;
+    g.gain.setValueAtTime(0.0001, at); g.gain.exponentialRampToValueAtTime(vol * v, at + 0.006); g.gain.exponentialRampToValueAtTime(0.0001, at + dec);
+    o.connect(g).connect(dest); o.start(at); o.stop(at + dec + 0.05);
+  }
+}
+
+/* VERTICAL CUT — this piece */
+// The same shader rendered at the phone's own size (840 x 1170, the safe area),
+// not cropped from the landscape frame. Cuts sit on bar lines of the 96 BPM
+// track: the first flight, the climb, the drop into the wet streets, the last bar.
+const VSEG = [{ at: 0, src: 0, len: 150 }, { at: 150, src: 225, len: 225 }, { at: 375, src: 525, len: 75 }];
+const VFR = 450, VEND = VFR - 60;
+let VCITY = null;                                          // created on first use: the landscape page never pays for it
+const VLOW = [
+  [76, 148, ['EVERY PIXEL', 'MARCHES A RAY'], 'up to 120 steps through a distance field'],
+  [156, 290, ['ONE BOX,', 'REPEATED'], 'a hash per cell decides height, width and neon'],
+  [300, 380, ['WET STREETS'], 'a second ray bounces off the asphalt'],
+];
+function vScrim(y0, y1, a, up = false) {
+  const g = vx.createLinearGradient(0, y0, 0, y1);
+  g.addColorStop(up ? 1 : 0, 'rgba(6,2,14,0)'); g.addColorStop(up ? 0 : 1, `rgba(6,2,14,${a})`);
+  vx.fillStyle = g; vx.fillRect(SAFE.x, y0, SAFE.w, y1 - y0);
+}
+function vDraw(v) {
+  const { src } = vSeg(VSEG, v), f = Math.min(FRAMES - 1, src);
+  vReset();
+  vx.fillStyle = '#07030d'; vx.fillRect(0, 0, VW, VH);
+  if (gl) {
+    if (!VCITY) VCITY = makeCity(SAFE.w, SAFE.h);
+    VCITY.render(f);
+    vx.save(); vx.beginPath(); vx.roundRect(SAFE.x, SAFE.y, SAFE.w, SAFE.h, 26); vx.clip();
+    vx.drawImage(VCITY.canvas, SAFE.x, SAFE.y);
+    vx.restore();
+  }
+  vShade('7,3,13');
+  vScrim(SAFE.y, 420, 0.65, true);
+  vTag('RAYMARCH CITY', C.cyan);
+  const main = ctx; ctx = vx;
+  try {
+    const k = E.outExpo(prog(v, -12, 8)), o = 1 - E.inCubic(prog(v, 60, 74)), a = Math.min(k, o);
+    if (a > 0) {
+      vScrim(SAFE.y, 760, 0.72 * a, true);
+      glowText('RAYMARCH', VL - 4, 470 + (1 - k) * 30, 112, 900, C.paper, C.magenta, a, 12);
+      glowText('CITY', VL - 4, 588 + (1 - k) * 40, 112, 900, C.cyan, C.magenta, a, 12);
+      vText('one fragment shader · zero polygons', VL, 660, { size: 40, weight: 500, color: C.paper, alpha: a * 0.92, max: VR - VL });
+    }
+    for (const [a0, b0, big, small] of VLOW) {
+      const [al, dy] = vEnv(v, a0, b0, 10, 10);
+      if (al <= 0) continue;
+      vx.globalAlpha = al; vScrim(1020, SAFE.b, 0.72); vx.globalAlpha = 1;
+      const y1 = 1340 - (big.length - 1) * 70;
+      big.forEach((ln, i) => vText(ln, VL, y1 - 58 + i * 70 + dy, { size: 64, weight: 850, color: C.paper, spacing: 3, alpha: al, max: VR - VL }));
+      vText(small, VL + 2, 1360 + dy, { size: 34, weight: 500, color: C.cyan, alpha: al * 0.95, max: VR - VL });
+    }
+  } finally { ctx = main; }
+  if (v >= VEND) vEndCard(v - VEND, { title: 'Raymarch City', line: 'one shader · no meshes · no textures',
+    ink: C.paper, dim: 'rgba(244,241,255,0.7)', accent: C.cyan, scrim: '7,3,13', a: 0.7 });
+  vReset();
+}
+
 window.__motion = {
   title: 'Raymarch City',
   description: 'A camera flight through a neon city that exists only as a distance function in one fragment shader.',
@@ -568,18 +762,33 @@ window.__motion = {
   gifStart: 11,
   seek(i) { draw(Math.max(0, Math.min(FRAMES - 1, Math.floor(i)))); },
   audio: renderAudio,
+  variants: {
+    vertical: {
+      width: VW, height: VH, frames: VFR, canvas: vcv,
+      poster: 250, gifStart: 7,
+      seek(i) { vSeek(vDraw, i, VFR); },
+      audio: () => vAudio(VSEG, VFR, { fadeOut: 0.8 }),
+    },
+  },
 };
 
 /* ==========================================================================
    PLAYER — identical in every piece; keep as is.
    Autoplays and loops, starts sound on the first click, ?frame=N pauses on a
-   frame. When the renderer sets window.__MOTION_RENDER__ it stays out of the way.
+   frame, ?variant=vertical plays the vertical cut (if the piece has one).
+   When the renderer sets window.__MOTION_RENDER__ it stays out of the way.
    ========================================================================== */
 (function player() {
-  const M = window.__motion, btn = document.getElementById('sound');
+  const btn = document.getElementById('sound'), q = new URLSearchParams(location.search);
+  let M = window.__motion;
+  const V = !window.__MOTION_RENDER__ && M.variants && M.variants[q.get('variant')];
+  if (V) {                                                // show the variant's own canvas instead
+    M = Object.assign({}, M, V);
+    V.canvas.style.cssText = `width:min(100vw,calc(100vh*${V.width}/${V.height}));height:auto;aspect-ratio:${V.width}/${V.height}`;
+    document.querySelector('canvas').replaceWith(V.canvas);
+  }
   const dur = M.frames / M.fps;
   if (window.__MOTION_RENDER__) { btn.hidden = true; M.seek(0); return; }
-  const q = new URLSearchParams(location.search);
   if (q.has('frame')) { btn.hidden = true; M.seek(+q.get('frame') || 0); return; }
   let t0 = performance.now(), ac = null, src = null, buf = null, paused = false, pausedAt = 0;
   const clock = () => ac && src ? (ac.currentTime - t0) : (performance.now() - t0) / 1000;

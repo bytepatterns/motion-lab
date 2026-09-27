@@ -36,6 +36,27 @@ export function resolveSlug(arg) {
 export const pieceFile = (slug) => path.join(PROJECTS, slug, 'index.html');
 export const outPath = (...p) => { const f = path.join(OUT, ...p); fs.mkdirSync(path.dirname(f), { recursive: true }); return f; };
 
+/**
+ * What the tools expect from the main piece and from each optional variant
+ * (window.__motion.variants.<name>). A variant's files carry its name:
+ * out/NN-slug.vertical.mp4, .png, .gif.
+ */
+export const SPECS = {
+  main: { width: 1920, height: 1080, minFrames: 450, maxFrames: 900, gifWidth: 960, gifLimit: 3 * 1024 * 1024 },
+  vertical: {
+    width: 1080, height: 1920, minFrames: 360, maxFrames: 600, gifWidth: 540, gifLimit: 2 * 1024 * 1024,
+    // Reels / Shorts / TikTok overlap: everything a viewer must see stays in here
+    safe: { left: 60, right: 900, top: 230, bottom: 1400 },
+  },
+};
+export function specOf(variant) {
+  if (!variant) return SPECS.main;
+  if (!SPECS[variant] || variant === 'main') fail(`unknown variant "${variant}". Known: ${Object.keys(SPECS).filter((k) => k !== 'main').join(', ')}`);
+  return SPECS[variant];
+}
+/** out/ file name for a piece or one of its variants: name('01-showreel', 'vertical', 'mp4') -> 01-showreel.vertical.mp4 */
+export const outName = (slug, variant, ext) => `${slug}${variant ? '.' + variant : ''}.${ext}`;
+
 /** Parses flags like --workers 4 / --keep-frames; everything else is positional. */
 export function parseArgs(argv = process.argv.slice(2)) {
   const pos = [], flags = {};
@@ -63,8 +84,11 @@ export async function launch() {
  * Opens a piece in render mode (the player stays idle) and waits for
  * window.__motion. With { instrument: true } calls to Math.random, Date.now,
  * performance.now and new Date() are counted in window.__clockCalls.
+ * With { variant: 'vertical' } window.__motion is replaced by the piece merged
+ * with __motion.variants.vertical (its own canvas, size, frames, seek, audio),
+ * so every tool below works on the variant unchanged.
  */
-export async function openPiece(browser, slug, { instrument = false } = {}) {
+export async function openPiece(browser, slug, { instrument = false, variant = null } = {}) {
   const context = await browser.newContext({ viewport: { width: 1920, height: 1080 }, deviceScaleFactor: 1 });
   const page = await context.newPage();
   const url = pathToFileURL(pieceFile(slug)).href;
@@ -88,14 +112,28 @@ export async function openPiece(browser, slug, { instrument = false } = {}) {
   await page.goto(url, { waitUntil: 'load' });
   await page.waitForFunction(() => window.__motion && typeof window.__motion.seek === 'function', null, { timeout: 15000 })
     .catch(() => { throw new Error(`${slug}: window.__motion.seek never appeared${errors.length ? ' — ' + errors[0] : ''}`); });
+  const variants = await page.evaluate(() => Object.keys(window.__motion.variants || {}));
+  if (variant) {
+    const problem = await page.evaluate((v) => {
+      const M = window.__motion, V = M.variants && M.variants[v];
+      if (!V) return `no __motion.variants.${v}`;
+      if (typeof V.seek !== 'function') return `__motion.variants.${v}.seek is not a function`;
+      if (!V.canvas || typeof V.canvas.toDataURL !== 'function') return `__motion.variants.${v}.canvas is missing`;
+      window.__motionMain = M;
+      window.__motion = Object.assign({}, M, V, { variant: v, variants: undefined, poster: V.poster, gifStart: V.gifStart });
+      return '';
+    }, variant);
+    if (problem) throw new Error(`${slug}: ${problem}`);
+  }
   const meta = await page.evaluate(() => {
     const M = window.__motion;
     return {
       title: M.title, description: M.description, fps: M.fps, width: M.width, height: M.height,
-      frames: M.frames, poster: M.poster, gifStart: M.gifStart,
+      frames: M.frames, poster: M.poster, gifStart: M.gifStart, variant: M.variant || null,
       hasAudio: typeof M.audio === 'function', docTitle: document.title,
     };
   });
+  meta.variants = variants;
   return { page, context, meta, requests, errors };
 }
 

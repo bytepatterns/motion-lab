@@ -30,7 +30,7 @@
    ========================================================================== */
 const W = 1920, H = 1080, FPS = 30, FRAMES = 720, BEAT = 18, BAR = 72;
 const cv = document.getElementById('stage');
-const ctx = cv.getContext('2d');
+let ctx = cv.getContext('2d');                                   // the vertical cut points it at its own canvas
 const FONT = 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
 const MONO = 'ui-monospace, "Cascadia Code", Consolas, Menlo, monospace';
 
@@ -115,32 +115,34 @@ const PARA = 'Bubble sort steps through the list again and again. On every pass 
   'makes no swaps. In the worst case a list of n elements needs about n²/2 comparisons, which is why the method is taught far ' +
   'more often than it is used. Reading this takes longer than watching it happen.';
 const PARA_X = 300, PARA_Y = 380, PARA_LH = 66, PARA_W = 1320;
-let paraLines = null;
-function paragraph() {
-  if (!paraLines) { font(40, 400); paraLines = wrap(PARA, PARA_W); }   // pure: depends only on the font
-  return paraLines;
+const READ = { x: PARA_X, y: PARA_Y, lh: PARA_LH, w: PARA_W, fs: 40, hy: 230, hs: 120 };   // layout of the opening scene
+const paraCache = {};
+function paragraph(L = READ) {
+  const key = L.w + '/' + L.fs;
+  if (!paraCache[key]) { font(L.fs, 400); paraCache[key] = wrap(PARA, L.w); }   // pure: depends only on the font
+  return paraCache[key];
 }
 function barOrder(n) {                     // a seeded shuffle of target widths
   const r = mulberry32(42), a = Array.from({ length: n }, (_, i) => i);
   for (let i = n - 1; i > 0; i--) { const j = Math.floor(r() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; }
   return a;                                 // a[line] = rank (0 = shortest)
 }
-function sceneRead(f) {
-  const lines = paragraph(), n = lines.length, rank = barOrder(n);
+function sceneRead(f, L = READ) {
+  const lines = paragraph(L), n = lines.length, rank = barOrder(n), hk = L.hs / 120;
   const toBar = E.inOutCubic(prog(f, 34, 54));
   const out = E.inExpo(prog(f, 100, 116));
   // text lines -> bars -> sorted bars
   for (let i = 0; i < n; i++) {
-    const y0 = PARA_Y + i * PARA_LH;
-    font(40, 400);
+    const y0 = L.y + i * L.lh;
+    font(L.fs, 400);
     const lw = ctx.measureText(lines[i]).width;
-    const targetW = 220 + (rank[i] / (n - 1)) * (PARA_W - 220);
+    const targetW = 220 + (rank[i] / (n - 1)) * (L.w - 220);
     const sortT = E.outExpo(prog(f, 62 + rank[i] * 2.4, 80 + rank[i] * 2.4));
-    const y = lerp(y0, PARA_Y + rank[i] * PARA_LH, sortT);
+    const y = lerp(y0, L.y + rank[i] * L.lh, sortT);
     // text, dissolving
     if (toBar < 1) {
       ctx.globalAlpha = (1 - toBar) * (0.85 + 0.15 * prog(f, 0, 10));
-      ctx.fillStyle = BP.text4; ctx.textBaseline = 'middle'; ctx.fillText(lines[i], PARA_X, y0 + (f < 34 ? -f * 0.4 : -13.6));
+      ctx.fillStyle = BP.text4; ctx.textBaseline = 'middle'; ctx.fillText(lines[i], L.x, y0 + (f < 34 ? -f * 0.4 : -13.6));
       ctx.globalAlpha = 1;
     }
     if (toBar > 0) {
@@ -149,7 +151,7 @@ function sceneRead(f) {
       let col = BP.text4;
       if (f >= 62) col = moving ? BP.primary : sortT >= 0.98 ? BP.secondary : BP.text4;
       // collapse into the wordmark underline
-      const cy = lerp(y, 596, out), cx = lerp(PARA_X, W / 2 - 330, out), cw = lerp(bw, 660, out), ch = lerp(bh, 8, out);
+      const cy = lerp(y, 596, out), cx = lerp(L.x, W / 2 - 330, out), cw = lerp(bw, 660, out), ch = lerp(bh, 8, out);
       ctx.globalAlpha = toBar;
       ctx.fillStyle = out > 0 ? BP.primary : col;
       rr(cx, cy - ch / 2, cw, ch, ch / 2); ctx.fill();
@@ -157,20 +159,20 @@ function sceneRead(f) {
     }
   }
   // headline: "Stop reading." -> "Start seeing."
-  const hy = 230;
+  const hy = L.hy;
   const swap = E.inOutExpo(prog(f, 52, 66));
-  font(120, 800); ctx.letterSpacing = '-3px'; ctx.textBaseline = 'middle';
-  ctx.save(); ctx.beginPath(); ctx.rect(0, hy - 90, W, 180); ctx.clip();
-  const enter = E.outExpo(prog(f, 0, 16));
+  font(L.hs, 800); ctx.letterSpacing = '-3px'; ctx.textBaseline = 'middle';
+  ctx.save(); ctx.beginPath(); ctx.rect(0, hy - 90 * hk, W, 180 * hk); ctx.clip();
+  const enter = E.outExpo(prog(f, L.e0 || 0, 16));
   ctx.globalAlpha = lerp(0.35, 1, enter) * (1 - swap);
-  ctx.fillStyle = BP.text1; ctx.fillText('Stop reading.', PARA_X, hy + (1 - enter) * 40 - swap * 180);
+  ctx.fillStyle = BP.text1; ctx.fillText('Stop reading.', L.x, hy + (1 - enter) * 40 - swap * 180 * hk);
   const strike = E.outExpo(prog(f, 40, 52));
   if (strike > 0 && swap < 1) {
     const sw = ctx.measureText('Stop reading.').width;
-    ctx.fillStyle = BP.primary; ctx.fillRect(PARA_X - 10, hy + 4 - swap * 180, (sw + 20) * strike, 10);
+    ctx.fillStyle = BP.primary; ctx.fillRect(L.x - 10, hy + 4 - swap * 180 * hk, (sw + 20) * strike, 10);
   }
   ctx.globalAlpha = 1 - out;
-  ctx.fillStyle = BP.primary; ctx.fillText('Start seeing.', PARA_X, hy + 180 - swap * 180 - out * 120);
+  ctx.fillStyle = BP.primary; ctx.fillText('Start seeing.', L.x, hy + 180 * hk - swap * 180 * hk - out * 120);
   ctx.restore(); ctx.letterSpacing = '0px'; ctx.globalAlpha = 1;
 }
 
@@ -609,6 +611,224 @@ async function renderAudio() {
   return ac.startRendering();
 }
 
+/* ==========================================================================
+   VERTICAL CUT — shared block, identical in every piece.
+   1080x1920 for Reels, Shorts and TikTok (__motion.variants.vertical). The
+   piece's own scene code is re-used and recomposed for a phone: everything a
+   viewer must read stays inside the area no platform covers (x 60..900,
+   y 230..1400); outside it there is only dimmed texture.
+   ========================================================================== */
+const VW = 1080, VH = 1920, SAFE = { x: 60, y: 230, w: 840, h: 1170, r: 900, b: 1400 };
+const vcv = document.createElement('canvas'); vcv.width = VW; vcv.height = VH;
+const vx = vcv.getContext('2d', { willReadFrequently: true });   // CPU raster: identical pixels on every redraw
+const VL = 96, VR = 864;                                          // text column inside the safe area
+
+function vReset() {
+  vx.setTransform(1, 0, 0, 1, 0, 0); vx.globalAlpha = 1; vx.globalCompositeOperation = 'source-over';
+  vx.filter = 'none'; vx.shadowBlur = 0; vx.shadowColor = 'transparent'; vx.letterSpacing = '0px'; vx.setLineDash([]);
+  vx.textAlign = 'left'; vx.textBaseline = 'alphabetic'; vx.lineCap = 'butt'; vx.lineJoin = 'miter';
+}
+/** Canvas text on the vertical frame; `max` shrinks the size until the line fits. */
+function vText(str, x, y, { size = 40, weight = 700, color = '#FFFFFF', align = 'left', spacing = 0, alpha = 1, fam = FONT, max = 0 } = {}) {
+  if (alpha <= 0.002 || !str) return size;
+  vx.font = `${weight} ${size}px ${fam}`; vx.letterSpacing = spacing + 'px';
+  if (max) { const w = vx.measureText(str).width; if (w > max) { size = size * max / w; vx.font = `${weight} ${size}px ${fam}`; } }
+  vx.textAlign = align; vx.textBaseline = 'alphabetic';
+  const a0 = vx.globalAlpha; vx.globalAlpha = a0 * alpha; vx.fillStyle = color;
+  vx.fillText(str, x + (align === 'center' ? spacing / 2 : align === 'right' ? spacing : 0), y);   // tracking is added after the last glyph too
+  vx.globalAlpha = a0; vx.letterSpacing = '0px';
+  return size;
+}
+/** Word-wraps with the given font; returns the lines. */
+function vWrap(str, maxW, size, weight = 700, fam = FONT) {
+  vx.font = `${weight} ${size}px ${fam}`; vx.letterSpacing = '0px';
+  const words = str.split(' '), lines = []; let cur = '';
+  for (const w of words) { const t = cur ? cur + ' ' + w : w; if (vx.measureText(t).width > maxW && cur) { lines.push(cur); cur = w; } else cur = t; }
+  if (cur) lines.push(cur);
+  return lines;
+}
+/** Fade envelope with a small rise: [alpha, dy]. */
+function vEnv(v, a, b, fin = 8, fout = 8) {
+  const i = E.outCubic(prog(v, a, a + fin)), o = 1 - E.inCubic(prog(v, b - fout, b));
+  return [Math.min(i, o), (1 - i) * 22 - (1 - o) * 10];
+}
+/** Which segment of a cut list a vertical frame is in: segs = [{ at, src, len }] in frames. */
+function vSeg(segs, v) {
+  let k = 0; while (k < segs.length - 1 && v >= segs[k + 1].at) k++;
+  const s = segs[k];
+  return { k, s, local: v - s.at, src: s.src + (v - s.at) };
+}
+/** Dims everything outside the safe area to a quiet texture (brightness x 0.2), with a soft inner edge. */
+function vShade(rgb, a = 0.8, feather = 40) {
+  vx.save(); vx.setTransform(1, 0, 0, 1, 0, 0); vx.globalAlpha = 1; vx.globalCompositeOperation = 'source-over';
+  vx.fillStyle = `rgba(${rgb},${a})`;
+  vx.beginPath(); vx.rect(0, 0, VW, VH); vx.rect(SAFE.x, SAFE.y, SAFE.w, SAFE.h); vx.fill('evenodd');
+  const strip = (x0, y0, x1, y1, rx, ry, rw, rh) => {
+    const g = vx.createLinearGradient(x0, y0, x1, y1);
+    g.addColorStop(0, `rgba(${rgb},${a})`); g.addColorStop(1, `rgba(${rgb},0)`);
+    vx.fillStyle = g; vx.fillRect(rx, ry, rw, rh);
+  };
+  strip(SAFE.x, 0, SAFE.x + feather, 0, SAFE.x, SAFE.y, feather, SAFE.h);
+  strip(SAFE.r, 0, SAFE.r - feather, 0, SAFE.r - feather, SAFE.y, feather, SAFE.h);
+  strip(0, SAFE.y, 0, SAFE.y + feather, SAFE.x, SAFE.y, SAFE.w, feather);
+  strip(0, SAFE.b, 0, SAFE.b - feather, SAFE.x, SAFE.b - feather, SAFE.w, feather);
+  vx.restore();
+}
+/** Series tag at the top of the safe area, e.g. MADE IN CODE · 04. */
+function vTag(label, color, alpha = 1) {
+  vText('MADE IN CODE', VL, 292, { size: 28, weight: 800, color, spacing: 5, alpha });
+  vx.font = `800 28px ${FONT}`; vx.letterSpacing = '5px';
+  const w = vx.measureText('MADE IN CODE').width; vx.letterSpacing = '0px';
+  vText('·  ' + label, VL + w + 14, 292, { size: 28, weight: 600, color: 'rgba(255,255,255,0.72)', spacing: 3, alpha, max: VR - VL - w - 14 });
+}
+/** Big hook lines, left-aligned from y0; visible from frame 0, settles in a few frames. */
+function vHook(v, lines, y0, { size = 84, lh = 1.08, color = '#FFFFFF', accent = null, weight = 800, spacing = -1.5, alpha = 1 } = {}) {
+  const k = E.outExpo(prog(v, -6, 12));
+  lines.forEach((ln, i) => {
+    const kk = E.outExpo(prog(v, -12 + i * 2, 8 + i * 2));
+    vText(ln, VL, y0 + i * size * lh + (1 - kk) * 30, { size, weight, spacing, color: accent && i === lines.length - 1 ? accent : color, alpha: alpha * Math.max(0.25, kk), max: VR - VL });
+  });
+  return k;
+}
+/** Closing card, the last 60 frames: piece title, "drawn in code · bytepatterns.com". l = frames into the card. */
+function vEndCard(l, { title, line = '', ink = '#FFFFFF', dim = 'rgba(255,255,255,0.66)', accent = '#FFFFFF', scrim = '0,0,0', a = 0.84 }) {
+  const k = E.outCubic(prog(l, 0, 12));
+  vx.save(); vx.setTransform(1, 0, 0, 1, 0, 0);
+  vx.fillStyle = `rgba(${scrim},${a * k})`; vx.fillRect(0, 0, VW, VH);
+  vx.restore();
+  const t1 = E.outExpo(prog(l, 3, 19)), t2 = E.outExpo(prog(l, 11, 27)), t3 = E.outExpo(prog(l, 19, 35));
+  vx.fillStyle = accent; vx.globalAlpha = t1; vx.fillRect(VL, 742, 88 * t1, 7); vx.globalAlpha = 1;
+  const size = vText(title, VL, 850 + (1 - t1) * 40, { size: 92, weight: 800, color: ink, spacing: -2, alpha: t1, max: VR - VL });
+  const y2 = 850 + Math.max(size, 60) * 0.25 + 70;
+  vx.font = `600 44px ${FONT}`;
+  const lead = 'drawn in code  ·  ', lw = vx.measureText(lead).width;
+  vText(lead, VL, y2 + (1 - t2) * 24, { size: 44, weight: 600, color: dim, alpha: t2 });
+  vText('bytepatterns.com', VL + lw, y2 + (1 - t2) * 24, { size: 44, weight: 800, color: accent, alpha: t2 });
+  if (line) vText(line, VL, y2 + 72 + (1 - t3) * 18, { size: 32, weight: 500, color: dim, alpha: t3, max: VR - VL });
+}
+/** Seeks a cut. The first frame a page draws is drawn twice: the very first read of a
+ *  GPU-backed source canvas can come out a shade different from every later one. */
+let vWarm = false;
+function vSeek(draw, i, frames) {
+  const f = Math.max(0, Math.min(frames - 1, Math.floor(i)));
+  if (!vWarm) { vWarm = true; draw(f); }
+  draw(f);
+}
+/** The soundtrack of a cut: the piece's own audio() spliced to the same segments as the picture. */
+async function vAudio(segs, frames, { xf = 0.025, fadeOut = 0.6, extra = null } = {}) {
+  const src = await renderAudio();
+  const SR = 48000, dur = frames / FPS, ac = new OfflineAudioContext(2, Math.round(SR * dur), SR);
+  const out = ac.createGain(); out.connect(ac.destination);
+  out.gain.setValueAtTime(1, 0); out.gain.setValueAtTime(1, dur - fadeOut); out.gain.linearRampToValueAtTime(0, dur - 0.01);
+  segs.forEach((s, k) => {
+    const at = s.at / FPS, off = s.src / FPS, d = s.len / FPS;
+    const pre = k === 0 ? 0 : Math.min(xf, off), post = k === segs.length - 1 ? 0 : xf;
+    const b = ac.createBufferSource(), g = ac.createGain(); b.buffer = src;
+    g.gain.setValueAtTime(pre ? 0 : 1, at - pre);
+    if (pre) g.gain.linearRampToValueAtTime(1, at + pre);
+    if (post) { g.gain.setValueAtTime(1, at + d - post); g.gain.linearRampToValueAtTime(0, at + d + post); }
+    b.connect(g).connect(out); b.start(at - pre, off - pre, d + pre + post);
+  });
+  if (extra) extra(ac, out);
+  const buf = await ac.startRendering();
+  let peak = 0; for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) peak = Math.max(peak, Math.abs(d[i])); }
+  if (peak > 0.9) for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) d[i] *= 0.9 / peak; }
+  return buf;
+}
+/** A soft three-partial bell, for the closing card. */
+function vChime(ac, dest, at, freq, vol = 0.08) {
+  for (const [mul, v, dec] of [[1, 1, 1.8], [2.01, 0.35, 0.8], [3.02, 0.12, 0.4]]) {
+    const o = ac.createOscillator(), g = ac.createGain(); o.type = 'sine'; o.frequency.value = freq * mul;
+    g.gain.setValueAtTime(0.0001, at); g.gain.exponentialRampToValueAtTime(vol * v, at + 0.006); g.gain.exponentialRampToValueAtTime(0.0001, at + dec);
+    o.connect(g).connect(dest); o.start(at); o.stop(at + dec + 0.05);
+  }
+}
+
+/* VERTICAL CUT — this piece */
+// "Stop reading." -> the three product cards one at a time, full width, like a
+// phone carousel -> 300 tiles -> closing card. The cards are the landscape card
+// code drawn through a scale, so every lesson still plays for real.
+const VSEG = [
+  { at: 0, src: 0, len: 100 },                          // paragraph -> bars -> sorted
+  { at: 100, src: 262, len: 95 },                       // lesson card, bubble sort running (card time 40..135)
+  { at: 195, src: 292, len: 95 },                       // animation card, binary search (40..135)
+  { at: 290, src: 352, len: 95 },                       // quiz card, answered (70..165)
+  { at: 385, src: 468, len: 92 },                       // 300 lessons
+  { at: 477, src: 612, len: 60 },                       // closing card
+];
+const VFR = 537, VEND = VFR - 60;
+const VREAD = { x: VL, y: 640, lh: 50, w: VR - VL, fs: 32, hy: 440, hs: 108, e0: -12 };   // e0: the hook is up at frame 0
+const VCARD = { s: 1.35, x: 480 - CARD_W * 1.35 / 2, y: 536 };
+function vBackground(f) {
+  vx.fillStyle = BP.canvas; vx.fillRect(0, 0, VW, VH);
+  let gx = 300 + Math.sin(f / 90) * 100, gy = 560;
+  let g = vx.createRadialGradient(gx, gy, 0, gx, gy, 800);
+  g.addColorStop(0, rgba(BP.secondary, 0.07)); g.addColorStop(1, rgba(BP.secondary, 0));
+  vx.fillStyle = g; vx.fillRect(0, 0, VW, VH);
+  gx = 760 + Math.cos(f / 110) * 90; gy = 1250;
+  g = vx.createRadialGradient(gx, gy, 0, gx, gy, 700);
+  g.addColorStop(0, rgba(BP.primary, 0.06)); g.addColorStop(1, rgba(BP.primary, 0));
+  vx.fillStyle = g; vx.fillRect(0, 0, VW, VH);
+  vx.fillStyle = rgba(BP.border, 0.55);
+  for (let y = 30; y < VH; y += 60) for (let x = 30; x < VW; x += 60) vx.fillRect(x - 1, y - 1, 2, 2);
+}
+function vCard(k, l, local, len) {
+  const draw = [lessonCard, animationCard, quizCard][k];
+  const inn = E.outExpo(prog(local, 0, 14)), out = E.inExpo(prog(local, len - 9, len));
+  const x = VCARD.x + (1 - inn) * 700 - out * 760, rot = (1 - inn) * 0.05 - out * 0.04;
+  vx.save();
+  vx.translate(x + CARD_W * VCARD.s / 2, VCARD.y + CARD_H * VCARD.s / 2); vx.rotate(rot); vx.scale(VCARD.s, VCARD.s);
+  vx.translate(-CARD_W / 2, -CARD_H / 2);
+  vx.shadowColor = 'rgba(0,0,0,0.55)'; vx.shadowBlur = 50; vx.shadowOffsetY = 18;
+  vx.fillStyle = BP.surface; vx.beginPath(); vx.roundRect(0, 0, CARD_W, CARD_H, 28); vx.fill();
+  vx.shadowColor = 'transparent'; vx.shadowBlur = 0; vx.shadowOffsetY = 0;
+  vx.strokeStyle = BP.border; vx.lineWidth = 2; vx.beginPath(); vx.roundRect(1, 1, CARD_W - 2, CARD_H - 2, 27); vx.stroke();
+  draw(l);
+  vx.restore();
+}
+function vProof(l) {
+  const count = Math.round(300 * E.inOutCubic(prog(l, 10, 76))), enter = E.outExpo(prog(l, 0, 20));
+  vx.save(); vx.beginPath(); vx.rect(SAFE.x, 440, SAFE.w, 300); vx.clip();
+  vText(String(count), VL - 12, 700 + (1 - enter) * 260, { size: 280, weight: 800, color: BP.primary, spacing: -10 });
+  vx.restore();
+  const t2 = E.outExpo(prog(l, 8, 28)), t3 = E.outExpo(prog(l, 30, 50));
+  vText('free animated lessons', VL + (1 - t2) * 40, 800, { size: 68, weight: 800, color: BP.text1, spacing: -1.5, alpha: t2 });
+  vText('29 modules  ·  no account needed', VL + (1 - t3) * 40, 866, { size: 38, weight: 600, color: BP.text2, alpha: t3 });
+  const T = 26, G = 8, gx = VL + (VR - VL - (COLS * (T + G) - G)) / 2, gy = 900;
+  for (let i = 0; i < 300; i++) {
+    const c = i % COLS, r = Math.floor(i / COLS), x = gx + c * (T + G), y = gy + r * (T + G);
+    const appear = E.outCubic(prog(l, 2 + (c + r) * 0.5, 14 + (c + r) * 0.5));
+    if (appear <= 0) continue;
+    const lit = i < count, fresh = lit && i >= count - 24 && l < 78, s = T * (0.6 + 0.4 * appear);
+    vx.globalAlpha = appear;
+    if (lit) { vx.fillStyle = fresh ? BP.primary : BP.secondary; vx.beginPath(); vx.roundRect(x + (T - s) / 2, y + (T - s) / 2, s, s, 6); vx.fill(); }
+    else { vx.strokeStyle = BP.border; vx.lineWidth = 2; vx.beginPath(); vx.roundRect(x + 1 + (T - s) / 2, y + 1 + (T - s) / 2, s - 2, s - 2, 6); vx.stroke(); }
+  }
+  vx.globalAlpha = 1;
+}
+function vDraw(v) {
+  const { k, s, local, src } = vSeg(VSEG, v), f = Math.min(FRAMES - 1, src);
+  vReset();
+  vBackground(f);
+  const main = ctx; ctx = vx;
+  try {
+    if (k === 0) sceneRead(f, VREAD);
+    else if (k <= 3) {
+      const h = E.outExpo(prog(v, 100, 112));
+      vText('Every lesson is an', VL, 386 + (1 - h) * 20, { size: 64, weight: 800, color: BP.text1, spacing: -1.5, alpha: h });
+      vText('animation you can play.', VL, 462 + (1 - h) * 20, { size: 64, weight: 800, color: BP.primary, spacing: -1.5, alpha: h, max: VR - VL });
+      vCard(k - 1, f - (222 + (k - 1) * 30), local, s.len);
+    } else if (k === 4) vProof(f - 468);
+    else vProof(90);
+  } finally { ctx = main; }
+  vReset();
+  vShade('11,13,16');
+  vTag('LAUNCH FILM', BP.primary);
+  if (v >= VEND) vEndCard(v - VEND, { title: 'BytePatterns Launch Film', line: 'Stop reading. Start seeing. 300 free animated lessons.',
+    ink: BP.text1, dim: BP.text3, accent: BP.primary, scrim: '11,13,16', a: 0.9 });
+  vReset();
+}
+
 window.__motion = {
   title: 'BytePatterns Launch Film',
   description: 'A 24-second launch film: a paragraph turns into sorted bars, product cards play their own lessons, and 300 tiles light up.',
@@ -617,18 +837,33 @@ window.__motion = {
   gifStart: 0,
   seek(i) { draw(Math.max(0, Math.min(FRAMES - 1, Math.floor(i)))); },
   audio: renderAudio,
+  variants: {
+    vertical: {
+      width: VW, height: VH, frames: VFR, canvas: vcv,
+      poster: 150, gifStart: 3.2,
+      seek(i) { vSeek(vDraw, i, VFR); },
+      audio: () => vAudio(VSEG, VFR),
+    },
+  },
 };
 
 /* ==========================================================================
    PLAYER — identical in every piece; keep as is.
    Autoplays and loops, starts sound on the first click, ?frame=N pauses on a
-   frame. When the renderer sets window.__MOTION_RENDER__ it stays out of the way.
+   frame, ?variant=vertical plays the vertical cut (if the piece has one).
+   When the renderer sets window.__MOTION_RENDER__ it stays out of the way.
    ========================================================================== */
 (function player() {
-  const M = window.__motion, btn = document.getElementById('sound');
+  const btn = document.getElementById('sound'), q = new URLSearchParams(location.search);
+  let M = window.__motion;
+  const V = !window.__MOTION_RENDER__ && M.variants && M.variants[q.get('variant')];
+  if (V) {                                                // show the variant's own canvas instead
+    M = Object.assign({}, M, V);
+    V.canvas.style.cssText = `width:min(100vw,calc(100vh*${V.width}/${V.height}));height:auto;aspect-ratio:${V.width}/${V.height}`;
+    document.querySelector('canvas').replaceWith(V.canvas);
+  }
   const dur = M.frames / M.fps;
   if (window.__MOTION_RENDER__) { btn.hidden = true; M.seek(0); return; }
-  const q = new URLSearchParams(location.search);
   if (q.has('frame')) { btn.hidden = true; M.seek(+q.get('frame') || 0); return; }
   let t0 = performance.now(), ac = null, src = null, buf = null, paused = false, pausedAt = 0;
   const clock = () => ac && src ? (ac.currentTime - t0) : (performance.now() - t0) / 1000;

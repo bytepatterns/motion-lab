@@ -29,9 +29,10 @@
    450 signature    "drawn in code", the cursor becomes the dot we started with
    The last frame is the first frame, so the loop has no seam.
    ========================================================================== */
-const W = 1920, H = 1080, FPS = 30, FRAMES = 540, BEAT = 15, BAR = 60;
+let W = 1920, H = 1080;                                  // the vertical cut re-points W, H and ctx at its stage
+const FPS = 30, FRAMES = 540, BEAT = 15, BAR = 60;
 const cv = document.getElementById('stage');
-const ctx = cv.getContext('2d');
+let ctx = cv.getContext('2d');
 const FONT = 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
 
 const INK = '#0C0C10', PAPER = '#F3F0E8', BLUE = '#2E5BFF', LIME = '#D8FF3C', PINK = '#FF3E7A', MUTE = '#8E8C88';
@@ -92,7 +93,7 @@ function sceneIgnite(f) {
 
   // dot -> line -> two lines that open a mask
   const grow = E.outExpo(prog(f, 3, 17));
-  const lineW = lerp(20, 1480, grow);
+  const lineW = lerp(20, Math.min(1480, W - 120), grow);
   const split = E.outExpo(prog(f, 15, 27));
   const gap = lerp(0, 150, split) + lerp(0, 700, E.inExpo(prog(f, 46, 58)));
   const thick = lerp(20, 5, clamp(grow * 1.4 + split));
@@ -106,7 +107,7 @@ function sceneIgnite(f) {
     ctx.save();
     ctx.beginPath(); ctx.rect(0, cy - gap + 4, W, gap * 2 - 8); ctx.clip();
     const words = [['MAKE', PAPER], ['IT', PAPER], ['MOVE', LIME]];
-    const size = fitSize('MAKE IT MOVE', 900, 176, 1300, -4);
+    const size = fitSize('MAKE IT MOVE', 900, 176, Math.min(1300, W - 140), -4);
     font(size); ctx.letterSpacing = '-4px'; ctx.textBaseline = 'middle';
     const space = ctx.measureText(' ').width;
     const total = ctx.measureText('MAKE IT MOVE').width;
@@ -139,10 +140,11 @@ function sceneType(f) {
   if (f < 75) {                                            // SHAPE
     const l = f - 60;
     ctx.fillStyle = PAPER; ctx.fillRect(0, 0, W, H);
+    const size = fitSize('SHAPE', 900, 330, W - 90, -10);
     ghosts(3, 0.8, (d) => {
       const t = E.outExpo(prog(l + d, 0, 9));
       ctx.save(); ctx.translate(cx, cy + 40); ctx.rotate(lerp(-0.22, 0, t)); ctx.scale(lerp(1.7, 1, t), lerp(1.7, 1, t));
-      font(330); ctx.letterSpacing = '-10px'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      font(size); ctx.letterSpacing = '-10px'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
       ctx.fillStyle = INK; ctx.fillText('SHAPE', 0, 0); ctx.restore(); ctx.letterSpacing = '0px';
     });
     // three shapes pop above the word
@@ -170,7 +172,7 @@ function sceneType(f) {
       ctx.fillStyle = i % 4 === 0 ? LIME : 'rgba(243,240,232,0.18)';
       ctx.fillRect(i * bw + 6, H - h * rise, bw - 12, h * rise);
     }
-    const size = fitSize('RHYTHM', 900, 330, 1560, -10);
+    const size = fitSize('RHYTHM', 900, 330, Math.min(1560, W - 90), -10);
     ghosts(4, 0.7, (d) => {
       const t = E.outExpo(prog(l + d, 0, 10));
       ctx.save(); ctx.translate(cx + (1 - t) * 1300, cy - 40); ctx.transform(1, 0, lerp(-0.35, 0, t), 1, 0, 0);
@@ -187,8 +189,9 @@ function sceneType(f) {
     glow.addColorStop(0, 'rgba(216,255,60,0.28)'); glow.addColorStop(1, 'rgba(216,255,60,0)');
     ctx.fillStyle = glow; ctx.fillRect(0, 0, W, H);
     // text layer: a dim word, lit behind the beam, a hot band at the beam
+    const ls = fitSize('LIGHT', 900, 330, W - 90, -10);
     resetCtx(lctx); lctx.clearRect(0, 0, W, H);
-    lctx.font = `900 330px ${FONT}`; lctx.letterSpacing = '-10px'; lctx.textAlign = 'center'; lctx.textBaseline = 'middle';
+    lctx.font = `900 ${ls}px ${FONT}`; lctx.letterSpacing = '-10px'; lctx.textAlign = 'center'; lctx.textBaseline = 'middle';
     lctx.fillStyle = '#2A2A31'; lctx.fillText('LIGHT', cx, cy);
     lctx.globalCompositeOperation = 'source-atop';
     lctx.fillStyle = PAPER; lctx.fillRect(0, 0, Math.max(0, sweep - 40), H);
@@ -207,13 +210,14 @@ function sceneType(f) {
 }
 
 // "M◯TION": the O is a geometric ring so the camera can fly through its hole.
-function motionLayout() {
-  const size = 300, word = ['M', 'O', 'T', 'I', 'O', 'N'];
+function motionLayout(size = 300) {
+  const word = ['M', 'O', 'T', 'I', 'O', 'N'];
   font(size); ctx.letterSpacing = '0px';
   const cap = ctx.measureText('M').actualBoundingBoxAscent;
   const R = cap * 0.52, lw = cap * 0.2, track = -6;
   const items = word.map((ch, i) => ({ ch, ring: i === 1, w: i === 1 ? 2 * R + 26 : ctx.measureText(ch).width }));
   const total = items.reduce((a, b) => a + b.w + track, -track);
+  if (total > W - 100) return motionLayout(size * (W - 100) / total);    // narrow stage: shrink to fit
   let x = W / 2 - total / 2;
   for (const it of items) { it.x = x; x += it.w + track; }
   const base = H / 2 + cap / 2 + 10;
@@ -373,7 +377,7 @@ function sceneTunnel(f) {
     const scrim = ctx.createRadialGradient(W / 2, H / 2, 0, W / 2, H / 2, 820);
     scrim.addColorStop(0, 'rgba(12,12,16,0.82)'); scrim.addColorStop(1, 'rgba(12,12,16,0)');
     ctx.globalAlpha = inn * (1 - out); ctx.fillStyle = scrim; ctx.fillRect(0, 0, W, H);
-    const size = fitSize(txt, 900, 150, 1500, 4);
+    const size = fitSize(txt, 900, 150, Math.min(1500, W - 100), 4);
     font(size); ctx.letterSpacing = lerp(70, 4, inn) + 'px'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
     ctx.fillStyle = PAPER; ctx.fillText(txt, W / 2, H / 2 - out * 40);
     ctx.letterSpacing = '0px'; ctx.textAlign = 'left'; ctx.globalAlpha = 1;
@@ -388,7 +392,7 @@ function whip(f) {
   const x = (ff) => -W * E.inOutExpo(prog(ff, 344, 360));
   ctx.save(); ctx.translate(x(f), 0); sceneWall(f); ctx.restore(); resetCtx();
   ctx.save(); ctx.translate(x(f) + W, 0); sceneTunnel(f); ctx.restore(); resetCtx();
-  resetCtx(l2ctx); l2ctx.clearRect(0, 0, W, H); l2ctx.drawImage(cv, 0, 0);
+  resetCtx(l2ctx); l2ctx.clearRect(0, 0, W, H); l2ctx.drawImage(ctx.canvas, 0, 0);
   const v = x(f) - x(f - 1);                               // px per frame, negative = moving left
   for (let k = 1; k <= 6; k++) { ctx.globalAlpha = 0.16; ctx.drawImage(layer2, -v * k / 6, 0); }
   ctx.globalAlpha = 1;
@@ -597,6 +601,171 @@ async function renderAudio() {
   return ac.startRendering();
 }
 
+/* ==========================================================================
+   VERTICAL CUT — shared block, identical in every piece.
+   1080x1920 for Reels, Shorts and TikTok (__motion.variants.vertical). The
+   piece's own scene code is re-used and recomposed for a phone: everything a
+   viewer must read stays inside the area no platform covers (x 60..900,
+   y 230..1400); outside it there is only dimmed texture.
+   ========================================================================== */
+const VW = 1080, VH = 1920, SAFE = { x: 60, y: 230, w: 840, h: 1170, r: 900, b: 1400 };
+const vcv = document.createElement('canvas'); vcv.width = VW; vcv.height = VH;
+const vx = vcv.getContext('2d', { willReadFrequently: true });   // CPU raster: identical pixels on every redraw
+const VL = 96, VR = 864;                                          // text column inside the safe area
+
+function vReset() {
+  vx.setTransform(1, 0, 0, 1, 0, 0); vx.globalAlpha = 1; vx.globalCompositeOperation = 'source-over';
+  vx.filter = 'none'; vx.shadowBlur = 0; vx.shadowColor = 'transparent'; vx.letterSpacing = '0px'; vx.setLineDash([]);
+  vx.textAlign = 'left'; vx.textBaseline = 'alphabetic'; vx.lineCap = 'butt'; vx.lineJoin = 'miter';
+}
+/** Canvas text on the vertical frame; `max` shrinks the size until the line fits. */
+function vText(str, x, y, { size = 40, weight = 700, color = '#FFFFFF', align = 'left', spacing = 0, alpha = 1, fam = FONT, max = 0 } = {}) {
+  if (alpha <= 0.002 || !str) return size;
+  vx.font = `${weight} ${size}px ${fam}`; vx.letterSpacing = spacing + 'px';
+  if (max) { const w = vx.measureText(str).width; if (w > max) { size = size * max / w; vx.font = `${weight} ${size}px ${fam}`; } }
+  vx.textAlign = align; vx.textBaseline = 'alphabetic';
+  const a0 = vx.globalAlpha; vx.globalAlpha = a0 * alpha; vx.fillStyle = color;
+  vx.fillText(str, x + (align === 'center' ? spacing / 2 : align === 'right' ? spacing : 0), y);   // tracking is added after the last glyph too
+  vx.globalAlpha = a0; vx.letterSpacing = '0px';
+  return size;
+}
+/** Word-wraps with the given font; returns the lines. */
+function vWrap(str, maxW, size, weight = 700, fam = FONT) {
+  vx.font = `${weight} ${size}px ${fam}`; vx.letterSpacing = '0px';
+  const words = str.split(' '), lines = []; let cur = '';
+  for (const w of words) { const t = cur ? cur + ' ' + w : w; if (vx.measureText(t).width > maxW && cur) { lines.push(cur); cur = w; } else cur = t; }
+  if (cur) lines.push(cur);
+  return lines;
+}
+/** Fade envelope with a small rise: [alpha, dy]. */
+function vEnv(v, a, b, fin = 8, fout = 8) {
+  const i = E.outCubic(prog(v, a, a + fin)), o = 1 - E.inCubic(prog(v, b - fout, b));
+  return [Math.min(i, o), (1 - i) * 22 - (1 - o) * 10];
+}
+/** Which segment of a cut list a vertical frame is in: segs = [{ at, src, len }] in frames. */
+function vSeg(segs, v) {
+  let k = 0; while (k < segs.length - 1 && v >= segs[k + 1].at) k++;
+  const s = segs[k];
+  return { k, s, local: v - s.at, src: s.src + (v - s.at) };
+}
+/** Dims everything outside the safe area to a quiet texture (brightness x 0.2), with a soft inner edge. */
+function vShade(rgb, a = 0.8, feather = 40) {
+  vx.save(); vx.setTransform(1, 0, 0, 1, 0, 0); vx.globalAlpha = 1; vx.globalCompositeOperation = 'source-over';
+  vx.fillStyle = `rgba(${rgb},${a})`;
+  vx.beginPath(); vx.rect(0, 0, VW, VH); vx.rect(SAFE.x, SAFE.y, SAFE.w, SAFE.h); vx.fill('evenodd');
+  const strip = (x0, y0, x1, y1, rx, ry, rw, rh) => {
+    const g = vx.createLinearGradient(x0, y0, x1, y1);
+    g.addColorStop(0, `rgba(${rgb},${a})`); g.addColorStop(1, `rgba(${rgb},0)`);
+    vx.fillStyle = g; vx.fillRect(rx, ry, rw, rh);
+  };
+  strip(SAFE.x, 0, SAFE.x + feather, 0, SAFE.x, SAFE.y, feather, SAFE.h);
+  strip(SAFE.r, 0, SAFE.r - feather, 0, SAFE.r - feather, SAFE.y, feather, SAFE.h);
+  strip(0, SAFE.y, 0, SAFE.y + feather, SAFE.x, SAFE.y, SAFE.w, feather);
+  strip(0, SAFE.b, 0, SAFE.b - feather, SAFE.x, SAFE.b - feather, SAFE.w, feather);
+  vx.restore();
+}
+/** Series tag at the top of the safe area, e.g. MADE IN CODE · 04. */
+function vTag(label, color, alpha = 1) {
+  vText('MADE IN CODE', VL, 292, { size: 28, weight: 800, color, spacing: 5, alpha });
+  vx.font = `800 28px ${FONT}`; vx.letterSpacing = '5px';
+  const w = vx.measureText('MADE IN CODE').width; vx.letterSpacing = '0px';
+  vText('·  ' + label, VL + w + 14, 292, { size: 28, weight: 600, color: 'rgba(255,255,255,0.72)', spacing: 3, alpha, max: VR - VL - w - 14 });
+}
+/** Big hook lines, left-aligned from y0; visible from frame 0, settles in a few frames. */
+function vHook(v, lines, y0, { size = 84, lh = 1.08, color = '#FFFFFF', accent = null, weight = 800, spacing = -1.5, alpha = 1 } = {}) {
+  const k = E.outExpo(prog(v, -6, 12));
+  lines.forEach((ln, i) => {
+    const kk = E.outExpo(prog(v, -12 + i * 2, 8 + i * 2));
+    vText(ln, VL, y0 + i * size * lh + (1 - kk) * 30, { size, weight, spacing, color: accent && i === lines.length - 1 ? accent : color, alpha: alpha * Math.max(0.25, kk), max: VR - VL });
+  });
+  return k;
+}
+/** Closing card, the last 60 frames: piece title, "drawn in code · bytepatterns.com". l = frames into the card. */
+function vEndCard(l, { title, line = '', ink = '#FFFFFF', dim = 'rgba(255,255,255,0.66)', accent = '#FFFFFF', scrim = '0,0,0', a = 0.84 }) {
+  const k = E.outCubic(prog(l, 0, 12));
+  vx.save(); vx.setTransform(1, 0, 0, 1, 0, 0);
+  vx.fillStyle = `rgba(${scrim},${a * k})`; vx.fillRect(0, 0, VW, VH);
+  vx.restore();
+  const t1 = E.outExpo(prog(l, 3, 19)), t2 = E.outExpo(prog(l, 11, 27)), t3 = E.outExpo(prog(l, 19, 35));
+  vx.fillStyle = accent; vx.globalAlpha = t1; vx.fillRect(VL, 742, 88 * t1, 7); vx.globalAlpha = 1;
+  const size = vText(title, VL, 850 + (1 - t1) * 40, { size: 92, weight: 800, color: ink, spacing: -2, alpha: t1, max: VR - VL });
+  const y2 = 850 + Math.max(size, 60) * 0.25 + 70;
+  vx.font = `600 44px ${FONT}`;
+  const lead = 'drawn in code  ·  ', lw = vx.measureText(lead).width;
+  vText(lead, VL, y2 + (1 - t2) * 24, { size: 44, weight: 600, color: dim, alpha: t2 });
+  vText('bytepatterns.com', VL + lw, y2 + (1 - t2) * 24, { size: 44, weight: 800, color: accent, alpha: t2 });
+  if (line) vText(line, VL, y2 + 72 + (1 - t3) * 18, { size: 32, weight: 500, color: dim, alpha: t3, max: VR - VL });
+}
+/** Seeks a cut. The first frame a page draws is drawn twice: the very first read of a
+ *  GPU-backed source canvas can come out a shade different from every later one. */
+let vWarm = false;
+function vSeek(draw, i, frames) {
+  const f = Math.max(0, Math.min(frames - 1, Math.floor(i)));
+  if (!vWarm) { vWarm = true; draw(f); }
+  draw(f);
+}
+/** The soundtrack of a cut: the piece's own audio() spliced to the same segments as the picture. */
+async function vAudio(segs, frames, { xf = 0.025, fadeOut = 0.6, extra = null } = {}) {
+  const src = await renderAudio();
+  const SR = 48000, dur = frames / FPS, ac = new OfflineAudioContext(2, Math.round(SR * dur), SR);
+  const out = ac.createGain(); out.connect(ac.destination);
+  out.gain.setValueAtTime(1, 0); out.gain.setValueAtTime(1, dur - fadeOut); out.gain.linearRampToValueAtTime(0, dur - 0.01);
+  segs.forEach((s, k) => {
+    const at = s.at / FPS, off = s.src / FPS, d = s.len / FPS;
+    const pre = k === 0 ? 0 : Math.min(xf, off), post = k === segs.length - 1 ? 0 : xf;
+    const b = ac.createBufferSource(), g = ac.createGain(); b.buffer = src;
+    g.gain.setValueAtTime(pre ? 0 : 1, at - pre);
+    if (pre) g.gain.linearRampToValueAtTime(1, at + pre);
+    if (post) { g.gain.setValueAtTime(1, at + d - post); g.gain.linearRampToValueAtTime(0, at + d + post); }
+    b.connect(g).connect(out); b.start(at - pre, off - pre, d + pre + post);
+  });
+  if (extra) extra(ac, out);
+  const buf = await ac.startRendering();
+  let peak = 0; for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) peak = Math.max(peak, Math.abs(d[i])); }
+  if (peak > 0.9) for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) d[i] *= 0.9 / peak; }
+  return buf;
+}
+/** A soft three-partial bell, for the closing card. */
+function vChime(ac, dest, at, freq, vol = 0.08) {
+  for (const [mul, v, dec] of [[1, 1, 1.8], [2.01, 0.35, 0.8], [3.02, 0.12, 0.4]]) {
+    const o = ac.createOscillator(), g = ac.createGain(); o.type = 'sine'; o.frequency.value = freq * mul;
+    g.gain.setValueAtTime(0.0001, at); g.gain.exponentialRampToValueAtTime(vol * v, at + 0.006); g.gain.exponentialRampToValueAtTime(0.0001, at + dec);
+    o.connect(g).connect(dest); o.start(at); o.stop(at + dec + 0.05);
+  }
+}
+
+/* VERTICAL CUT — this piece */
+// The whole reel up to the signature, 1:1 on the beat, redrawn by the same scene
+// code on a portrait stage (W, H and ctx point at it while it draws), under a
+// one-line hook; the signature makes way for the closing card.
+const VFR = 510, VEND = 450;
+const VST = { x: SAFE.x, y: 410, w: SAFE.w, h: SAFE.b - 410 };
+const vst = document.createElement('canvas'); vst.width = VST.w; vst.height = VST.h;
+const vstx = vst.getContext('2d');                          // GPU-backed, like the landscape canvas
+function vDraw(v) {
+  const keep = [W, H, ctx];
+  W = VST.w; H = VST.h; ctx = vstx;
+  try {
+    if (v < VEND) draw(v);
+    else { resetCtx(); ctx.fillStyle = INK; ctx.fillRect(0, 0, W, H); dotGrid(0.07); }
+  } finally { [W, H, ctx] = keep; }
+  vReset();
+  vx.fillStyle = INK; vx.fillRect(0, 0, VW, VH);
+  vx.fillStyle = PAPER; vx.globalAlpha = 0.05;
+  for (let y = 30; y < VH; y += 60) for (let x = 30; x < VW; x += 60) vx.fillRect(x - 1, y - 1, 3, 3);   // whole pixels: no AA edges to drift
+  vx.globalAlpha = 1;
+  vx.save(); vx.beginPath(); vx.roundRect(VST.x, VST.y, VST.w, VST.h, 28); vx.clip(); vx.drawImage(vst, VST.x, VST.y); vx.restore();
+  vShade('12,12,16');
+  vTag('MOTION SHOWREEL', LIME);
+  const k = E.outExpo(prog(v, -12, 8)), beat = v < VEND ? 1 + 0.02 * pulse(v, 60) : 1;
+  vx.save(); vx.translate(VL, 372); vx.scale(beat, beat);
+  vText('Every frame here is code.', 0, (1 - k) * 24, { size: 74, weight: 900, color: PAPER, spacing: -2, max: VR - VL - 20 });
+  vx.restore();
+  if (v >= VEND) vEndCard(v - VEND, { title: 'Motion Showreel', line: 'kinetic type, shape morphs and a tunnel warp at 120 BPM',
+    ink: PAPER, dim: 'rgba(243,240,232,0.66)', accent: LIME, scrim: '12,12,16', a: 0.6 });
+  vReset();
+}
+
 window.__motion = {
   title: 'Motion Showreel',
   description: 'Eighteen seconds of kinetic type, shape morphs, a dive through a letter and a tunnel warp, cut to a synthesized 120 BPM beat.',
@@ -605,18 +774,33 @@ window.__motion = {
   gifStart: 0,
   seek(i) { draw(Math.max(0, Math.min(FRAMES - 1, Math.floor(i)))); },
   audio: renderAudio,
+  variants: {
+    vertical: {
+      width: VW, height: VH, frames: VFR, canvas: vcv,
+      poster: 300, gifStart: 3,
+      seek(i) { vSeek(vDraw, i, VFR); },
+      audio: () => vAudio([{ at: 0, src: 0, len: VFR }], VFR, { fadeOut: 0.8 }),
+    },
+  },
 };
 
 /* ==========================================================================
    PLAYER — identical in every piece; keep as is.
    Autoplays and loops, starts sound on the first click, ?frame=N pauses on a
-   frame. When the renderer sets window.__MOTION_RENDER__ it stays out of the way.
+   frame, ?variant=vertical plays the vertical cut (if the piece has one).
+   When the renderer sets window.__MOTION_RENDER__ it stays out of the way.
    ========================================================================== */
 (function player() {
-  const M = window.__motion, btn = document.getElementById('sound');
+  const btn = document.getElementById('sound'), q = new URLSearchParams(location.search);
+  let M = window.__motion;
+  const V = !window.__MOTION_RENDER__ && M.variants && M.variants[q.get('variant')];
+  if (V) {                                                // show the variant's own canvas instead
+    M = Object.assign({}, M, V);
+    V.canvas.style.cssText = `width:min(100vw,calc(100vh*${V.width}/${V.height}));height:auto;aspect-ratio:${V.width}/${V.height}`;
+    document.querySelector('canvas').replaceWith(V.canvas);
+  }
   const dur = M.frames / M.fps;
   if (window.__MOTION_RENDER__) { btn.hidden = true; M.seek(0); return; }
-  const q = new URLSearchParams(location.search);
   if (q.has('frame')) { btn.hidden = true; M.seek(+q.get('frame') || 0); return; }
   let t0 = performance.now(), ac = null, src = null, buf = null, paused = false, pausedAt = 0;
   const clock = () => ac && src ? (ac.currentTime - t0) : (performance.now() - t0) / 1000;

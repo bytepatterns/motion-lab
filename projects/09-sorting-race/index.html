@@ -625,8 +625,9 @@ function draw(f) {
 // Every 4th comparison of every algorithm is a tick; its pitch is the larger
 // of the two values being compared (major pentatonic). A bell marks each finish,
 // a chord lands on the podium.
-async function renderAudio() {
-  const SR = 48000, dur = FRAMES / FPS, LEN = Math.round(SR * dur);
+// TM: the race timing (the vertical cut runs the same race on a shorter clock).
+async function renderAudio(TM = { frames: FRAMES, rs: RS, rd: RD, pod: POD, sh0: 4, shStep: 0.42 }) {
+  const SR = 48000, dur = TM.frames / FPS, LEN = Math.round(SR * dur);
   const ac = new OfflineAudioContext(2, LEN, SR);
   const dry = ac.createBuffer(2, LEN, SR), L = dry.getChannelData(0), R = dry.getChannelData(1);
   const PENTA = [0, 2, 4, 7, 9];
@@ -654,24 +655,24 @@ async function renderAudio() {
   }
   const PAN = [-0.7, -0.25, 0.25, 0.7];
   // intro: the shuffle, one tick per bar as it moves
-  for (let i = 0; i < N; i += 2) tone((4 + i * 0.42 + 6) / FPS, pitch(INPUT[i]), 0.14, 0.05, -0.8 + 1.6 * i / N, 0.03, 0.2);
-  thump(RS / FPS, 0.26);
+  for (let i = 0; i < N; i += 2) tone((TM.sh0 + i * TM.shStep + 6) / FPS, pitch(INPUT[i]), 0.14, 0.05, -0.8 + 1.6 * i / N, 0.03, 0.2);
+  thump(TM.rs / FPS, 0.26);
   // the race: ticks
   ALGOS.forEach((A, k) => {
     const pan = PAN[k % 4] * (k < 4 ? 1 : 0.8), harm = k < 4 ? 0.12 : 0.4;
     for (let i = 3; i < A.comparisons; i += 4) {
-      const at = (RS + (i + 1) / MAXC * RD) / FPS;
+      const at = (TM.rs + (i + 1) / MAXC * TM.rd) / FPS;
       tone(at, pitch(Math.max(A.pairs[2 * i], A.pairs[2 * i + 1])), 0.12, 0.06, pan, 0.022, harm);
     }
   });
   // a bell for every finish, pitched by place
   const BELL = [659.26, 587.33, 493.88, 440, 392, 329.63, 293.66, 246.94];
   ALGOS.forEach((A, k) => {
-    const at = finishFrame(A) / FPS, fr = BELL[A.rank - 1], g = A.rank <= 3 ? 0.16 : 0.1;
+    const at = (TM.rs + A.comparisons / MAXC * TM.rd) / FPS, fr = BELL[A.rank - 1], g = A.rank <= 3 ? 0.16 : 0.1;
     [[1, 1, 1.4], [2, 0.35, 0.6], [3.01, 0.18, 0.35], [4.2, 0.08, 0.2]].forEach(([m, a, d]) => tone(at, fr * m, 2.2, g * a, PAN[k % 4] * 0.6, d, 0, 0.003));
   });
   // the podium chord (A major add 9)
-  const chordAt = (POD + 36) / FPS;
+  const chordAt = (TM.pod + 36) / FPS;
   [110, 164.81, 220, 277.18, 329.63, 493.88, 659.26].forEach((fr, i) => tone(chordAt, fr, Math.min(dur - chordAt, 4.6), i < 2 ? 0.12 : 0.08, (i % 2 ? 0.3 : -0.3), 1.8, 0.25, 0.06));
 
   // mix: dry + generated room
@@ -693,6 +694,264 @@ async function renderAudio() {
   return out;
 }
 
+/* ==========================================================================
+   VERTICAL CUT — shared block, identical in every piece.
+   1080x1920 for Reels, Shorts and TikTok (__motion.variants.vertical). The
+   piece's own scene code is re-used and recomposed for a phone: everything a
+   viewer must read stays inside the area no platform covers (x 60..900,
+   y 230..1400); outside it there is only dimmed texture.
+   ========================================================================== */
+const VW = 1080, VH = 1920, SAFE = { x: 60, y: 230, w: 840, h: 1170, r: 900, b: 1400 };
+const vcv = document.createElement('canvas'); vcv.width = VW; vcv.height = VH;
+const vx = vcv.getContext('2d', { willReadFrequently: true });   // CPU raster: identical pixels on every redraw
+const VL = 96, VR = 864;                                          // text column inside the safe area
+
+function vReset() {
+  vx.setTransform(1, 0, 0, 1, 0, 0); vx.globalAlpha = 1; vx.globalCompositeOperation = 'source-over';
+  vx.filter = 'none'; vx.shadowBlur = 0; vx.shadowColor = 'transparent'; vx.letterSpacing = '0px'; vx.setLineDash([]);
+  vx.textAlign = 'left'; vx.textBaseline = 'alphabetic'; vx.lineCap = 'butt'; vx.lineJoin = 'miter';
+}
+/** Canvas text on the vertical frame; `max` shrinks the size until the line fits. */
+function vText(str, x, y, { size = 40, weight = 700, color = '#FFFFFF', align = 'left', spacing = 0, alpha = 1, fam = FONT, max = 0 } = {}) {
+  if (alpha <= 0.002 || !str) return size;
+  vx.font = `${weight} ${size}px ${fam}`; vx.letterSpacing = spacing + 'px';
+  if (max) { const w = vx.measureText(str).width; if (w > max) { size = size * max / w; vx.font = `${weight} ${size}px ${fam}`; } }
+  vx.textAlign = align; vx.textBaseline = 'alphabetic';
+  const a0 = vx.globalAlpha; vx.globalAlpha = a0 * alpha; vx.fillStyle = color;
+  vx.fillText(str, x + (align === 'center' ? spacing / 2 : align === 'right' ? spacing : 0), y);   // tracking is added after the last glyph too
+  vx.globalAlpha = a0; vx.letterSpacing = '0px';
+  return size;
+}
+/** Word-wraps with the given font; returns the lines. */
+function vWrap(str, maxW, size, weight = 700, fam = FONT) {
+  vx.font = `${weight} ${size}px ${fam}`; vx.letterSpacing = '0px';
+  const words = str.split(' '), lines = []; let cur = '';
+  for (const w of words) { const t = cur ? cur + ' ' + w : w; if (vx.measureText(t).width > maxW && cur) { lines.push(cur); cur = w; } else cur = t; }
+  if (cur) lines.push(cur);
+  return lines;
+}
+/** Fade envelope with a small rise: [alpha, dy]. */
+function vEnv(v, a, b, fin = 8, fout = 8) {
+  const i = E.outCubic(prog(v, a, a + fin)), o = 1 - E.inCubic(prog(v, b - fout, b));
+  return [Math.min(i, o), (1 - i) * 22 - (1 - o) * 10];
+}
+/** Which segment of a cut list a vertical frame is in: segs = [{ at, src, len }] in frames. */
+function vSeg(segs, v) {
+  let k = 0; while (k < segs.length - 1 && v >= segs[k + 1].at) k++;
+  const s = segs[k];
+  return { k, s, local: v - s.at, src: s.src + (v - s.at) };
+}
+/** Dims everything outside the safe area to a quiet texture (brightness x 0.2), with a soft inner edge. */
+function vShade(rgb, a = 0.8, feather = 40) {
+  vx.save(); vx.setTransform(1, 0, 0, 1, 0, 0); vx.globalAlpha = 1; vx.globalCompositeOperation = 'source-over';
+  vx.fillStyle = `rgba(${rgb},${a})`;
+  vx.beginPath(); vx.rect(0, 0, VW, VH); vx.rect(SAFE.x, SAFE.y, SAFE.w, SAFE.h); vx.fill('evenodd');
+  const strip = (x0, y0, x1, y1, rx, ry, rw, rh) => {
+    const g = vx.createLinearGradient(x0, y0, x1, y1);
+    g.addColorStop(0, `rgba(${rgb},${a})`); g.addColorStop(1, `rgba(${rgb},0)`);
+    vx.fillStyle = g; vx.fillRect(rx, ry, rw, rh);
+  };
+  strip(SAFE.x, 0, SAFE.x + feather, 0, SAFE.x, SAFE.y, feather, SAFE.h);
+  strip(SAFE.r, 0, SAFE.r - feather, 0, SAFE.r - feather, SAFE.y, feather, SAFE.h);
+  strip(0, SAFE.y, 0, SAFE.y + feather, SAFE.x, SAFE.y, SAFE.w, feather);
+  strip(0, SAFE.b, 0, SAFE.b - feather, SAFE.x, SAFE.b - feather, SAFE.w, feather);
+  vx.restore();
+}
+/** Series tag at the top of the safe area, e.g. MADE IN CODE · 04. */
+function vTag(label, color, alpha = 1) {
+  vText('MADE IN CODE', VL, 292, { size: 28, weight: 800, color, spacing: 5, alpha });
+  vx.font = `800 28px ${FONT}`; vx.letterSpacing = '5px';
+  const w = vx.measureText('MADE IN CODE').width; vx.letterSpacing = '0px';
+  vText('·  ' + label, VL + w + 14, 292, { size: 28, weight: 600, color: 'rgba(255,255,255,0.72)', spacing: 3, alpha, max: VR - VL - w - 14 });
+}
+/** Big hook lines, left-aligned from y0; visible from frame 0, settles in a few frames. */
+function vHook(v, lines, y0, { size = 84, lh = 1.08, color = '#FFFFFF', accent = null, weight = 800, spacing = -1.5, alpha = 1 } = {}) {
+  const k = E.outExpo(prog(v, -6, 12));
+  lines.forEach((ln, i) => {
+    const kk = E.outExpo(prog(v, -12 + i * 2, 8 + i * 2));
+    vText(ln, VL, y0 + i * size * lh + (1 - kk) * 30, { size, weight, spacing, color: accent && i === lines.length - 1 ? accent : color, alpha: alpha * Math.max(0.25, kk), max: VR - VL });
+  });
+  return k;
+}
+/** Closing card, the last 60 frames: piece title, "drawn in code · bytepatterns.com". l = frames into the card. */
+function vEndCard(l, { title, line = '', ink = '#FFFFFF', dim = 'rgba(255,255,255,0.66)', accent = '#FFFFFF', scrim = '0,0,0', a = 0.84 }) {
+  const k = E.outCubic(prog(l, 0, 12));
+  vx.save(); vx.setTransform(1, 0, 0, 1, 0, 0);
+  vx.fillStyle = `rgba(${scrim},${a * k})`; vx.fillRect(0, 0, VW, VH);
+  vx.restore();
+  const t1 = E.outExpo(prog(l, 3, 19)), t2 = E.outExpo(prog(l, 11, 27)), t3 = E.outExpo(prog(l, 19, 35));
+  vx.fillStyle = accent; vx.globalAlpha = t1; vx.fillRect(VL, 742, 88 * t1, 7); vx.globalAlpha = 1;
+  const size = vText(title, VL, 850 + (1 - t1) * 40, { size: 92, weight: 800, color: ink, spacing: -2, alpha: t1, max: VR - VL });
+  const y2 = 850 + Math.max(size, 60) * 0.25 + 70;
+  vx.font = `600 44px ${FONT}`;
+  const lead = 'drawn in code  ·  ', lw = vx.measureText(lead).width;
+  vText(lead, VL, y2 + (1 - t2) * 24, { size: 44, weight: 600, color: dim, alpha: t2 });
+  vText('bytepatterns.com', VL + lw, y2 + (1 - t2) * 24, { size: 44, weight: 800, color: accent, alpha: t2 });
+  if (line) vText(line, VL, y2 + 72 + (1 - t3) * 18, { size: 32, weight: 500, color: dim, alpha: t3, max: VR - VL });
+}
+/** Seeks a cut. The first frame a page draws is drawn twice: the very first read of a
+ *  GPU-backed source canvas can come out a shade different from every later one. */
+let vWarm = false;
+function vSeek(draw, i, frames) {
+  const f = Math.max(0, Math.min(frames - 1, Math.floor(i)));
+  if (!vWarm) { vWarm = true; draw(f); }
+  draw(f);
+}
+/** The soundtrack of a cut: the piece's own audio() spliced to the same segments as the picture. */
+async function vAudio(segs, frames, { xf = 0.025, fadeOut = 0.6, extra = null } = {}) {
+  const src = await renderAudio();
+  const SR = 48000, dur = frames / FPS, ac = new OfflineAudioContext(2, Math.round(SR * dur), SR);
+  const out = ac.createGain(); out.connect(ac.destination);
+  out.gain.setValueAtTime(1, 0); out.gain.setValueAtTime(1, dur - fadeOut); out.gain.linearRampToValueAtTime(0, dur - 0.01);
+  segs.forEach((s, k) => {
+    const at = s.at / FPS, off = s.src / FPS, d = s.len / FPS;
+    const pre = k === 0 ? 0 : Math.min(xf, off), post = k === segs.length - 1 ? 0 : xf;
+    const b = ac.createBufferSource(), g = ac.createGain(); b.buffer = src;
+    g.gain.setValueAtTime(pre ? 0 : 1, at - pre);
+    if (pre) g.gain.linearRampToValueAtTime(1, at + pre);
+    if (post) { g.gain.setValueAtTime(1, at + d - post); g.gain.linearRampToValueAtTime(0, at + d + post); }
+    b.connect(g).connect(out); b.start(at - pre, off - pre, d + pre + post);
+  });
+  if (extra) extra(ac, out);
+  const buf = await ac.startRendering();
+  let peak = 0; for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) peak = Math.max(peak, Math.abs(d[i])); }
+  if (peak > 0.9) for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) d[i] *= 0.9 / peak; }
+  return buf;
+}
+/** A soft three-partial bell, for the closing card. */
+function vChime(ac, dest, at, freq, vol = 0.08) {
+  for (const [mul, v, dec] of [[1, 1, 1.8], [2.01, 0.35, 0.8], [3.02, 0.12, 0.4]]) {
+    const o = ac.createOscillator(), g = ac.createGain(); o.type = 'sine'; o.frequency.value = freq * mul;
+    g.gain.setValueAtTime(0.0001, at); g.gain.exponentialRampToValueAtTime(vol * v, at + 0.006); g.gain.exponentialRampToValueAtTime(0.0001, at + dec);
+    o.connect(g).connect(dest); o.start(at); o.stop(at + dec + 0.05);
+  }
+}
+
+/* VERTICAL CUT — this piece */
+// The same race on a shorter clock: 12 s instead of 20 (still one comparison per
+// tick for everyone, so the finishing order and gaps are exact), eight panels in
+// a 2 x 4 grid, then the podium. The soundtrack is re-timed to the same clock.
+const VRS = 36, VRD = 360, VPOD = VRS + VRD + 20, VFR = 540, VEND = VFR - 60;
+const VTM = { frames: VFR, rs: VRS, rd: VRD, pod: VPOD, sh0: 2, shStep: 0.3 };
+const vClock = v => MAXC * clamp((v - VRS) / VRD);
+const vFinish = A => VRS + A.comparisons / MAXC * VRD;
+function vState(A, v) {
+  const c = vClock(v), done = c >= A.comparisons, idx = done ? A.comparisons : Math.floor(c);
+  return { done, idx, snap: A.snaps[idx], count: done ? A.comparisons : Math.floor(c) };
+}
+const VCAPS = CAPTIONS.map(c => ({ ...c, v: c.f === 0 ? 0 : Math.round(VRS + (c.f - RS) / RD * VRD) }));
+const VGRID = { x: VL, y: 600, w: VR - VL, h: 792, gap: 16 };
+const VPW = (VGRID.w - VGRID.gap) / 2, VPH = (VGRID.h - 3 * VGRID.gap) / 4;
+function vRR(x, y, w, h, r) { vx.beginPath(); vx.roundRect(x, y, w, h, r); }
+function vPanel(k, v) {
+  const A = ALGOS[k], S = vState(A, v), ff = vFinish(A);
+  const x = VGRID.x + (k % 2) * (VPW + VGRID.gap), y = VGRID.y + Math.floor(k / 2) * (VPH + VGRID.gap);
+  const racing = v >= VRS && !S.done;
+  const dim = S.done ? lerp(1, 0.62, E.outCubic(prog(v, ff + 10, ff + 30))) : 1;
+  vRR(x, y, VPW, VPH, 12); vx.fillStyle = racing ? C.panelHi : C.panel; vx.fill();
+  vx.lineWidth = 2; vx.strokeStyle = racing ? 'rgba(255,181,71,0.22)' : C.edge; vx.stroke();
+  const flash = S.done ? 1 - E.outCubic(prog(v, ff, ff + 20)) : 0;
+  if (flash > 0) { vRR(x, y, VPW, VPH, 12); vx.lineWidth = 3; vx.strokeStyle = `rgba(61,220,151,${0.9 * flash})`; vx.stroke(); }
+  vText(A.name, x + 18, y + 42, { size: 30, weight: 700, color: C.text, alpha: dim });
+  const h1 = S.done || v < VRS ? -1 : A.pairs[2 * S.idx], h2 = S.done || v < VRS ? -1 : A.pairs[2 * S.idx + 1];
+  if (v < VRS) vText('ready', x + VPW - 18, y + 42, { size: 28, weight: 600, color: C.muted, align: 'right', alpha: 0.8 });
+  else if (!S.done) vText(`${h1} vs ${h2}`, x + VPW - 18, y + 42, { size: 28, weight: 700, color: C.accent, align: 'right' });
+  else {
+    const pop = E.outBack(prog(v, ff + 3, ff + 13));
+    vx.save(); vx.translate(x + VPW - 18, y + 42); vx.scale(pop, pop);
+    vText(ordinal(A.rank), 0, 0, { size: 32, weight: 800, color: A.rank <= 3 ? C.accent : C.text, align: 'right', alpha: dim });
+    vx.restore();
+  }
+  const bx = x + 18, by = y + 58, bw = VPW - 36, bh = VPH - 58 - 16, step = bw / N, barW = step - 1.2;
+  const sweep = S.done ? E.outCubic(prog(v, ff, ff + 12)) * (N + 6) : 0;
+  vx.globalAlpha = dim;
+  for (let i = 0; i < N; i++) {
+    let val = S.snap[i];
+    if (v < VRS) val = lerp(i + 1, INPUT[i], E.inOutCubic(prog(v, VTM.sh0 + i * VTM.shStep, VTM.sh0 + 12 + i * VTM.shStep)));
+    const hh = Math.max(3, val / N * bh);
+    let c = BAR_SHADE[Math.round(val)];
+    if (val === h1 || val === h2) c = C.accent;
+    if (S.done && i < sweep) c = C.done;
+    vx.fillStyle = c; vx.fillRect(bx + i * step, by + bh - hh, barW, hh);
+  }
+  vx.globalAlpha = 1;
+}
+function vHeader(v) {
+  const k = E.outCubic(prog(v, VRS - 2, VRS + 8));
+  if (k <= 0) return;
+  vText('COMPARISONS', VL, 356, { size: 28, weight: 700, color: C.muted, spacing: 3, alpha: k });
+  const live = v >= VRS && v < VRS + VRD;
+  vText(fmt(vClock(v)), VL - 4, 458, { size: 104, weight: 800, color: live ? C.accent : C.text, spacing: -2, alpha: k });
+  vx.globalAlpha = k;
+  vx.fillStyle = C.edge; vx.fillRect(VL, 484, VR - VL, 3);
+  vx.fillStyle = C.accent; vx.fillRect(VL, 484, (VR - VL) * vClock(v) / MAXC, 3);
+  vx.globalAlpha = 1;
+  let cur = 0; for (let i = 0; i < VCAPS.length; i++) if (VCAPS[i].v <= v) cur = i;
+  const c = VCAPS[cur], a = E.outCubic(prog(v, c.v, c.v + 8));
+  if (cur > 0 && a < 1) vText(VCAPS[cur - 1].text, VL, 548, { size: 34, weight: 500, color: C.muted, alpha: (1 - a) * k, max: VR - VL });
+  vText(c.text, VL + (1 - a) * 14, 548, { size: 34, weight: 500, color: cur > 0 ? C.text : C.muted, alpha: a * k, max: VR - VL });
+}
+function vIntro(v) {
+  const out = prog(v, VRS - 12, VRS);
+  if (out >= 1) return;
+  vx.fillStyle = `rgba(7,9,13,${0.8 * (1 - E.inCubic(out))})`; vx.fillRect(0, 0, VW, VH);
+  const lines = [['8 sorting algorithms.', C.text], ['The same 64 numbers.', C.text], ['Who finishes first?', C.accent]];
+  lines.forEach(([s, col], i) => {
+    const o = E.inCubic(prog(v, VRS - 14 + i * 3, VRS - 4 + i * 3)), kin = E.outExpo(prog(v, -12 + i * 2, 8 + i * 2));
+    vText(s, VL, 420 + i * 96 - o * 30 + (1 - kin) * 24, { size: 80, weight: 800, color: col, spacing: -2, alpha: (1 - o) * kin, max: VR - VL });
+  });
+}
+function vPodium(v) {
+  const s = E.inOutCubic(prog(v, VPOD, VPOD + 16));
+  if (s <= 0) return;
+  vx.fillStyle = `rgba(7,9,13,${0.975 * s})`; vx.fillRect(0, 0, VW, VH);
+  const o = ALGOS.order, ratio = MAXC / MINC;
+  const k1 = E.outCubic(prog(v, VPOD + 6, VPOD + 20));
+  vText('FINAL · SAME 64 NUMBERS', VL, 360, { size: 28, weight: 700, color: C.accent, spacing: 3, alpha: k1 });
+  vText('Same input.', VL, 452 + (1 - k1) * 20, { size: 84, weight: 800, spacing: -1.5, color: C.text, alpha: k1 });
+  vText(`${ratio.toFixed(1)}× the work.`, VL, 546 + (1 - k1) * 20, { size: 84, weight: 800, spacing: -1.5, color: C.accent, alpha: k1 });
+  const base = 900, cx = 480;
+  const slots = [{ i: 1, x: cx - 260, h: 130 }, { i: 0, x: cx, h: 180 }, { i: 2, x: cx + 260, h: 96 }];
+  const delays = { 2: 0, 1: 4, 0: 8 };
+  for (const sl of slots) {
+    const A = o[sl.i]; if (!A) continue;
+    const st = VPOD + 14 + delays[sl.i];
+    const g = E.outBack(prog(v, st, st + 14)), tIn = E.outCubic(prog(v, st + 6, st + 18));
+    const bh = sl.h * g, top = base - bh, bw = 220;
+    vRR(sl.x - bw / 2, top, bw, bh, [10, 10, 0, 0]); vx.fillStyle = sl.i === 0 ? '#2A2114' : '#161C27'; vx.fill();
+    vx.fillStyle = sl.i === 0 ? C.accent : 'rgba(238,242,247,0.35)'; vx.fillRect(sl.x - bw / 2, top, bw, 3);
+    if (g > 0.6) vText(ordinal(A.rank), sl.x, top + Math.min(bh, sl.h) / 2 + 22, { size: 60, weight: 800, align: 'center', color: sl.i === 0 ? C.accent : C.text, alpha: clamp((g - 0.6) / 0.4) });
+    const yT = Math.min(top, base - sl.h);
+    vText(A.name, sl.x, yT - 62 + (1 - tIn) * 14, { size: 32, weight: 700, align: 'center', color: C.text, alpha: tIn, max: 250 });
+    vText(fmt(A.comparisons), sl.x, yT - 14 + (1 - tIn) * 14, { size: 46, weight: 800, align: 'center', color: sl.i === 0 ? C.accent : C.text, alpha: tIn });
+  }
+  vx.fillStyle = 'rgba(238,242,247,0.18)'; vx.fillRect(VL, base, VR - VL, 2);
+  const x0 = 330, maxW = 380, y0 = 950, rowH = 54;
+  o.forEach((A, r) => {
+    const st = VPOD + 24 + r * 3, a = E.outCubic(prog(v, st, st + 8)), g = E.outCubic(prog(v, st + 2, st + 20));
+    const y = y0 + r * rowH;
+    vText(A.name, x0 - 20, y + 30, { size: 30, weight: 600, align: 'right', color: A.rank <= 3 ? C.text : C.muted, alpha: a });
+    const bw = Math.max(4, maxW * A.comparisons / MAXC * g);
+    vRR(x0, y + 8, bw, 28, 4); vx.globalAlpha = a;
+    vx.fillStyle = r === 0 ? C.accent : A.rank <= 3 ? 'rgba(255,181,71,0.55)' : 'rgba(238,242,247,0.30)'; vx.fill(); vx.globalAlpha = 1;
+    vText(fmt(A.comparisons * g), x0 + bw + 14, y + 32, { size: 30, weight: 800, color: C.text, alpha: a });
+  });
+}
+function vDraw(v) {
+  vReset();
+  vx.fillStyle = C.bg; vx.fillRect(0, 0, VW, VH);
+  for (let k = 0; k < ALGOS.length; k++) vPanel(k, v);
+  vHeader(v);
+  vIntro(v);
+  vPodium(v);
+  vReset();
+  vShade('7,9,13');
+  vTag('SORTING RACE', C.accent);
+  if (v >= VEND) vEndCard(v - VEND, { title: 'Sorting Race', line: `eight algorithms, the same 64 numbers, ${(MAXC / MINC).toFixed(1)}× apart`,
+    ink: C.text, dim: 'rgba(238,242,247,0.66)', accent: C.accent, scrim: '7,9,13', a: 0.93 });
+  vReset();
+}
+
 window.__motion = {
   title: 'Sorting Race',
   description: 'Eight sorting algorithms sort the same 64 numbers side by side, paced by their real comparison counts.',
@@ -701,6 +960,19 @@ window.__motion = {
   gifStart: 0,                 // optional: second where the README GIF starts
   seek(i) { draw(Math.max(0, Math.min(FRAMES - 1, Math.floor(i)))); },
   audio: renderAudio,
+  variants: {
+    vertical: {
+      width: VW, height: VH, frames: VFR, canvas: vcv,
+      poster: 200, gifStart: 1,
+      seek(i) { vSeek(vDraw, i, VFR); },
+      audio: async () => {                                  // the race re-timed to the vertical clock, then the closing card fades
+        const buf = await renderAudio(VTM);
+        for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c), n = d.length, f0 = n - Math.round(0.8 * 48000);
+          for (let i = f0; i < n; i++) d[i] *= (n - 1 - i) / (n - 1 - f0); }
+        return buf;
+      },
+    },
+  },
   // the numbers behind the picture, for anyone who wants to check them
   stats: ALGOS.map(A => ({ id: A.id, name: A.name, comparisons: A.comparisons, writes: A.totalWrites, rank: A.rank, sorted: A.sorted, finishFrame: finishFrame(A) })),
   input: INPUT.slice(),
@@ -710,13 +982,20 @@ window.__motion = {
 /* ==========================================================================
    PLAYER — identical in every piece; keep as is.
    Autoplays and loops, starts sound on the first click, ?frame=N pauses on a
-   frame. When the renderer sets window.__MOTION_RENDER__ it stays out of the way.
+   frame, ?variant=vertical plays the vertical cut (if the piece has one).
+   When the renderer sets window.__MOTION_RENDER__ it stays out of the way.
    ========================================================================== */
 (function player() {
-  const M = window.__motion, btn = document.getElementById('sound');
+  const btn = document.getElementById('sound'), q = new URLSearchParams(location.search);
+  let M = window.__motion;
+  const V = !window.__MOTION_RENDER__ && M.variants && M.variants[q.get('variant')];
+  if (V) {                                                // show the variant's own canvas instead
+    M = Object.assign({}, M, V);
+    V.canvas.style.cssText = `width:min(100vw,calc(100vh*${V.width}/${V.height}));height:auto;aspect-ratio:${V.width}/${V.height}`;
+    document.querySelector('canvas').replaceWith(V.canvas);
+  }
   const dur = M.frames / M.fps;
   if (window.__MOTION_RENDER__) { btn.hidden = true; M.seek(0); return; }
-  const q = new URLSearchParams(location.search);
   if (q.has('frame')) { btn.hidden = true; M.seek(+q.get('frame') || 0); return; }
   let t0 = performance.now(), ac = null, src = null, buf = null, paused = false, pausedAt = 0;
   const clock = () => ac && src ? (ac.currentTime - t0) : (performance.now() - t0) / 1000;

@@ -99,6 +99,7 @@ in a browser:
 - sound starts on the first click (browser autoplay policy) and the picture
   restarts from frame 0 in sync with it; a second click mutes;
 - `Space` pauses; `?frame=N` shows a single frame (handy for stills);
+- `?variant=vertical` plays the piece's vertical cut instead (see 7);
 - when the renderer sets `window.__MOTION_RENDER__ = true` before the page
   loads, the player does nothing except `seek(0)`.
 
@@ -128,3 +129,42 @@ node tools/verify.mjs NN-slug     # exits 0
 or all four at once: `node tools/all.mjs NN-slug`. Then look at a few frames
 (`node tools/still.mjs NN-slug 30 200 400` → `out/stills/`) before calling it
 finished. If `verify` fails, the piece is fixed — never the tool.
+
+## 7. Variants (optional): the vertical cut
+
+A piece may also carry a 9:16 cut for Reels, Shorts and TikTok. It is an
+optional sub-object; a piece without it renders and verifies exactly as before.
+
+```js
+window.__motion = {
+  /* ...the landscape piece as above... */
+  variants: {
+    vertical: {
+      width: 1080, height: 1920,
+      frames: 453,                   // 360..600 (12..20 s)
+      canvas: verticalCanvas,        // its own 1080x1920 canvas (required)
+      poster: 300, gifStart: 7,      // optional, as above
+      seek(i) {},                    // same rules as the piece's seek: synchronous, pure in i
+      async audio() {},              // 2 ch, 48 kHz, exactly frames / fps seconds
+    },
+  },
+};
+```
+
+- **Recompose, do not crop.** Re-use the piece's own scene code (through a
+  transform, or with the size and context pointed at a portrait stage) and lay
+  the type out again for a phone.
+- **Safe area.** Platform buttons and captions cover the edges. Everything a
+  viewer must see stays inside **x 60..900, y 230..1400**; outside it only dim
+  texture (luma ≤ 70). `verify --variant vertical` checks this on 7 frames: no
+  run of 3 pixels brighter than luma 70 may lie outside.
+- **Hook in the first second**, readable on frame 0; the **last 2 s are a
+  closing card**: the piece title and `drawn in code · bytepatterns.com`.
+- **Sound** is the piece's own soundtrack, cut to the same segments as the
+  picture (or re-timed, when the picture runs on a different clock).
+- Every tool takes `--variant vertical` and writes `out/NN-slug.vertical.mp4`,
+  `.png` and `.gif` (540 px wide, ≤ 2 MB):
+
+```bash
+node tools/all.mjs NN-slug --variant vertical
+```

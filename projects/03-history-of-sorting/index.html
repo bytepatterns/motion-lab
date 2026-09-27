@@ -26,7 +26,7 @@
    ========================================================================== */
 const W = 1920, H = 1080, FPS = 30, FRAMES = 900;          // 30 s
 const cv = document.getElementById('stage');
-const ctx = cv.getContext('2d', { willReadFrequently: true });   // CPU raster: identical pixels on every redraw
+let ctx = cv.getContext('2d', { willReadFrequently: true });     // CPU raster; the vertical cut points it at its own canvas
 const FONT = 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
 const MONO = 'ui-monospace, "Cascadia Code", Consolas, Menlo, monospace';
 
@@ -307,8 +307,9 @@ function intro(f) {
 }
 
 // ---- one era ---------------------------------------------------------------
-function drawBars(era, lf, alpha) {
-  const ev = era.ev, n = era.n, x0 = 900, x1 = 1800, slot = (x1 - x0) / n, bw = slot * 0.7, base = 712, hmax = 380;
+const BARS = { x0: 900, x1: 1800, base: 712, hmax: 380 };
+function drawBars(era, lf, alpha, L = BARS) {
+  const ev = era.ev, n = era.n, { x0, x1, base, hmax } = L, slot = (x1 - x0) / n, bw = slot * 0.7;
   const kf = runK(lf, ev), k = Math.min(ev.length - 1, Math.floor(kf)), fr = kf - k;
   const cur = ev[Math.min(ev.length - 1, k + 1)];
   const A = ev[k].a, B = cur.a, m = E.outCubic(fr);
@@ -543,6 +544,200 @@ async function renderAudio() {
   return ac.startRendering();
 }
 
+/* ==========================================================================
+   VERTICAL CUT — shared block, identical in every piece.
+   1080x1920 for Reels, Shorts and TikTok (__motion.variants.vertical). The
+   piece's own scene code is re-used and recomposed for a phone: everything a
+   viewer must read stays inside the area no platform covers (x 60..900,
+   y 230..1400); outside it there is only dimmed texture.
+   ========================================================================== */
+const VW = 1080, VH = 1920, SAFE = { x: 60, y: 230, w: 840, h: 1170, r: 900, b: 1400 };
+const vcv = document.createElement('canvas'); vcv.width = VW; vcv.height = VH;
+const vx = vcv.getContext('2d', { willReadFrequently: true });   // CPU raster: identical pixels on every redraw
+const VL = 96, VR = 864;                                          // text column inside the safe area
+
+function vReset() {
+  vx.setTransform(1, 0, 0, 1, 0, 0); vx.globalAlpha = 1; vx.globalCompositeOperation = 'source-over';
+  vx.filter = 'none'; vx.shadowBlur = 0; vx.shadowColor = 'transparent'; vx.letterSpacing = '0px'; vx.setLineDash([]);
+  vx.textAlign = 'left'; vx.textBaseline = 'alphabetic'; vx.lineCap = 'butt'; vx.lineJoin = 'miter';
+}
+/** Canvas text on the vertical frame; `max` shrinks the size until the line fits. */
+function vText(str, x, y, { size = 40, weight = 700, color = '#FFFFFF', align = 'left', spacing = 0, alpha = 1, fam = FONT, max = 0 } = {}) {
+  if (alpha <= 0.002 || !str) return size;
+  vx.font = `${weight} ${size}px ${fam}`; vx.letterSpacing = spacing + 'px';
+  if (max) { const w = vx.measureText(str).width; if (w > max) { size = size * max / w; vx.font = `${weight} ${size}px ${fam}`; } }
+  vx.textAlign = align; vx.textBaseline = 'alphabetic';
+  const a0 = vx.globalAlpha; vx.globalAlpha = a0 * alpha; vx.fillStyle = color;
+  vx.fillText(str, x + (align === 'center' ? spacing / 2 : align === 'right' ? spacing : 0), y);   // tracking is added after the last glyph too
+  vx.globalAlpha = a0; vx.letterSpacing = '0px';
+  return size;
+}
+/** Word-wraps with the given font; returns the lines. */
+function vWrap(str, maxW, size, weight = 700, fam = FONT) {
+  vx.font = `${weight} ${size}px ${fam}`; vx.letterSpacing = '0px';
+  const words = str.split(' '), lines = []; let cur = '';
+  for (const w of words) { const t = cur ? cur + ' ' + w : w; if (vx.measureText(t).width > maxW && cur) { lines.push(cur); cur = w; } else cur = t; }
+  if (cur) lines.push(cur);
+  return lines;
+}
+/** Fade envelope with a small rise: [alpha, dy]. */
+function vEnv(v, a, b, fin = 8, fout = 8) {
+  const i = E.outCubic(prog(v, a, a + fin)), o = 1 - E.inCubic(prog(v, b - fout, b));
+  return [Math.min(i, o), (1 - i) * 22 - (1 - o) * 10];
+}
+/** Which segment of a cut list a vertical frame is in: segs = [{ at, src, len }] in frames. */
+function vSeg(segs, v) {
+  let k = 0; while (k < segs.length - 1 && v >= segs[k + 1].at) k++;
+  const s = segs[k];
+  return { k, s, local: v - s.at, src: s.src + (v - s.at) };
+}
+/** Dims everything outside the safe area to a quiet texture (brightness x 0.2), with a soft inner edge. */
+function vShade(rgb, a = 0.8, feather = 40) {
+  vx.save(); vx.setTransform(1, 0, 0, 1, 0, 0); vx.globalAlpha = 1; vx.globalCompositeOperation = 'source-over';
+  vx.fillStyle = `rgba(${rgb},${a})`;
+  vx.beginPath(); vx.rect(0, 0, VW, VH); vx.rect(SAFE.x, SAFE.y, SAFE.w, SAFE.h); vx.fill('evenodd');
+  const strip = (x0, y0, x1, y1, rx, ry, rw, rh) => {
+    const g = vx.createLinearGradient(x0, y0, x1, y1);
+    g.addColorStop(0, `rgba(${rgb},${a})`); g.addColorStop(1, `rgba(${rgb},0)`);
+    vx.fillStyle = g; vx.fillRect(rx, ry, rw, rh);
+  };
+  strip(SAFE.x, 0, SAFE.x + feather, 0, SAFE.x, SAFE.y, feather, SAFE.h);
+  strip(SAFE.r, 0, SAFE.r - feather, 0, SAFE.r - feather, SAFE.y, feather, SAFE.h);
+  strip(0, SAFE.y, 0, SAFE.y + feather, SAFE.x, SAFE.y, SAFE.w, feather);
+  strip(0, SAFE.b, 0, SAFE.b - feather, SAFE.x, SAFE.b - feather, SAFE.w, feather);
+  vx.restore();
+}
+/** Series tag at the top of the safe area, e.g. MADE IN CODE · 04. */
+function vTag(label, color, alpha = 1) {
+  vText('MADE IN CODE', VL, 292, { size: 28, weight: 800, color, spacing: 5, alpha });
+  vx.font = `800 28px ${FONT}`; vx.letterSpacing = '5px';
+  const w = vx.measureText('MADE IN CODE').width; vx.letterSpacing = '0px';
+  vText('·  ' + label, VL + w + 14, 292, { size: 28, weight: 600, color: 'rgba(255,255,255,0.72)', spacing: 3, alpha, max: VR - VL - w - 14 });
+}
+/** Big hook lines, left-aligned from y0; visible from frame 0, settles in a few frames. */
+function vHook(v, lines, y0, { size = 84, lh = 1.08, color = '#FFFFFF', accent = null, weight = 800, spacing = -1.5, alpha = 1 } = {}) {
+  const k = E.outExpo(prog(v, -6, 12));
+  lines.forEach((ln, i) => {
+    const kk = E.outExpo(prog(v, -12 + i * 2, 8 + i * 2));
+    vText(ln, VL, y0 + i * size * lh + (1 - kk) * 30, { size, weight, spacing, color: accent && i === lines.length - 1 ? accent : color, alpha: alpha * Math.max(0.25, kk), max: VR - VL });
+  });
+  return k;
+}
+/** Closing card, the last 60 frames: piece title, "drawn in code · bytepatterns.com". l = frames into the card. */
+function vEndCard(l, { title, line = '', ink = '#FFFFFF', dim = 'rgba(255,255,255,0.66)', accent = '#FFFFFF', scrim = '0,0,0', a = 0.84 }) {
+  const k = E.outCubic(prog(l, 0, 12));
+  vx.save(); vx.setTransform(1, 0, 0, 1, 0, 0);
+  vx.fillStyle = `rgba(${scrim},${a * k})`; vx.fillRect(0, 0, VW, VH);
+  vx.restore();
+  const t1 = E.outExpo(prog(l, 3, 19)), t2 = E.outExpo(prog(l, 11, 27)), t3 = E.outExpo(prog(l, 19, 35));
+  vx.fillStyle = accent; vx.globalAlpha = t1; vx.fillRect(VL, 742, 88 * t1, 7); vx.globalAlpha = 1;
+  const size = vText(title, VL, 850 + (1 - t1) * 40, { size: 92, weight: 800, color: ink, spacing: -2, alpha: t1, max: VR - VL });
+  const y2 = 850 + Math.max(size, 60) * 0.25 + 70;
+  vx.font = `600 44px ${FONT}`;
+  const lead = 'drawn in code  ·  ', lw = vx.measureText(lead).width;
+  vText(lead, VL, y2 + (1 - t2) * 24, { size: 44, weight: 600, color: dim, alpha: t2 });
+  vText('bytepatterns.com', VL + lw, y2 + (1 - t2) * 24, { size: 44, weight: 800, color: accent, alpha: t2 });
+  if (line) vText(line, VL, y2 + 72 + (1 - t3) * 18, { size: 32, weight: 500, color: dim, alpha: t3, max: VR - VL });
+}
+/** Seeks a cut. The first frame a page draws is drawn twice: the very first read of a
+ *  GPU-backed source canvas can come out a shade different from every later one. */
+let vWarm = false;
+function vSeek(draw, i, frames) {
+  const f = Math.max(0, Math.min(frames - 1, Math.floor(i)));
+  if (!vWarm) { vWarm = true; draw(f); }
+  draw(f);
+}
+/** The soundtrack of a cut: the piece's own audio() spliced to the same segments as the picture. */
+async function vAudio(segs, frames, { xf = 0.025, fadeOut = 0.6, extra = null } = {}) {
+  const src = await renderAudio();
+  const SR = 48000, dur = frames / FPS, ac = new OfflineAudioContext(2, Math.round(SR * dur), SR);
+  const out = ac.createGain(); out.connect(ac.destination);
+  out.gain.setValueAtTime(1, 0); out.gain.setValueAtTime(1, dur - fadeOut); out.gain.linearRampToValueAtTime(0, dur - 0.01);
+  segs.forEach((s, k) => {
+    const at = s.at / FPS, off = s.src / FPS, d = s.len / FPS;
+    const pre = k === 0 ? 0 : Math.min(xf, off), post = k === segs.length - 1 ? 0 : xf;
+    const b = ac.createBufferSource(), g = ac.createGain(); b.buffer = src;
+    g.gain.setValueAtTime(pre ? 0 : 1, at - pre);
+    if (pre) g.gain.linearRampToValueAtTime(1, at + pre);
+    if (post) { g.gain.setValueAtTime(1, at + d - post); g.gain.linearRampToValueAtTime(0, at + d + post); }
+    b.connect(g).connect(out); b.start(at - pre, off - pre, d + pre + post);
+  });
+  if (extra) extra(ac, out);
+  const buf = await ac.startRendering();
+  let peak = 0; for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) peak = Math.max(peak, Math.abs(d[i])); }
+  if (peak > 0.9) for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) d[i] *= 0.9 / peak; }
+  return buf;
+}
+/** A soft three-partial bell, for the closing card. */
+function vChime(ac, dest, at, freq, vol = 0.08) {
+  for (const [mul, v, dec] of [[1, 1, 1.8], [2.01, 0.35, 0.8], [3.02, 0.12, 0.4]]) {
+    const o = ac.createOscillator(), g = ac.createGain(); o.type = 'sine'; o.frequency.value = freq * mul;
+    g.gain.setValueAtTime(0.0001, at); g.gain.exponentialRampToValueAtTime(vol * v, at + 0.006); g.gain.exponentialRampToValueAtTime(0.0001, at + dec);
+    o.connect(g).connect(dest); o.start(at); o.stop(at + dec + 0.05);
+  }
+}
+
+/* VERTICAL CUT — this piece */
+// All five eras, each cut to its run (lf 22..120: the sort starts at 24 and is
+// done by 118), after the 48-bar hook. Big year on top, the bars below.
+const VIN = 48, VERA = 98, VL0 = 22;
+const VSEG = [{ at: 0, src: 0, len: VIN }, ...ERAS.map((_, e) => ({ at: VIN + e * VERA, src: INTRO + e * ERA_LEN + VL0, len: VERA }))];
+VSEG[VSEG.length - 1].len += 60;                          // the last era runs on under the closing card
+const VFR = VIN + ERAS.length * VERA + 60, VEND = VFR - 60;
+const VBARS = { x0: VL, x1: VR, base: 1150, hmax: 380 };
+function vYears(lit) {
+  vx.font = `600 28px ${MONO}`;
+  let x = VL;
+  ERAS.forEach((e, k) => {
+    const on = k <= lit, cur = k === lit;
+    vText(String(e.year), x, 352, { size: 28, weight: cur ? 800 : 600, fam: MONO, color: cur ? C.amber : on ? C.ink : C.dim, alpha: cur ? 1 : on ? 0.8 : 0.55 });
+    if (cur) { vx.fillStyle = C.amber; vx.fillRect(x, 364, 72, 3); }
+    x += 72 + 34;
+  });
+}
+function vIntro(v) {
+  const n = INTRO_N, slot = (VR - VL) / n, bw = slot * 0.6, base = VBARS.base;
+  for (let p = 0; p < n; p++) {
+    const val = INTRO_PERM[p], d = introLand(val) - 3;
+    const u = E.outExpo(prog(v, d, d + 20));
+    const x = VL + slot * lerp(p, val - 1, u) + (slot - bw) / 2;
+    const lift = Math.sin(Math.PI * clamp(u * 1.15)) * 34, h = 26 + (val / n) * VBARS.hmax;
+    vx.fillStyle = mix(C.bar, C.amber, E.outCubic(prog(v, d + 6, d + 14)));
+    vx.beginPath(); vx.roundRect(x, base - h - lift, bw, h, [3, 3, 0, 0]); vx.fill();
+  }
+  vHook(v, ['A short history', 'of sorting'], 470, { size: 96, color: C.ink });
+  vText('Five ideas, 1945 → 2002', VL, 640, { size: 44, weight: 500, color: C.dim, alpha: E.outExpo(prog(v, -6, 14)) });
+}
+function vEra(e, lf, lv) {
+  const era = ERAS[e], prev = ERAS[e - 1];
+  const yu = E.inOutCubic(prog(lv, 0, 14));
+  const year = prev ? Math.round(lerp(prev.year, era.year, yu)) : era.year;
+  const inT = prev ? 1 : E.outExpo(prog(lv, 0, 12));
+  vText(String(year), VL - 8, 590 + (1 - inT) * 50, { size: 230, weight: 800, color: C.ink, spacing: -6, alpha: inT });
+  const nIn = E.outExpo(prog(lv, 2, 16));
+  vText(era.name, VL, 680 + (1 - nIn) * 30, { size: 72, weight: 700, color: C.amber, alpha: nIn });
+  vText(era.who, VL + 2, 736 + (1 - nIn) * 30, { size: 40, weight: 500, color: C.dim, alpha: E.outExpo(prog(lv, 5, 19)) });
+  const main = ctx; ctx = vx;
+  try { drawBars(era, lf, 1, VBARS); } finally { ctx = main; }
+  vReset();
+  const cIn = E.outExpo(prog(lv, 6, 22));
+  vWrap(era.line, VR - VL, 40, 500).forEach((ln, i) => vText(ln, VL, 1304 + i * 50 + (1 - cIn) * 20, { size: 40, weight: 500, color: C.ink, alpha: cIn }));
+  vYears(yu > 0.5 || !prev ? e : e - 1);
+}
+function vDraw(v) {
+  vReset();
+  vx.fillStyle = C.bg; vx.fillRect(0, 0, VW, VH);
+  const { k, local } = vSeg(VSEG, v);
+  if (k === 0) vIntro(v);
+  else vEra(k - 1, Math.min(VL0 + local, 134), local);
+  vReset();
+  vShade('14,17,22');
+  vTag('A SHORT HISTORY OF SORTING', C.amber);
+  if (v >= VEND) vEndCard(v - VEND, { title: 'A Short History of Sorting', line: 'merge · Shell · quick · heap · Timsort, 1945 to 2002',
+    ink: C.ink, dim: 'rgba(237,234,227,0.66)', accent: C.amber, scrim: '14,17,22' });
+  vReset();
+}
+
 window.__motion = {
   title: 'A Short History of Sorting',
   description: 'Merge sort, Shellsort, quicksort, heapsort and Timsort, 1945 to 2002, each one running for real on a row of bars.',
@@ -551,18 +746,33 @@ window.__motion = {
   gifStart: 2.4,
   seek(i) { draw(Math.max(0, Math.min(FRAMES - 1, Math.floor(i)))); },
   audio: renderAudio,
+  variants: {
+    vertical: {
+      width: VW, height: VH, frames: VFR, canvas: vcv,
+      poster: VIN + 2 * VERA + 60, gifStart: 1.2,
+      seek(i) { vSeek(vDraw, i, VFR); },
+      audio: () => vAudio(VSEG, VFR),
+    },
+  },
 };
 
 /* ==========================================================================
    PLAYER — identical in every piece; keep as is.
    Autoplays and loops, starts sound on the first click, ?frame=N pauses on a
-   frame. When the renderer sets window.__MOTION_RENDER__ it stays out of the way.
+   frame, ?variant=vertical plays the vertical cut (if the piece has one).
+   When the renderer sets window.__MOTION_RENDER__ it stays out of the way.
    ========================================================================== */
 (function player() {
-  const M = window.__motion, btn = document.getElementById('sound');
+  const btn = document.getElementById('sound'), q = new URLSearchParams(location.search);
+  let M = window.__motion;
+  const V = !window.__MOTION_RENDER__ && M.variants && M.variants[q.get('variant')];
+  if (V) {                                                // show the variant's own canvas instead
+    M = Object.assign({}, M, V);
+    V.canvas.style.cssText = `width:min(100vw,calc(100vh*${V.width}/${V.height}));height:auto;aspect-ratio:${V.width}/${V.height}`;
+    document.querySelector('canvas').replaceWith(V.canvas);
+  }
   const dur = M.frames / M.fps;
   if (window.__MOTION_RENDER__) { btn.hidden = true; M.seek(0); return; }
-  const q = new URLSearchParams(location.search);
   if (q.has('frame')) { btn.hidden = true; M.seek(+q.get('frame') || 0); return; }
   let t0 = performance.now(), ac = null, src = null, buf = null, paused = false, pausedAt = 0;
   const clock = () => ac && src ? (ac.currentTime - t0) : (performance.now() - t0) / 1000;

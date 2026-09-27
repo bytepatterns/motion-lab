@@ -34,7 +34,7 @@
    ========================================================================== */
 const W = 1920, H = 1080, FPS = 30, FRAMES = 600;          // 20 s
 const cv = document.getElementById('stage');
-const ctx = cv.getContext('2d');
+let ctx = cv.getContext('2d');                                   // the vertical cut points it at its own canvas
 const FONT = 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
 
 // ---- helpers -------------------------------------------------------------
@@ -582,6 +582,223 @@ async function renderAudio() {
   return buf;
 }
 
+/* ==========================================================================
+   VERTICAL CUT — shared block, identical in every piece.
+   1080x1920 for Reels, Shorts and TikTok (__motion.variants.vertical). The
+   piece's own scene code is re-used and recomposed for a phone: everything a
+   viewer must read stays inside the area no platform covers (x 60..900,
+   y 230..1400); outside it there is only dimmed texture.
+   ========================================================================== */
+const VW = 1080, VH = 1920, SAFE = { x: 60, y: 230, w: 840, h: 1170, r: 900, b: 1400 };
+const vcv = document.createElement('canvas'); vcv.width = VW; vcv.height = VH;
+const vx = vcv.getContext('2d', { willReadFrequently: true });   // CPU raster: identical pixels on every redraw
+const VL = 96, VR = 864;                                          // text column inside the safe area
+
+function vReset() {
+  vx.setTransform(1, 0, 0, 1, 0, 0); vx.globalAlpha = 1; vx.globalCompositeOperation = 'source-over';
+  vx.filter = 'none'; vx.shadowBlur = 0; vx.shadowColor = 'transparent'; vx.letterSpacing = '0px'; vx.setLineDash([]);
+  vx.textAlign = 'left'; vx.textBaseline = 'alphabetic'; vx.lineCap = 'butt'; vx.lineJoin = 'miter';
+}
+/** Canvas text on the vertical frame; `max` shrinks the size until the line fits. */
+function vText(str, x, y, { size = 40, weight = 700, color = '#FFFFFF', align = 'left', spacing = 0, alpha = 1, fam = FONT, max = 0 } = {}) {
+  if (alpha <= 0.002 || !str) return size;
+  vx.font = `${weight} ${size}px ${fam}`; vx.letterSpacing = spacing + 'px';
+  if (max) { const w = vx.measureText(str).width; if (w > max) { size = size * max / w; vx.font = `${weight} ${size}px ${fam}`; } }
+  vx.textAlign = align; vx.textBaseline = 'alphabetic';
+  const a0 = vx.globalAlpha; vx.globalAlpha = a0 * alpha; vx.fillStyle = color;
+  vx.fillText(str, x + (align === 'center' ? spacing / 2 : align === 'right' ? spacing : 0), y);   // tracking is added after the last glyph too
+  vx.globalAlpha = a0; vx.letterSpacing = '0px';
+  return size;
+}
+/** Word-wraps with the given font; returns the lines. */
+function vWrap(str, maxW, size, weight = 700, fam = FONT) {
+  vx.font = `${weight} ${size}px ${fam}`; vx.letterSpacing = '0px';
+  const words = str.split(' '), lines = []; let cur = '';
+  for (const w of words) { const t = cur ? cur + ' ' + w : w; if (vx.measureText(t).width > maxW && cur) { lines.push(cur); cur = w; } else cur = t; }
+  if (cur) lines.push(cur);
+  return lines;
+}
+/** Fade envelope with a small rise: [alpha, dy]. */
+function vEnv(v, a, b, fin = 8, fout = 8) {
+  const i = E.outCubic(prog(v, a, a + fin)), o = 1 - E.inCubic(prog(v, b - fout, b));
+  return [Math.min(i, o), (1 - i) * 22 - (1 - o) * 10];
+}
+/** Which segment of a cut list a vertical frame is in: segs = [{ at, src, len }] in frames. */
+function vSeg(segs, v) {
+  let k = 0; while (k < segs.length - 1 && v >= segs[k + 1].at) k++;
+  const s = segs[k];
+  return { k, s, local: v - s.at, src: s.src + (v - s.at) };
+}
+/** Dims everything outside the safe area to a quiet texture (brightness x 0.2), with a soft inner edge. */
+function vShade(rgb, a = 0.8, feather = 40) {
+  vx.save(); vx.setTransform(1, 0, 0, 1, 0, 0); vx.globalAlpha = 1; vx.globalCompositeOperation = 'source-over';
+  vx.fillStyle = `rgba(${rgb},${a})`;
+  vx.beginPath(); vx.rect(0, 0, VW, VH); vx.rect(SAFE.x, SAFE.y, SAFE.w, SAFE.h); vx.fill('evenodd');
+  const strip = (x0, y0, x1, y1, rx, ry, rw, rh) => {
+    const g = vx.createLinearGradient(x0, y0, x1, y1);
+    g.addColorStop(0, `rgba(${rgb},${a})`); g.addColorStop(1, `rgba(${rgb},0)`);
+    vx.fillStyle = g; vx.fillRect(rx, ry, rw, rh);
+  };
+  strip(SAFE.x, 0, SAFE.x + feather, 0, SAFE.x, SAFE.y, feather, SAFE.h);
+  strip(SAFE.r, 0, SAFE.r - feather, 0, SAFE.r - feather, SAFE.y, feather, SAFE.h);
+  strip(0, SAFE.y, 0, SAFE.y + feather, SAFE.x, SAFE.y, SAFE.w, feather);
+  strip(0, SAFE.b, 0, SAFE.b - feather, SAFE.x, SAFE.b - feather, SAFE.w, feather);
+  vx.restore();
+}
+/** Series tag at the top of the safe area, e.g. MADE IN CODE · 04. */
+function vTag(label, color, alpha = 1) {
+  vText('MADE IN CODE', VL, 292, { size: 28, weight: 800, color, spacing: 5, alpha });
+  vx.font = `800 28px ${FONT}`; vx.letterSpacing = '5px';
+  const w = vx.measureText('MADE IN CODE').width; vx.letterSpacing = '0px';
+  vText('·  ' + label, VL + w + 14, 292, { size: 28, weight: 600, color: 'rgba(255,255,255,0.72)', spacing: 3, alpha, max: VR - VL - w - 14 });
+}
+/** Big hook lines, left-aligned from y0; visible from frame 0, settles in a few frames. */
+function vHook(v, lines, y0, { size = 84, lh = 1.08, color = '#FFFFFF', accent = null, weight = 800, spacing = -1.5, alpha = 1 } = {}) {
+  const k = E.outExpo(prog(v, -6, 12));
+  lines.forEach((ln, i) => {
+    const kk = E.outExpo(prog(v, -12 + i * 2, 8 + i * 2));
+    vText(ln, VL, y0 + i * size * lh + (1 - kk) * 30, { size, weight, spacing, color: accent && i === lines.length - 1 ? accent : color, alpha: alpha * Math.max(0.25, kk), max: VR - VL });
+  });
+  return k;
+}
+/** Closing card, the last 60 frames: piece title, "drawn in code · bytepatterns.com". l = frames into the card. */
+function vEndCard(l, { title, line = '', ink = '#FFFFFF', dim = 'rgba(255,255,255,0.66)', accent = '#FFFFFF', scrim = '0,0,0', a = 0.84 }) {
+  const k = E.outCubic(prog(l, 0, 12));
+  vx.save(); vx.setTransform(1, 0, 0, 1, 0, 0);
+  vx.fillStyle = `rgba(${scrim},${a * k})`; vx.fillRect(0, 0, VW, VH);
+  vx.restore();
+  const t1 = E.outExpo(prog(l, 3, 19)), t2 = E.outExpo(prog(l, 11, 27)), t3 = E.outExpo(prog(l, 19, 35));
+  vx.fillStyle = accent; vx.globalAlpha = t1; vx.fillRect(VL, 742, 88 * t1, 7); vx.globalAlpha = 1;
+  const size = vText(title, VL, 850 + (1 - t1) * 40, { size: 92, weight: 800, color: ink, spacing: -2, alpha: t1, max: VR - VL });
+  const y2 = 850 + Math.max(size, 60) * 0.25 + 70;
+  vx.font = `600 44px ${FONT}`;
+  const lead = 'drawn in code  ·  ', lw = vx.measureText(lead).width;
+  vText(lead, VL, y2 + (1 - t2) * 24, { size: 44, weight: 600, color: dim, alpha: t2 });
+  vText('bytepatterns.com', VL + lw, y2 + (1 - t2) * 24, { size: 44, weight: 800, color: accent, alpha: t2 });
+  if (line) vText(line, VL, y2 + 72 + (1 - t3) * 18, { size: 32, weight: 500, color: dim, alpha: t3, max: VR - VL });
+}
+/** Seeks a cut. The first frame a page draws is drawn twice: the very first read of a
+ *  GPU-backed source canvas can come out a shade different from every later one. */
+let vWarm = false;
+function vSeek(draw, i, frames) {
+  const f = Math.max(0, Math.min(frames - 1, Math.floor(i)));
+  if (!vWarm) { vWarm = true; draw(f); }
+  draw(f);
+}
+/** The soundtrack of a cut: the piece's own audio() spliced to the same segments as the picture. */
+async function vAudio(segs, frames, { xf = 0.025, fadeOut = 0.6, extra = null } = {}) {
+  const src = await renderAudio();
+  const SR = 48000, dur = frames / FPS, ac = new OfflineAudioContext(2, Math.round(SR * dur), SR);
+  const out = ac.createGain(); out.connect(ac.destination);
+  out.gain.setValueAtTime(1, 0); out.gain.setValueAtTime(1, dur - fadeOut); out.gain.linearRampToValueAtTime(0, dur - 0.01);
+  segs.forEach((s, k) => {
+    const at = s.at / FPS, off = s.src / FPS, d = s.len / FPS;
+    const pre = k === 0 ? 0 : Math.min(xf, off), post = k === segs.length - 1 ? 0 : xf;
+    const b = ac.createBufferSource(), g = ac.createGain(); b.buffer = src;
+    g.gain.setValueAtTime(pre ? 0 : 1, at - pre);
+    if (pre) g.gain.linearRampToValueAtTime(1, at + pre);
+    if (post) { g.gain.setValueAtTime(1, at + d - post); g.gain.linearRampToValueAtTime(0, at + d + post); }
+    b.connect(g).connect(out); b.start(at - pre, off - pre, d + pre + post);
+  });
+  if (extra) extra(ac, out);
+  const buf = await ac.startRendering();
+  let peak = 0; for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) peak = Math.max(peak, Math.abs(d[i])); }
+  if (peak > 0.9) for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) d[i] *= 0.9 / peak; }
+  return buf;
+}
+/** A soft three-partial bell, for the closing card. */
+function vChime(ac, dest, at, freq, vol = 0.08) {
+  for (const [mul, v, dec] of [[1, 1, 1.8], [2.01, 0.35, 0.8], [3.02, 0.12, 0.4]]) {
+    const o = ac.createOscillator(), g = ac.createGain(); o.type = 'sine'; o.frequency.value = freq * mul;
+    g.gain.setValueAtTime(0.0001, at); g.gain.exponentialRampToValueAtTime(vol * v, at + 0.006); g.gain.exponentialRampToValueAtTime(0.0001, at + dec);
+    o.connect(g).connect(dest); o.start(at); o.stop(at + dec + 0.05);
+  }
+}
+
+/* VERTICAL CUT — this piece */
+// One continuous take: the arena (840 px wide in the landscape piece, too) fills
+// the phone under a score line; LEVEL CLEAR at 14.8 s, then the closing card.
+const VFR = 540, VEND = VFR - 60;
+const VA = { s: 0.85, x: 110, y: 520, L: G.L - 16, T: G.T - 6, W: G.R - G.L + 32 };   // arena crop (landscape px), its scale and where it lands
+// the vignette is drawn once: a radial gradient filled fresh every frame can come out
+// a level different depending on what the page drew before
+const VGLOW = (() => { const c = document.createElement('canvas'); c.width = VW; c.height = VH;
+  const g = c.getContext('2d', { willReadFrequently: true }), r = g.createRadialGradient(480, 900, 200, 480, 900, 1100);
+  r.addColorStop(0, 'rgba(40,20,80,0.35)'); r.addColorStop(1, 'rgba(0,0,0,0.6)'); g.fillStyle = r; g.fillRect(0, 0, VW, VH); return c; })();
+function vBackground(f) {
+  vx.fillStyle = C.bg; vx.fillRect(0, 0, VW, VH);
+  // the landscape grid, as pixel-aligned rects (anti-aliased hairlines drift by a level between redraws)
+  vx.save(); vx.fillStyle = 'rgba(91,63,168,0.16)';
+  const off = Math.round((f * 1.2) % 60);
+  for (let x = off - 60; x < VW + 60; x += 60) vx.fillRect(x, 0, 1, VH);
+  for (let y = off - 60; y < VH + 60; y += 60) vx.fillRect(0, y, VW, 1);
+  vx.restore();
+  vx.drawImage(VGLOW, 0, 0);
+}
+function vHud(v, f) {
+  const fr = RUN.frames[f], k = E.outCubic(prog(v, 56, 70));
+  if (k <= 0) return;
+  const tSec = (fr.clearedAt >= 0 ? fr.clearedAt : f) / FPS, dy = (1 - k) * 20;
+  vText('SCORE', VL, 372 + dy, { size: 28, weight: 700, color: C.dim, spacing: 6, alpha: k });
+  vText(fmtScore(displayScore(RUN, f)), VL - 4, 462 + dy, { size: 80, weight: 800, color: C.paper, spacing: 1, alpha: k });
+  vText('TIME', 470, 372 + dy, { size: 28, weight: 700, color: C.dim, spacing: 6, alpha: k });
+  vText(tSec.toFixed(1) + ' s', 466, 462 + dy, { size: 80, weight: 800, color: C.paper, spacing: 1, alpha: k });
+  vText('BRICKS', VR, 372 + dy, { size: 28, weight: 700, color: C.dim, spacing: 6, align: 'right', alpha: k });
+  vText(String(fr.alive).padStart(2, '0'), VR, 462 + dy, { size: 80, weight: 800, color: fr.alive === 0 ? C.amber : C.cyan, spacing: 2, align: 'right', alpha: k });
+}
+function vClear(f) {
+  const a = f - RUN.clearedAt;
+  if (RUN.clearedAt < 0 || a < 0) return;
+  vx.fillStyle = `rgba(7,6,15,${0.8 * E.outCubic(clamp(a / 12))})`; vx.fillRect(SAFE.x, 500, SAFE.w, SAFE.b - 500);
+  vx.save();
+  vx.setTransform(VA.s, 0, 0, VA.s, VA.x - VA.s * VA.L, VA.y - VA.s * VA.T);
+  vx.globalCompositeOperation = 'lighter';
+  for (let n = 0; n < 7; n++) {                            // the same fireworks as the landscape card
+    const t0 = n * 9, age = a - t0; if (age < 0 || age > 60) continue;
+    const r = mulberry32(900 + n), cx = lerp(G.L + 120, G.R - 120, r()), cy = 220 + r() * 260;
+    vx.fillStyle = [C.magenta, C.cyan, C.amber][n % 3];
+    for (let k = 0; k < 40; k++) { const ang = k / 40 * Math.PI * 2 + r() * 0.1, sp = 380 + r() * 160, t = age / FPS;
+      vx.globalAlpha = Math.max(0, 1 - t / 2); vx.fillRect(cx + Math.cos(ang) * sp * t - 2.5, cy + Math.sin(ang) * sp * t + 260 * t * t - 2.5, 5, 5); }
+  }
+  vx.restore();
+  const gone = 1 - E.inCubic(prog(f, VEND - 4, VEND + 8));        // makes room for the closing card
+  const k = clamp(E.outBack(clamp(a / 14))) * gone, s = lerp(1.3, 1, E.outExpo(clamp(a / 14)));
+  vx.save(); vx.translate(480, 860); vx.scale(s, s);
+  glowText('LEVEL', 0, -70, 150, 900, C.paper, C.magenta, k, 12, 'center');
+  glowText('CLEAR', 0, 80, 150, 900, C.paper, C.magenta, k, 12, 'center');
+  vx.restore();
+  const k1 = E.outCubic(clamp((a - 10) / 14)) * gone;
+  vText(`${RUN.bricks.length} bricks  ·  ${(RUN.clearedAt / FPS).toFixed(1)} s  ·  no ball lost`, 480, 1060 + (1 - k1) * 20, { size: 38, weight: 600, color: C.amber, align: 'center', alpha: k1, max: VR - VL });
+}
+function vDraw(v) {
+  const f = Math.min(FRAMES - 1, v), fr = RUN.frames[f];
+  // the arena exactly as the landscape piece draws it, on the landscape canvas ...
+  if (ctx.reset) ctx.reset();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; ctx.filter = 'none'; ctx.shadowBlur = 0;
+  background(f);
+  const [sx, sy] = shake(RUN, f);
+  ctx.setTransform(1, 0, 0, 1, sx, sy);
+  arena(f, fr.fire); bricks(RUN, f); particles(RUN, f); paddle(RUN, f, fr); balls(RUN, f); callouts(RUN, f);
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
+  // ... then scaled onto the phone
+  vReset();
+  vBackground(f);
+  vx.save();
+  vx.beginPath(); vx.rect(SAFE.x, 500, SAFE.w, SAFE.b - 500); vx.clip();
+  vx.drawImage(cv, VA.L, VA.T, VA.W, H - VA.T, VA.x, VA.y, VA.W * VA.s, (H - VA.T) * VA.s);
+  vx.restore();
+  vShade('7,6,15');
+  vTag('NEON BREAKOUT', C.magenta);
+  if (v < 70) vHook(v, ['This game', 'plays itself.'], 388, { size: 88, color: C.paper, accent: C.cyan, alpha: 1 - E.inCubic(prog(v, 56, 70)) });
+  vHud(v, f);
+  const main = ctx; ctx = vx;
+  try { vClear(f); } finally { ctx = main; }
+  if (v >= VEND) vEndCard(v - VEND, { title: 'Neon Breakout', line: 'deterministic physics, every brick cleared, no ball lost',
+    ink: C.paper, dim: 'rgba(243,240,255,0.66)', accent: C.cyan, scrim: '7,6,15' });
+  vReset();
+}
+
 window.__motion = {
   title: 'Neon Breakout',
   description: 'A neon Breakout level that plays itself: deterministic physics, multi-ball, a fire-ball and every brick cleared.',
@@ -590,19 +807,34 @@ window.__motion = {
   gifStart: 5,
   seek(i) { draw(Math.max(0, Math.min(FRAMES - 1, Math.floor(i)))); },
   audio: renderAudio,
+  variants: {
+    vertical: {
+      width: VW, height: VH, frames: VFR, canvas: vcv,
+      poster: 214, gifStart: 5,
+      seek(i) { vSeek(vDraw, i, VFR); },
+      audio: () => vAudio([{ at: 0, src: 0, len: VFR }], VFR, { fadeOut: 1.0 }),
+    },
+  },
   stats: { clearedAt: RUN.clearedAt, lost: RUN.lost, score: RUN.score },
 };
 
 /* ==========================================================================
    PLAYER — identical in every piece; keep as is.
    Autoplays and loops, starts sound on the first click, ?frame=N pauses on a
-   frame. When the renderer sets window.__MOTION_RENDER__ it stays out of the way.
+   frame, ?variant=vertical plays the vertical cut (if the piece has one).
+   When the renderer sets window.__MOTION_RENDER__ it stays out of the way.
    ========================================================================== */
 (function player() {
-  const M = window.__motion, btn = document.getElementById('sound');
+  const btn = document.getElementById('sound'), q = new URLSearchParams(location.search);
+  let M = window.__motion;
+  const V = !window.__MOTION_RENDER__ && M.variants && M.variants[q.get('variant')];
+  if (V) {                                                // show the variant's own canvas instead
+    M = Object.assign({}, M, V);
+    V.canvas.style.cssText = `width:min(100vw,calc(100vh*${V.width}/${V.height}));height:auto;aspect-ratio:${V.width}/${V.height}`;
+    document.querySelector('canvas').replaceWith(V.canvas);
+  }
   const dur = M.frames / M.fps;
   if (window.__MOTION_RENDER__) { btn.hidden = true; M.seek(0); return; }
-  const q = new URLSearchParams(location.search);
   if (q.has('frame')) { btn.hidden = true; M.seek(+q.get('frame') || 0); return; }
   let t0 = performance.now(), ac = null, src = null, buf = null, paused = false, pausedAt = 0;
   const clock = () => ac && src ? (ac.currentTime - t0) : (performance.now() - t0) / 1000;
