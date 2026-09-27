@@ -1,0 +1,633 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="author" content="teambytepatterns">
+<meta name="description" content="A neon Breakout level that plays itself: deterministic ball physics, multi-ball, a fire-ball and every brick cleared in under fifteen seconds.">
+<title>Neon Breakout — motion-lab</title>
+<style>
+  /* Player chrome. The piece itself lives entirely in the canvas. */
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  body { display: grid; place-items: center; font: 500 15px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #fff; }
+  canvas { display: block; width: min(100vw, calc(100vh * 16 / 9)); height: auto; aspect-ratio: 16 / 9; }
+  #sound { position: fixed; left: 16px; bottom: 16px; padding: 8px 14px; border: 1px solid rgba(255,255,255,.35); border-radius: 999px;
+           background: rgba(0,0,0,.55); color: #fff; font: inherit; cursor: pointer; }
+  #sound[hidden] { display: none; }
+</style>
+</head>
+<body>
+<canvas id="stage" width="1920" height="1080" aria-label="A neon Breakout game playing itself"></canvas>
+<button id="sound" type="button">Click for sound</button>
+<script>
+'use strict';
+/* ==========================================================================
+   PIECE — Neon Breakout.
+   The level is simulated once, up front, with a fixed timestep (8 substeps a
+   frame) and a paddle controller that aims for the lowest brick. Every frame
+   stores paddle + balls; every hit is an event. seek(i) reads frame i and
+   draws particles, pop-ups and shake analytically from the events before i,
+   so any frame can be drawn in any order. The soundtrack is scheduled from
+   the same events: brick pitch = brick row.
+   Arrow keys (or A / D) take over the paddle in the browser; Esc returns to
+   the demo. The rendered video is always the auto-play run.
+   ========================================================================== */
+const W = 1920, H = 1080, FPS = 30, FRAMES = 600;          // 20 s
+const cv = document.getElementById('stage');
+const ctx = cv.getContext('2d');
+const FONT = 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
+
+// ---- helpers -------------------------------------------------------------
+function mulberry32(a) { return function () { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a);
+  t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const lerp = (a, b, t) => a + (b - a) * t;
+const prog = (f, a, b) => clamp((f - a) / (b - a));
+const E = {
+  inCubic: t => t * t * t,
+  outCubic: t => 1 - Math.pow(1 - t, 3),
+  inOutCubic: t => t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2,
+  outExpo: t => t === 1 ? 1 : 1 - Math.pow(2, -10 * t),
+  inExpo: t => t === 0 ? 0 : Math.pow(2, 10 * t - 10),
+  outBack: t => 1 + 2.70158 * Math.pow(t - 1, 3) + 1.70158 * Math.pow(t - 1, 2),
+};
+
+// ---- palette: magenta → cyan rows, amber for power-ups, ink + white -------
+const C = { bg: '#07060F', ink: '#0E0B1C', paper: '#F3F0FF', dim: '#8C86B3', amber: '#FFB547', magenta: '#FF3FD0', cyan: '#3FF0FF' };
+const hex = h => [parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16), parseInt(h.slice(5, 7), 16)];
+const ROWC = Array.from({ length: 7 }, (_, r) => { const a = hex(C.magenta), b = hex(C.cyan), t = r / 6;
+  return `rgb(${Math.round(lerp(a[0], b[0], t))},${Math.round(lerp(a[1], b[1], t))},${Math.round(lerp(a[2], b[2], t))})`; });
+
+// ---- game (pure, deterministic) --------------------------------------------
+const G = {
+  L: 540, R: 1380, T: 64, PY: 972, PH: 18, PW: 176, BR: 11,
+  cols: 12, rows: 7, bx0: 552, by0: 206, bw: 64, bh: 28, bpx: 70, bpy: 38,
+  SUB: 8, vmax: 3200,
+};
+const LEVEL = {                                            // tuned so the run clears with no ball lost
+  speed0: 1242.0944951878373, speedUp: 5.962836589025793, speedMax: 1427.0480318877599,
+  launch: -0.020628741906425496, aimBias: 0.09162457049691486,
+  splits: ['4,2', '4,9', '5,5', '5,6'], fires: ['3,5'], fireLen: 71, maxBalls: 3,
+  lowW: 1.0775817513314099, xW: 0.197710859612729,
+};
+
+function makeGame(O) {
+  const SPLITS = new Set(O.splits), FIRES = new Set(O.fires);
+  let fireUntil = -1;
+  const dt = 1 / (FPS * G.SUB);
+  const bricks = [];
+  for (let r = 0; r < G.rows; r++) for (let c = 0; c < G.cols; c++)
+    bricks.push({ r, c, x: G.bx0 + c * G.bpx, y: G.by0 + r * G.bpy, alive: true, dead: Infinity, split: SPLITS.has(r + ',' + c), fire: FIRES.has(r + ',' + c) && !SPLITS.has(r + ',' + c) });
+  const S = { bricks, alive: bricks.length, balls: [], px: (G.L + G.R) / 2, speed: O.speed0, score: 0, combo: 0, clearedAt: -1, lost: 0, f: 0, frames: [], events: [] };
+  const addBall = (x, y, vx, vy, f) => S.balls.push({ x, y, vx, vy, on: true, born: f });
+  addBall(S.px + 30, G.PY - G.BR - 1, Math.sin(O.launch) * O.speed0, -Math.cos(O.launch) * O.speed0, 0);
+  const target = { x: S.px };
+  function aim(ballX) {
+    let best = null, bs = -1e9;
+    for (const b of bricks) if (b.alive) {
+      const cx = b.x + G.bw / 2, cy = b.y + G.bh / 2;
+      const s = cy * O.lowW - Math.abs(cx - ballX) * O.xW + (b.split ? 60 : 0);
+      if (s > bs) { bs = s; best = b; }
+    }
+    return best;
+  }
+  function predict(b) {
+    if (b.vy <= 0) return null;
+    const t = (G.PY - G.BR - b.y) / b.vy;
+    if (t < 0) return null;
+    const w = G.R - G.L - 2 * G.BR;
+    let x = b.x - G.L - G.BR + b.vx * t;
+    x = ((x % (2 * w)) + 2 * w) % (2 * w); if (x > w) x = 2 * w - x;
+    return { x: x + G.L + G.BR, t };
+  }
+  // one frame; keys = null for auto-play, or -1/0/1 for the player
+  S.step = function (keys) {
+    const f = S.f, ev = S.events, balls = S.balls;
+    if (S.clearedAt < 0) for (let s = 0; s < G.SUB; s++) {
+      if (keys === null || keys === undefined) {
+        let pick = null;
+        for (const b of balls) if (b.on) { const p = predict(b); if (p && (!pick || p.t < pick.t)) pick = { ...p, b }; }
+        if (pick) {
+          const tb = aim(pick.x);
+          let off = 0;
+          if (tb) {
+            const dx = tb.x + G.bw / 2 - pick.x, dy = (G.PY - G.BR) - (tb.y + G.bh / 2);
+            off = Math.max(-0.85, Math.min(0.85, Math.atan2(dx, dy) / (62 * Math.PI / 180) + O.aimBias));
+          }
+          const want = pick.x - off * G.PW / 2;
+          target.x = Math.abs(want - S.px) <= G.vmax * pick.t ? want : pick.x;
+        } else {
+          let lo = null; for (const b of balls) if (b.on && (!lo || b.y > lo.y)) lo = b;
+          if (lo) target.x = lo.x;
+        }
+      } else target.x = S.px + keys * 1500 * dt * 1.0001;
+      target.x = Math.max(G.L + G.PW / 2, Math.min(G.R - G.PW / 2, target.x));
+      S.px += Math.max(-G.vmax * dt, Math.min(G.vmax * dt, target.x - S.px));
+      for (let bi = 0; bi < balls.length; bi++) {
+        const b = balls[bi]; if (!b.on) continue;
+        b.x += b.vx * dt; b.y += b.vy * dt;
+        if (b.x < G.L + G.BR) { b.x = 2 * (G.L + G.BR) - b.x; b.vx = Math.abs(b.vx); ev.push({ f, k: 'wall', x: G.L, y: b.y }); }
+        if (b.x > G.R - G.BR) { b.x = 2 * (G.R - G.BR) - b.x; b.vx = -Math.abs(b.vx); ev.push({ f, k: 'wall', x: G.R, y: b.y }); }
+        if (b.y < G.T + G.BR) { b.y = 2 * (G.T + G.BR) - b.y; b.vy = Math.abs(b.vy); ev.push({ f, k: 'wall', x: b.x, y: G.T }); }
+        if (b.vy > 0 && b.y + G.BR >= G.PY && b.y + G.BR <= G.PY + G.PH + 14 && Math.abs(b.x - S.px) <= G.PW / 2 + G.BR) {
+          const off = Math.max(-1, Math.min(1, (b.x - S.px) / (G.PW / 2)));
+          const a = off * 62 * Math.PI / 180;
+          b.vx = Math.sin(a) * S.speed; b.vy = -Math.cos(a) * S.speed; b.y = G.PY - G.BR;
+          S.combo = 0; ev.push({ f, k: 'paddle', x: b.x, y: G.PY, bi });
+        }
+        if (b.y > 1100) { b.on = false; S.lost++; ev.push({ f, k: 'lost', x: b.x, y: 1080 }); continue; }
+        const burning = f < fireUntil;
+        for (const k of bricks) {
+          if (!k.alive) continue;
+          const nx = Math.max(k.x, Math.min(b.x, k.x + G.bw)), ny = Math.max(k.y, Math.min(b.y, k.y + G.bh));
+          const dx = b.x - nx, dy = b.y - ny;
+          if (dx * dx + dy * dy > G.BR * G.BR) continue;
+          const ox = Math.min(b.x + G.BR - k.x, k.x + G.bw - (b.x - G.BR)), oy = Math.min(b.y + G.BR - k.y, k.y + G.bh - (b.y - G.BR));
+          if (burning) { /* plough on */ } else if (ox < oy) { b.vx = b.x < k.x + G.bw / 2 ? -Math.abs(b.vx) : Math.abs(b.vx); }
+          else { b.vy = b.y < k.y + G.bh / 2 ? -Math.abs(b.vy) : Math.abs(b.vy); }
+          k.alive = false; k.dead = f; S.alive--; S.combo++;
+          const pts = (G.rows - k.r) * 10 * Math.min(S.combo, 8);
+          S.score += pts;
+          ev.push({ f, k: 'brick', x: k.x + G.bw / 2, y: k.y + G.bh / 2, r: k.r, c: k.c, pts, combo: S.combo, bi, split: k.split, fire: k.fire, burning });
+          S.speed = Math.min(O.speedMax, S.speed + O.speedUp);
+          const m = Math.hypot(b.vx, b.vy); b.vx *= S.speed / m; b.vy *= S.speed / m;
+          if (k.split && balls.filter(q => q.on).length < O.maxBalls) {
+            for (const a of [-0.55, 0.55]) {
+              const ang = Math.atan2(b.vx, -b.vy) + a;
+              addBall(k.x + G.bw / 2, k.y + G.bh / 2, Math.sin(ang) * S.speed, -Math.abs(Math.cos(ang) * S.speed), f);
+            }
+            ev.push({ f, k: 'split', x: k.x + G.bw / 2, y: k.y + G.bh / 2 });
+          }
+          if (k.fire) { fireUntil = f + O.fireLen; ev.push({ f, k: 'fire', x: k.x + G.bw / 2, y: k.y + G.bh / 2 }); }
+          if (!burning) break;
+        }
+      }
+      if (S.alive === 0 && S.clearedAt < 0) { S.clearedAt = f; ev.push({ f, k: 'clear' }); }
+    }
+    S.frames.push({ px: S.px, fire: f < fireUntil, balls: balls.map(b => b.on && S.clearedAt < 0 ? [b.x, b.y] : null), score: S.score, alive: S.alive, combo: S.combo, clearedAt: S.clearedAt });
+    S.f++;
+  };
+  return S;
+}
+
+// the demo run, simulated once
+const RUN = makeGame(LEVEL);
+for (let f = 0; f < FRAMES; f++) RUN.step(null);
+const CLEAR = RUN.clearedAt;                               // 444 with this level
+const byFrame = new Map(); RUN.events.forEach((e, i) => { e.id = i; if (e.k !== 'wall') { if (!byFrame.has(e.f)) byFrame.set(e.f, []); byFrame.get(e.f).push(e); } });
+const bricksEv = RUN.events.filter(e => e.k === 'brick');
+
+// ---- glow sprites (drawn once) ----------------------------------------------
+function glowSprite(color, w, h, blur) {
+  const c = document.createElement('canvas'); c.width = w + blur * 4; c.height = h + blur * 4;
+  const g = c.getContext('2d'); g.filter = `blur(${blur}px)`; g.fillStyle = color;
+  g.beginPath(); g.roundRect(blur * 2, blur * 2, w, h, 8); g.fill(); return c;
+}
+const BRICK_GLOW = ROWC.map(c => glowSprite(c, G.bw, G.bh, 12));
+const AMBER_GLOW = glowSprite(C.amber, G.bw, G.bh, 14);
+const PADDLE_GLOW = glowSprite(C.cyan, G.PW, G.PH, 16);
+const dot = (color, r, blur) => { const c = document.createElement('canvas'); c.width = c.height = (r + blur * 2) * 2;
+  const g = c.getContext('2d'); g.filter = `blur(${blur}px)`; g.fillStyle = color; g.beginPath(); g.arc(c.width / 2, c.height / 2, r, 0, Math.PI * 2); g.fill(); return c; };
+const BALL_GLOW = dot(C.cyan, 16, 12), FIRE_GLOW = dot(C.amber, 22, 16);
+
+// ---- drawing ---------------------------------------------------------------
+function text(str, x, y, size, weight, color, alpha = 1, spacing = 0, align = 'left') {
+  if (alpha <= 0.002) return;
+  ctx.globalAlpha = alpha; ctx.fillStyle = color; ctx.textAlign = align; ctx.textBaseline = 'alphabetic';
+  ctx.font = `${weight} ${size}px ${FONT}`; ctx.letterSpacing = spacing + 'px';
+  ctx.fillText(str, x, y);
+  ctx.globalAlpha = 1; ctx.letterSpacing = '0px';
+}
+// soft neon glow without shadowBlur (blur paths can differ by a bit between a fresh and a warm canvas)
+function glowText(str, x, y, size, weight, color, glow, alpha, spacing = 0, align = 'left') {
+  if (alpha <= 0.002) return;
+  ctx.save(); ctx.font = `${weight} ${size}px ${FONT}`; ctx.letterSpacing = spacing + 'px'; ctx.textAlign = align; ctx.textBaseline = 'alphabetic';
+  ctx.lineJoin = 'round'; ctx.strokeStyle = glow;
+  for (const [w, a] of [[30, 0.07], [18, 0.11], [9, 0.18]]) { ctx.globalAlpha = alpha * a; ctx.lineWidth = w; ctx.strokeText(str, x, y); }
+  ctx.restore();
+  text(str, x, y, size, weight, color, alpha, spacing, align);
+}
+const fmtScore = n => String(Math.round(n)).padStart(6, '0');
+
+function displayScore(run, f) {                            // each hit rolls in over 8 frames
+  let s = 0;
+  for (const e of run.bricksEv) { if (e.f > f) break; s += e.pts * E.outCubic(clamp((f - e.f + 1) / 8)); }
+  return s;
+}
+function shake(run, f) {
+  let a = 0;
+  for (let k = Math.max(0, f - 14); k <= f; k++) { const list = run.byFrame.get(k); if (!list) continue;
+    for (const e of list) a += (e.k === 'split' || e.k === 'fire' ? 16 : e.k === 'brick' ? (e.burning ? 3 : 2.2) : e.k === 'clear' ? 22 : 0) * Math.exp(-(f - k) * 0.35); }
+  a = Math.min(a, 24);
+  return [Math.sin(f * 2.7) * a, Math.cos(f * 3.3) * a * 0.7];
+}
+
+function background(f) {
+  ctx.fillStyle = C.bg; ctx.fillRect(0, 0, W, H);
+  // horizon-less grid floor, slowly scrolling, very dim
+  ctx.save(); ctx.globalAlpha = 0.16; ctx.strokeStyle = '#5b3fa8'; ctx.lineWidth = 1;
+  ctx.beginPath();
+  const off = (f * 1.2) % 60;
+  for (let x = -60 + off; x < W + 60; x += 60) { ctx.moveTo(x, 0); ctx.lineTo(x, H); }
+  for (let y = -60 + off; y < H + 60; y += 60) { ctx.moveTo(0, y); ctx.lineTo(W, y); }
+  ctx.stroke(); ctx.restore();
+  const g = ctx.createRadialGradient(W / 2, H / 2, 200, W / 2, H / 2, 1100);
+  g.addColorStop(0, 'rgba(40,20,80,0.35)'); g.addColorStop(1, 'rgba(0,0,0,0.6)');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+}
+
+function arena(f, fire) {
+  const pulse = 0.55 + 0.1 * Math.sin(f * 0.2);
+  ctx.save();
+  ctx.fillStyle = 'rgba(8,6,20,0.85)'; ctx.fillRect(G.L - 6, G.T - 6, G.R - G.L + 12, 1080 - G.T + 6);
+  ctx.strokeStyle = fire ? C.amber : C.cyan; ctx.lineJoin = 'round';
+  ctx.beginPath(); ctx.moveTo(G.L - 6, 1080); ctx.lineTo(G.L - 6, G.T - 6); ctx.lineTo(G.R + 6, G.T - 6); ctx.lineTo(G.R + 6, 1080);
+  for (const [w, a] of [[16, 0.08], [8, 0.16], [3, 1]]) { ctx.globalAlpha = pulse * a; ctx.lineWidth = w; ctx.stroke(); }
+  ctx.restore();
+}
+
+function brickShape(x, y, color, alpha, special) {
+  ctx.globalAlpha = alpha;
+  const g = ctx.createLinearGradient(0, y, 0, y + G.bh);
+  g.addColorStop(0, '#ffffff'); g.addColorStop(0.18, color); g.addColorStop(1, color);
+  ctx.fillStyle = g; ctx.beginPath(); ctx.roundRect(x, y, G.bw, G.bh, 6); ctx.fill();
+  ctx.fillStyle = 'rgba(7,6,15,0.55)'; ctx.beginPath(); ctx.roundRect(x + 4, y + 9, G.bw - 8, G.bh - 13, 4); ctx.fill();
+  if (special === 'split') { ctx.fillStyle = '#fff'; for (const d of [-12, 0, 12]) { ctx.beginPath(); ctx.arc(x + G.bw / 2 + d, y + G.bh / 2 + 2, 3.2, 0, Math.PI * 2); ctx.fill(); } }
+  if (special === 'fire') { ctx.fillStyle = '#fff'; ctx.beginPath(); const cx = x + G.bw / 2, cy = y + G.bh / 2 + 2;
+    ctx.moveTo(cx, cy - 9); ctx.quadraticCurveTo(cx + 9, cy, cx, cy + 7); ctx.quadraticCurveTo(cx - 9, cy, cx, cy - 9); ctx.fill(); }
+  ctx.globalAlpha = 1;
+}
+
+function bricks(run, f) {
+  // intro: rows drop in during the first 10 frames (the hook), staggered
+  ctx.save(); ctx.globalCompositeOperation = 'lighter';
+  for (const b of run.bricks) {
+    if (b.dead <= f) continue;
+    const intro = E.outBack(clamp((f - b.r * 0.7 + 3) / 7)), y = b.y - (1 - intro) * 60;
+    const special = b.split || b.fire;
+    const spr = special ? AMBER_GLOW : BRICK_GLOW[b.r];
+    ctx.globalAlpha = (special ? 0.75 + 0.25 * Math.sin(f * 0.3 + b.c) : 0.45) * clamp(intro);
+    ctx.drawImage(spr, b.x - 24, y - 24);
+  }
+  ctx.restore();
+  for (const b of run.bricks) {
+    if (b.dead <= f) continue;
+    const intro = E.outBack(clamp((f - b.r * 0.7 + 3) / 7)), y = b.y - (1 - intro) * 60;
+    brickShape(b.x, y, b.split || b.fire ? C.amber : ROWC[b.r], clamp(intro), b.split ? 'split' : b.fire ? 'fire' : null);
+  }
+}
+
+function particles(run, f) {
+  ctx.save(); ctx.globalCompositeOperation = 'lighter';
+  for (const e of run.bricksEv) {
+    const age = f - e.f; if (age < 0) break; if (age > 42) continue;
+    const r = mulberry32(e.id * 7919 + 13), col = e.split || e.fire ? C.amber : ROWC[e.r];
+    // shock ring
+    if (age < 14) { const k = E.outCubic(age / 14); ctx.globalAlpha = (1 - k) * 0.8; ctx.strokeStyle = col; ctx.lineWidth = 3 * (1 - k) + 1;
+      ctx.beginPath(); ctx.ellipse(e.x, e.y, 20 + k * 70, 10 + k * 40, 0, 0, Math.PI * 2); ctx.stroke(); }
+    // shards
+    ctx.fillStyle = col;
+    const n = e.split || e.fire ? 26 : 16;
+    for (let k = 0; k < n; k++) {
+      const a = r() * Math.PI * 2, sp = 160 + r() * 520, life = 0.5 + r() * 0.9, sz = 2 + r() * 5;
+      const t = age / FPS; if (t > life) continue;
+      const x = e.x + Math.cos(a) * sp * t, y = e.y + Math.sin(a) * sp * t + 900 * t * t;
+      ctx.globalAlpha = (1 - t / life) * 0.95;
+      ctx.fillRect(x - sz / 2, y - sz / 2, sz, sz);
+    }
+  }
+  ctx.restore();
+  // score pop-ups
+  // (during a fire-ball rampage only every fourth hit gets one, or they pile up)
+  for (const e of run.bricksEv) {
+    const age = f - e.f; if (age < 0) break; if (age > 22) continue;
+    if (e.burning && e.combo % 4 !== 0) continue;
+    const k = age / 22;
+    text('+' + e.pts, e.x, e.y - 10 - E.outCubic(k) * 46, e.combo >= 4 ? 34 : 28, 800, C.paper, (1 - E.inCubic(k)) * 0.95, 0, 'center');
+  }
+}
+
+function paddle(run, f, fr) {
+  const x = fr.px - G.PW / 2, y = G.PY;
+  let hit = 0; for (let k = Math.max(0, f - 6); k <= f; k++) { const l = run.byFrame.get(k); if (l && l.some(e => e.k === 'paddle')) hit = Math.max(hit, 1 - (f - k) / 7); }
+  ctx.save(); ctx.globalCompositeOperation = 'lighter'; ctx.globalAlpha = 0.6 + 0.4 * hit; ctx.drawImage(PADDLE_GLOW, x - 32, y - 32); ctx.restore();
+  const g = ctx.createLinearGradient(0, y, 0, y + G.PH);
+  g.addColorStop(0, '#ffffff'); g.addColorStop(0.35, C.cyan); g.addColorStop(1, '#1aa6c0');
+  ctx.fillStyle = g; ctx.beginPath(); ctx.roundRect(x, y - hit * 3, G.PW, G.PH, 9); ctx.fill();
+}
+
+function balls(run, f) {
+  const fr = run.frames[f];
+  ctx.save(); ctx.globalCompositeOperation = 'lighter';
+  for (let bi = 0; bi < fr.balls.length; bi++) {
+    const p = fr.balls[bi]; if (!p) continue;
+    // trail from earlier frames of the same ball
+    const burning = fr.fire;
+    let prev = p;
+    for (let k = 1; k <= (burning ? 7 : 5); k++) {
+      const q = f - k >= 0 ? run.frames[f - k].balls[bi] : null; if (!q) break;
+      const dx = q[0] - prev[0], dy = q[1] - prev[1]; if (dx * dx + dy * dy > 200 * 200) break;   // bounced off-screen jump guard
+      ctx.globalAlpha = (1 - k / 8) * (burning ? 0.7 : 0.45);
+      ctx.strokeStyle = burning ? C.amber : C.cyan; ctx.lineWidth = G.BR * 2 * (1 - k / 9); ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.moveTo(prev[0], prev[1]); ctx.lineTo(q[0], q[1]); ctx.stroke();
+      prev = q;
+    }
+    ctx.globalAlpha = 1;
+    const spr = burning ? FIRE_GLOW : BALL_GLOW; ctx.drawImage(spr, p[0] - spr.width / 2, p[1] - spr.height / 2);
+  }
+  ctx.restore();
+  for (const p of fr.balls) { if (!p) continue; ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(p[0], p[1], G.BR, 0, Math.PI * 2); ctx.fill(); }
+}
+
+function callouts(run, f) {
+  for (const e of run.events) {
+    if (e.k !== 'split' && e.k !== 'fire') continue;
+    const age = f - e.f; if (age < 0 || age > 36) continue;
+    const k = E.outBack(clamp(age / 10)), o = 1 - E.inCubic(clamp((age - 24) / 12));
+    ctx.save(); ctx.translate((G.L + G.R) / 2, 640); ctx.scale(k, k);
+    glowText(e.k === 'split' ? 'MULTI-BALL' : 'FIRE-BALL', 0, 0, 96, 900, C.amber, C.amber, o, 6, 'center');
+    ctx.restore();
+  }
+}
+
+function hud(run, f, live) {
+  const fr = run.frames[f];
+  const k = E.outExpo(clamp((f + 3) / 12));
+  // left: title + score
+  text('NEON', 96, 160 - (1 - k) * 30, 68, 900, C.magenta, k, 5);
+  text('BREAKOUT', 96, 234 - (1 - k) * 30, 68, 900, C.paper, k, 5);
+  text('SCORE', 100, 404, 30, 700, C.dim, k, 6);
+  text(fmtScore(run.live ? fr.score : displayScore(run, f)), 96, 506, 100, 800, C.paper, k, 1);
+  text('BRICKS', 100, 620, 30, 700, C.dim, k, 6);
+  text(String(fr.alive).padStart(2, '0'), 96, 716, 96, 800, fr.alive === 0 ? C.amber : C.cyan, k, 2);
+  const tSec = (fr.clearedAt >= 0 ? fr.clearedAt : f) / FPS;
+  text('TIME', 100, 818, 30, 700, C.dim, k, 6);
+  text(tSec.toFixed(1) + ' s', 96, 900, 72, 800, C.paper, k, 1);
+  // right: mode, level, balls, combo
+  const blink = 0.55 + 0.45 * Math.sin(f * 0.35);
+  ctx.globalAlpha = k * blink; ctx.fillStyle = live ? C.amber : C.magenta; ctx.beginPath(); ctx.arc(1478, 158, 11, 0, Math.PI * 2); ctx.fill(); ctx.globalAlpha = 1;
+  text(live ? 'PLAYER' : 'AUTO-PLAY', 1502, 172, 44, 800, C.paper, k, 4);
+  text('LEVEL', 1462, 266, 30, 700, C.dim, k, 6);
+  text('01', 1458, 358, 96, 800, C.paper, k, 2);
+  text('BALLS', 1462, 460, 30, 700, C.dim, k, 6);
+  const nb = fr.balls.filter(Boolean).length;
+  for (let i = 0; i < 3; i++) { ctx.globalAlpha = k * (i < nb ? 1 : 0.18); ctx.fillStyle = i < nb ? '#fff' : C.dim;
+    ctx.beginPath(); ctx.arc(1480 + i * 46, 508, 14, 0, Math.PI * 2); ctx.fill(); }
+  ctx.globalAlpha = 1;
+  if (fr.combo >= 3 && fr.clearedAt < 0) {
+    text('COMBO', 1462, 640, 30, 700, C.dim, 1, 6);
+    text('×' + fr.combo, 1458, 736, 96, 900, C.amber, 1, 2);
+  }
+  if (fr.fire) text('FIRE-BALL', 1462, 830, 44, 900, C.amber, 0.6 + 0.4 * Math.sin(f * 0.8), 3);
+  text(live ? 'Esc — back to the demo' : '← →  take over', 1462, 1000, 30, 600, C.dim, k * 0.9, 1);
+}
+
+function levelClear(run, f) {
+  if (run.clearedAt < 0 || f < run.clearedAt) return;
+  const a = f - run.clearedAt;
+  // full-screen dim, then fireworks and the card
+  ctx.fillStyle = `rgba(7,6,15,${0.86 * E.outCubic(clamp(a / 12))})`; ctx.fillRect(0, 0, W, H);
+  // fireworks from the cleared grid
+  ctx.save(); ctx.globalCompositeOperation = 'lighter';
+  for (let n = 0; n < 7; n++) {
+    const t0 = n * 9, age = a - t0; if (age < 0 || age > 60) continue;
+    const r = mulberry32(900 + n), cx = lerp(G.L + 120, G.R - 120, r()), cy = 220 + r() * 260, col = [C.magenta, C.cyan, C.amber][n % 3];
+    ctx.fillStyle = col;
+    for (let k = 0; k < 40; k++) { const ang = k / 40 * Math.PI * 2 + r() * 0.1, sp = 380 + r() * 160, t = age / FPS;
+      const x = cx + Math.cos(ang) * sp * t, y = cy + Math.sin(ang) * sp * t + 260 * t * t; ctx.globalAlpha = Math.max(0, 1 - t / 2); ctx.fillRect(x - 2.5, y - 2.5, 5, 5); }
+  }
+  ctx.restore();
+  const k = E.outBack(clamp(a / 14)), s = lerp(1.35, 1, E.outExpo(clamp(a / 14)));
+  ctx.save(); ctx.translate(W / 2, 430); ctx.scale(s, s);
+  glowText('LEVEL CLEAR', 0, 0, 170, 900, C.paper, C.magenta, clamp(k), 14, 'center');
+  ctx.restore();
+  const k1 = E.outCubic(clamp((a - 12) / 16));
+  text('FINAL SCORE', W / 2, 540 + (1 - k1) * 20, 32, 700, C.dim, k1, 8, 'center');
+  text(fmtScore(run.score), W / 2, 650 + (1 - k1) * 20, 110, 800, C.cyan, k1, 4, 'center');
+  const k2 = E.outCubic(clamp((a - 26) / 16));
+  const secs = (run.clearedAt / FPS).toFixed(1);
+  text(`${run.bricks.length} bricks  ·  ${secs} s  ·  no ball lost`, W / 2, 740 + (1 - k2) * 20, 44, 600, C.amber, k2, 1, 'center');
+  const k3 = E.outCubic(clamp((a - 70) / 20));
+  text('bytepatterns · motion lab', W / 2, 1000, 32, 600, C.paper, k3 * 0.85, 3, 'center');
+}
+
+function drawRun(run, f, live) {
+  const fr = run.frames[f];
+  if (ctx.reset) ctx.reset();                              // every frame starts from a clean context state
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; ctx.filter = 'none'; ctx.shadowBlur = 0;
+  background(f);
+  const [sx, sy] = shake(run, f);
+  ctx.setTransform(1, 0, 0, 1, sx, sy);
+  arena(f, fr.fire);
+  bricks(run, f);
+  particles(run, f);
+  paddle(run, f, fr);
+  balls(run, f);
+  callouts(run, f);
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  hud(run, f, live);
+  levelClear(run, f);
+  // a soft fade at the very end, for the loop
+  const fo = E.inCubic(prog(f, 588, 599)) * 0.6;
+  if (!live && fo > 0) { ctx.fillStyle = `rgba(7,6,15,${fo})`; ctx.fillRect(0, 0, W, H); }
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.shadowBlur = 0; ctx.letterSpacing = '0px'; ctx.globalCompositeOperation = 'source-over';
+}
+RUN.byFrame = byFrame; RUN.bricksEv = bricksEv;
+
+// ---- keyboard take-over (browser only; never in the renderer) ---------------
+let LIVE = null, liveLast = -1;
+const keys = { l: false, r: false };
+if (!window.__MOTION_RENDER__ && !new URLSearchParams(location.search).has('frame')) {
+  addEventListener('keydown', e => {
+    const k = e.key;
+    if (k === 'Escape') { LIVE = null; return; }
+    const left = k === 'ArrowLeft' || k === 'a' || k === 'A', right = k === 'ArrowRight' || k === 'd' || k === 'D';
+    if (!left && !right) return;
+    e.preventDefault();
+    if (left) keys.l = true; if (right) keys.r = true;
+    if (!LIVE) newLive();
+  });
+  addEventListener('keyup', e => { const k = e.key;
+    if (k === 'ArrowLeft' || k === 'a' || k === 'A') keys.l = false; if (k === 'ArrowRight' || k === 'd' || k === 'D') keys.r = false; });
+}
+function newLive() {
+  LIVE = makeGame(Object.assign({}, LEVEL, { maxBalls: 3 }));
+  LIVE.live = true; LIVE.byFrame = new Map(); LIVE.bricksEv = []; LIVE.seen = 0; LIVE.relaunch = -1; liveLast = -1;
+  LIVE.step(0); indexLive();
+}
+function indexLive() {
+  const L = LIVE;
+  for (; L.seen < L.events.length; L.seen++) { const e = L.events[L.seen]; e.id = L.seen; if (e.k === 'wall') continue;
+    if (!L.byFrame.has(e.f)) L.byFrame.set(e.f, []); L.byFrame.get(e.f).push(e); if (e.k === 'brick') L.bricksEv.push(e); }
+}
+function liveTick(i) {
+  const d = liveLast < 0 ? 1 : (i - liveLast + FRAMES) % FRAMES; liveLast = i;
+  for (let n = 0; n < Math.min(d, 4); n++) {
+    const L = LIVE;
+    if (L.clearedAt >= 0 && L.f - L.clearedAt > 150) { newLive(); return; }
+    if (L.clearedAt < 0 && !L.balls.some(b => b.on)) {       // missed: serve a new ball after a beat
+      if (L.relaunch < 0) L.relaunch = L.f + 24;
+      if (L.f >= L.relaunch) { L.balls.push({ x: L.px, y: G.PY - G.BR - 1, vx: 0.25 * L.speed, vy: -0.97 * L.speed, on: true, born: L.f }); L.relaunch = -1; }
+    }
+    L.step((keys.r ? 1 : 0) - (keys.l ? 1 : 0));
+    indexLive();
+  }
+  // the live run is not bounded by FRAMES; draw its latest frame with the same code
+  drawRun(LIVE, LIVE.f - 1, true);
+}
+
+function draw(f) {
+  if (LIVE) { liveTick(f); return; }
+  drawRun(RUN, f, false);
+}
+
+// ---- sound: every event is a note ---------------------------------------------
+async function renderAudio() {
+  const SR = 48000, dur = FRAMES / FPS, LEN = Math.round(SR * dur);
+  const ac = new OfflineAudioContext(2, LEN, SR);
+  const rnd = mulberry32(0x0B8EA7);
+  const comp = ac.createDynamicsCompressor();
+  comp.threshold.value = -16; comp.ratio.value = 4; comp.attack.value = 0.003; comp.release.value = 0.15;
+  const master = ac.createGain(); master.gain.value = 0.9; master.connect(comp).connect(ac.destination);
+  master.gain.setValueAtTime(0.9, dur - 0.45); master.gain.linearRampToValueAtTime(0.0001, dur - 0.01);
+  const hz = m => 440 * Math.pow(2, (m - 69) / 12);
+  const ir = ac.createBuffer(2, SR * 1.6, SR);
+  for (let ch = 0; ch < 2; ch++) { const d = ir.getChannelData(ch); for (let k = 0; k < d.length; k++) d[k] = (rnd() * 2 - 1) * Math.pow(1 - k / d.length, 3); }
+  const verb = ac.createConvolver(); verb.buffer = ir; const vg = ac.createGain(); vg.gain.value = 0.22; verb.connect(vg).connect(master);
+  const noise = ac.createBuffer(1, SR, SR); { const d = noise.getChannelData(0); for (let k = 0; k < d.length; k++) d[k] = rnd() * 2 - 1; }
+  const at = f => f / FPS;
+  const pan = x => clamp((x - W / 2) / 520, -0.8, 0.8);
+
+  // brick: the row picks the pitch (top row highest), A minor pentatonic
+  const SCALE = [81, 79, 76, 74, 72, 69, 67];                 // row 0..6
+  const blip = (t, m, amp, p, len = 0.16, type = 'square') => {
+    const o = ac.createOscillator(); o.type = type; o.frequency.setValueAtTime(hz(m), t); o.frequency.exponentialRampToValueAtTime(hz(m) * 0.985, t + len);
+    const o2 = ac.createOscillator(); o2.type = 'triangle'; o2.frequency.value = hz(m + 12);
+    const g = ac.createGain(); g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(amp, t + 0.004); g.gain.exponentialRampToValueAtTime(0.0001, t + len);
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 5200;
+    const sp = ac.createStereoPanner(); sp.pan.value = p;
+    o.connect(lp); o2.connect(lp); lp.connect(g).connect(sp); sp.connect(master); sp.connect(verb);
+    o.start(t); o2.start(t); o.stop(t + len + 0.02); o2.stop(t + len + 0.02);
+  };
+  // thin out dense bursts: at most 3 brick notes per frame
+  const perFrame = new Map();
+  for (const e of RUN.events) {
+    if (e.f >= FRAMES) continue;
+    const t = at(e.f);
+    if (e.k === 'brick') {
+      const n = perFrame.get(e.f) || 0; if (n >= 3) continue; perFrame.set(e.f, n + 1);
+      blip(t + n * 0.012, SCALE[e.r], e.burning ? 0.12 : 0.17, pan(e.x));
+    } else if (e.k === 'paddle') {
+      const o = ac.createOscillator(); o.frequency.setValueAtTime(190, t); o.frequency.exponentialRampToValueAtTime(70, t + 0.12);
+      const g = ac.createGain(); g.gain.setValueAtTime(0.5, t); g.gain.exponentialRampToValueAtTime(0.001, t + 0.18);
+      const sp = ac.createStereoPanner(); sp.pan.value = pan(e.x); o.connect(g).connect(sp).connect(master); o.start(t); o.stop(t + 0.2);
+    } else if (e.k === 'split' || e.k === 'fire') {
+      const seq = e.k === 'split' ? [69, 72, 76, 81, 84] : [57, 64, 69, 76, 81];
+      seq.forEach((m, k) => blip(t + k * 0.045, m, 0.13, -0.4 + k * 0.2, 0.22, e.k === 'fire' ? 'sawtooth' : 'square'));
+      const s = ac.createBufferSource(); s.buffer = noise; const bp = ac.createBiquadFilter(); bp.type = 'bandpass'; bp.Q.value = 1.5;
+      bp.frequency.setValueAtTime(400, t); bp.frequency.exponentialRampToValueAtTime(5000, t + 0.5);
+      const g = ac.createGain(); g.gain.setValueAtTime(0.001, t); g.gain.exponentialRampToValueAtTime(0.4, t + 0.08); g.gain.exponentialRampToValueAtTime(0.001, t + 0.7);
+      s.connect(bp).connect(g).connect(master); g.connect(verb); s.start(t); s.stop(t + 0.72);
+    } else if (e.k === 'wall') {
+      const s = ac.createBufferSource(); s.buffer = noise; const hp = ac.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 3000;
+      const g = ac.createGain(); g.gain.setValueAtTime(0.09, t); g.gain.exponentialRampToValueAtTime(0.001, t + 0.03);
+      const sp = ac.createStereoPanner(); sp.pan.value = pan(e.x); s.connect(hp).connect(g).connect(sp).connect(master); s.start(t, (e.f * 0.0137) % 0.9); s.stop(t + 0.04);
+    }
+  }
+  // fire-ball rumble
+  const fe = RUN.events.find(e => e.k === 'fire');
+  if (fe) { const t = at(fe.f), len = LEVEL.fireLen / FPS, s = ac.createBufferSource(); s.buffer = noise; s.loop = true;
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 220; const g = ac.createGain();
+    g.gain.setValueAtTime(0.001, t); g.gain.exponentialRampToValueAtTime(0.5, t + 0.1); g.gain.setValueAtTime(0.5, t + len - 0.3); g.gain.exponentialRampToValueAtTime(0.001, t + len);
+    s.connect(lp).connect(g).connect(master); s.start(t); s.stop(t + len + 0.05); }
+
+  // groove under the game: 120 BPM (a beat every 15 frames) until the clear
+  const beat = 0.5, endGroove = at(CLEAR);
+  const bassNotes = [45, 45, 48, 43];                         // A A C G per bar
+  for (let b = 0; b * beat < endGroove - 0.05; b++) {
+    const t = b * beat;
+    const o = ac.createOscillator(), g = ac.createGain();
+    o.frequency.setValueAtTime(130, t); o.frequency.exponentialRampToValueAtTime(45, t + 0.1);
+    g.gain.setValueAtTime(0.55, t); g.gain.exponentialRampToValueAtTime(0.001, t + 0.26); o.connect(g).connect(master); o.start(t); o.stop(t + 0.28);
+    for (const h of [t + 0.25]) { const s = ac.createBufferSource(); s.buffer = noise; const hp = ac.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 8000;
+      const hg = ac.createGain(); hg.gain.setValueAtTime(0.07, h); hg.gain.exponentialRampToValueAtTime(0.001, h + 0.04); s.connect(hp).connect(hg).connect(master); s.start(h, (b * 0.071) % 0.9); s.stop(h + 0.05); }
+    const m = bassNotes[Math.floor(b / 4) % 4] - 12;
+    for (const h of [t, t + 0.25]) { const bo = ac.createOscillator(); bo.type = 'sawtooth'; bo.frequency.value = hz(m);
+      const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.setValueAtTime(900, h); lp.frequency.exponentialRampToValueAtTime(150, h + 0.2);
+      const bg = ac.createGain(); bg.gain.setValueAtTime(0.0001, h); bg.gain.exponentialRampToValueAtTime(0.16, h + 0.01); bg.gain.exponentialRampToValueAtTime(0.0001, h + 0.22);
+      bo.connect(lp).connect(bg).connect(master); bo.start(h); bo.stop(h + 0.24); }
+  }
+  // hook: a launch zap on frame 0
+  { const o = ac.createOscillator(); o.type = 'sawtooth'; o.frequency.setValueAtTime(220, 0); o.frequency.exponentialRampToValueAtTime(1760, 0.18);
+    const g = ac.createGain(); g.gain.setValueAtTime(0.0001, 0); g.gain.exponentialRampToValueAtTime(0.14, 0.02); g.gain.exponentialRampToValueAtTime(0.0001, 0.24);
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 3500; o.connect(lp).connect(g).connect(master); g.connect(verb); o.start(0); o.stop(0.26); }
+  // level clear: a fanfare and a held chord
+  if (CLEAR > 0) {
+    const t = at(CLEAR);
+    [69, 72, 76, 81, 84, 88].forEach((m, k) => blip(t + k * 0.07, m, 0.15, -0.5 + k * 0.2, 0.35));
+    const t2 = t + 0.5, end = dur - 0.2;
+    for (const m of [57, 64, 69, 73, 76]) for (const det of [-8, 7]) {
+      const o = ac.createOscillator(); o.type = 'sawtooth'; o.frequency.value = hz(m); o.detune.value = det;
+      const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.setValueAtTime(600, t2); lp.frequency.exponentialRampToValueAtTime(2400, t2 + 1.5);
+      const g = ac.createGain(); g.gain.setValueAtTime(0.0001, t2); g.gain.exponentialRampToValueAtTime(0.045, t2 + 0.3); g.gain.setValueAtTime(0.045, end - 1.2); g.gain.exponentialRampToValueAtTime(0.0001, end);
+      o.connect(lp).connect(g); g.connect(master); g.connect(verb); o.start(t2); o.stop(end + 0.02);
+    }
+    const o = ac.createOscillator(), g = ac.createGain(); o.frequency.setValueAtTime(110, t); o.frequency.exponentialRampToValueAtTime(40, t + 0.8);
+    g.gain.setValueAtTime(0.7, t); g.gain.exponentialRampToValueAtTime(0.001, t + 1); o.connect(g).connect(master); o.start(t); o.stop(t + 1.05);
+  }
+  const buf = await ac.startRendering();
+  let peak = 0; for (let ch = 0; ch < 2; ch++) { const d = buf.getChannelData(ch); for (let k = 0; k < d.length; k++) { const v = Math.abs(d[k]); if (v > peak) peak = v; } }
+  if (peak > 0.89) { const g = 0.89 / peak; for (let ch = 0; ch < 2; ch++) { const d = buf.getChannelData(ch); for (let k = 0; k < d.length; k++) d[k] *= g; } }
+  return buf;
+}
+
+window.__motion = {
+  title: 'Neon Breakout',
+  description: 'A neon Breakout level that plays itself: deterministic physics, multi-ball, a fire-ball and every brick cleared.',
+  fps: FPS, width: W, height: H, frames: FRAMES,
+  poster: 214,
+  gifStart: 5,
+  seek(i) { draw(Math.max(0, Math.min(FRAMES - 1, Math.floor(i)))); },
+  audio: renderAudio,
+  stats: { clearedAt: RUN.clearedAt, lost: RUN.lost, score: RUN.score },
+};
+
+/* ==========================================================================
+   PLAYER — identical in every piece; keep as is.
+   Autoplays and loops, starts sound on the first click, ?frame=N pauses on a
+   frame. When the renderer sets window.__MOTION_RENDER__ it stays out of the way.
+   ========================================================================== */
+(function player() {
+  const M = window.__motion, btn = document.getElementById('sound');
+  const dur = M.frames / M.fps;
+  if (window.__MOTION_RENDER__) { btn.hidden = true; M.seek(0); return; }
+  const q = new URLSearchParams(location.search);
+  if (q.has('frame')) { btn.hidden = true; M.seek(+q.get('frame') || 0); return; }
+  let t0 = performance.now(), ac = null, src = null, buf = null, paused = false, pausedAt = 0;
+  const clock = () => ac && src ? (ac.currentTime - t0) : (performance.now() - t0) / 1000;
+  function loop() {
+    if (!paused) M.seek(Math.floor(((clock() % dur) + dur) % dur * M.fps));
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+  btn.addEventListener('click', async () => {
+    if (src) { src.stop(); src = null; btn.textContent = 'Click for sound'; t0 = performance.now(); return; }
+    btn.textContent = 'Loading sound…';
+    ac = ac || new AudioContext({ sampleRate: 48000 });
+    buf = buf || await M.audio();
+    await ac.resume();
+    src = ac.createBufferSource(); src.buffer = buf; src.loop = true; src.connect(ac.destination);
+    t0 = ac.currentTime + 0.05; src.start(t0);        // picture restarts from frame 0 in sync with the sound
+    btn.textContent = 'Sound on — click to mute';
+  });
+  addEventListener('keydown', e => {
+    if (e.code !== 'Space') return;
+    e.preventDefault(); paused = !paused;
+    if (ac) paused ? ac.suspend() : ac.resume();
+    if (!ac) { if (paused) pausedAt = performance.now(); else t0 += performance.now() - pausedAt; }
+  });
+})();
+</script>
+</body>
+</html>

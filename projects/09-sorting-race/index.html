@@ -1,0 +1,747 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sorting Race — motion-lab</title>
+<style>
+  /* Player chrome. The piece itself lives entirely in the canvas. */
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  body { display: grid; place-items: center; font: 500 15px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #fff; }
+  canvas { display: block; width: min(100vw, calc(100vh * 16 / 9)); height: auto; aspect-ratio: 16 / 9; }
+  #sound { position: fixed; left: 16px; bottom: 16px; padding: 8px 14px; border: 1px solid rgba(255,255,255,.35); border-radius: 999px;
+           background: rgba(0,0,0,.55); color: #fff; font: inherit; cursor: pointer; }
+  #sound[hidden] { display: none; }
+</style>
+</head>
+<body>
+<canvas id="stage" width="1920" height="1080" aria-label="Eight sorting algorithms race on the same 64 numbers"></canvas>
+<button id="sound" type="button">Click for sound</button>
+<script>
+'use strict';
+/* ==========================================================================
+   PIECE — Sorting Race.
+   Eight sorting algorithms sort the SAME shuffled 64 numbers. Every
+   algorithm is actually run once at load time; each comparison it makes is
+   recorded together with the array state at that moment. The race clock
+   counts comparisons: every algorithm makes one comparison per tick, so an
+   algorithm finishes at a time proportional to its real comparison count.
+   ========================================================================== */
+const W = 1920, H = 1080, FPS = 30, FRAMES = 840;          // 28 s
+const cv = document.getElementById('stage');
+const ctx = cv.getContext('2d');
+const FONT = 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
+
+// ---- helpers -------------------------------------------------------------
+function mulberry32(a) { return function () { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a);
+  t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const lerp = (a, b, t) => a + (b - a) * t;
+const prog = (f, a, b) => clamp((f - a) / (b - a));           // 0..1 progress of frame f through [a, b]
+const E = {
+  inCubic: t => t * t * t,
+  outCubic: t => 1 - Math.pow(1 - t, 3),
+  inOutCubic: t => t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2,
+  outExpo: t => t === 1 ? 1 : 1 - Math.pow(2, -10 * t),
+  inExpo: t => t === 0 ? 0 : Math.pow(2, 10 * t - 10),
+  inOutExpo: t => t === 0 ? 0 : t === 1 ? 1 : t < .5 ? Math.pow(2, 20 * t - 10) / 2 : (2 - Math.pow(2, -20 * t + 10)) / 2,
+  outBack: t => 1 + 2.70158 * Math.pow(t - 1, 3) + 1.70158 * Math.pow(t - 1, 2),
+};
+
+// ---- design tokens -------------------------------------------------------
+const C = {
+  bg: '#07090D', panel: '#0E131B', panelHi: '#131A25', edge: 'rgba(255,255,255,0.07)',
+  text: '#EEF2F7', muted: '#8C96A8', faint: '#3A4353',
+  accent: '#FFB547',   // live comparison, podium
+  done: '#3DDC97',     // sorted
+};
+const BAR_SHADE = Array.from({ length: 65 }, (_, v) => `hsl(218, 14%, ${Math.round(34 + 42 * v / 64)}%)`);
+const fmt = n => Math.round(n).toLocaleString('en-US');
+const ordinal = r => r + (r % 10 === 1 && r % 100 !== 11 ? 'st' : r % 10 === 2 && r % 100 !== 12 ? 'nd' : r % 10 === 3 && r % 100 !== 13 ? 'rd' : 'th');
+
+// ---- the input: 1..64, shuffled once with a fixed seed ---------------------
+const N = 64, SEED = 3;
+const INPUT = (() => {
+  const a = Array.from({ length: N }, (_, i) => i + 1), r = mulberry32(SEED);
+  for (let i = N - 1; i > 0; i--) { const j = Math.floor(r() * (i + 1)); const t = a[i]; a[i] = a[j]; a[j] = t; }
+  return a;
+})();
+
+// ---- recorder: every comparison stores a snapshot of the array ------------
+function recorder(input) {
+  const a = input.slice(), snaps = [], pairs = [], wr = [];
+  let writes = 0;
+  return {
+    a,
+    lt(x, y) { snaps.push(Uint8Array.from(a)); pairs.push(x, y); wr.push(writes); return x < y; },
+    set(i, v) { a[i] = v; writes++; },
+    swap(i, j) { const t = a[i]; a[i] = a[j]; a[j] = t; writes += 2; },
+    finish() { snaps.push(Uint8Array.from(a)); wr.push(writes); return { snaps, pairs, writes: wr, comparisons: pairs.length / 2, totalWrites: writes, final: Array.from(a) }; },
+  };
+}
+
+// ---- the eight algorithms ---------------------------------------------------
+function bubbleSort(r) {
+  const a = r.a;
+  for (let end = N - 1; end > 0; end--) {
+    let swapped = false;
+    for (let j = 0; j < end; j++) if (r.lt(a[j + 1], a[j])) { r.swap(j, j + 1); swapped = true; }
+    if (!swapped) break;
+  }
+}
+function insertionSort(r) {
+  const a = r.a;
+  for (let i = 1; i < N; i++) for (let j = i; j > 0 && r.lt(a[j], a[j - 1]); j--) r.swap(j, j - 1);
+}
+function selectionSort(r) {
+  const a = r.a;
+  for (let i = 0; i < N - 1; i++) {
+    let m = i;
+    for (let j = i + 1; j < N; j++) if (r.lt(a[j], a[m])) m = j;
+    if (m !== i) r.swap(i, m);
+  }
+}
+function shellSort(r) {                         // Ciura gaps below 64
+  const a = r.a;
+  for (const g of [57, 23, 10, 4, 1])
+    for (let i = g; i < N; i++) for (let j = i; j >= g && r.lt(a[j], a[j - g]); j -= g) r.swap(j, j - g);
+}
+function mergeSort(r) {                         // top-down, auxiliary array
+  const a = r.a, aux = new Array(N);
+  (function sort(lo, hi) {
+    if (hi - lo < 2) return;
+    const mid = (lo + hi) >> 1;
+    sort(lo, mid); sort(mid, hi);
+    for (let k = lo; k < hi; k++) aux[k] = a[k];
+    let i = lo, j = mid;
+    for (let k = lo; k < hi; k++) {
+      if (i >= mid) r.set(k, aux[j++]);
+      else if (j >= hi) r.set(k, aux[i++]);
+      else if (r.lt(aux[j], aux[i])) r.set(k, aux[j++]);
+      else r.set(k, aux[i++]);
+    }
+  })(0, N);
+}
+function quickSort(r) {                         // Hoare partition, middle pivot
+  const a = r.a;
+  (function qs(lo, hi) {
+    if (lo >= hi) return;
+    const p = a[(lo + hi) >> 1];
+    let i = lo - 1, j = hi + 1;
+    for (;;) {
+      do i++; while (r.lt(a[i], p));
+      do j--; while (r.lt(p, a[j]));
+      if (i >= j) break;
+      r.swap(i, j);
+    }
+    qs(lo, j); qs(j + 1, hi);
+  })(0, N - 1);
+}
+function heapSort(r) {                          // max-heap, sift-down
+  const a = r.a;
+  function sift(i, n) {
+    for (;;) {
+      const l = 2 * i + 1;
+      if (l >= n) return;
+      let c = l;
+      if (l + 1 < n && r.lt(a[l], a[l + 1])) c = l + 1;
+      if (r.lt(a[i], a[c])) { r.swap(i, c); i = c; } else return;
+    }
+  }
+  for (let i = (N >> 1) - 1; i >= 0; i--) sift(i, N);
+  for (let end = N - 1; end > 0; end--) { r.swap(0, end); sift(0, end); }
+}
+function timSort(r) {                           // a faithful port of the classic list sort (runs, binary insertion, galloping merges)
+  const a = r.a, lt = (x, y) => r.lt(x, y), set = (i, v) => r.set(i, v);
+  const MIN_GALLOP = 7;
+  let minGallop = MIN_GALLOP;
+  function gallopLeft(key, x, base, n, hint) {
+    let lastofs = 0, ofs = 1;
+    if (lt(x[base + hint], key)) {
+      const maxofs = n - hint;
+      while (ofs < maxofs) { if (lt(x[base + hint + ofs], key)) { lastofs = ofs; ofs = (ofs << 1) + 1; } else break; }
+      if (ofs > maxofs) ofs = maxofs;
+      lastofs += hint; ofs += hint;
+    } else {
+      const maxofs = hint + 1;
+      while (ofs < maxofs) { if (lt(x[base + hint - ofs], key)) break; lastofs = ofs; ofs = (ofs << 1) + 1; }
+      if (ofs > maxofs) ofs = maxofs;
+      const k = lastofs; lastofs = hint - ofs; ofs = hint - k;
+    }
+    lastofs++;
+    while (lastofs < ofs) { const m = lastofs + ((ofs - lastofs) >> 1); if (lt(x[base + m], key)) lastofs = m + 1; else ofs = m; }
+    return ofs;
+  }
+  function gallopRight(key, x, base, n, hint) {
+    let lastofs = 0, ofs = 1;
+    if (lt(key, x[base + hint])) {
+      const maxofs = hint + 1;
+      while (ofs < maxofs) { if (lt(key, x[base + hint - ofs])) { lastofs = ofs; ofs = (ofs << 1) + 1; } else break; }
+      if (ofs > maxofs) ofs = maxofs;
+      const k = lastofs; lastofs = hint - ofs; ofs = hint - k;
+    } else {
+      const maxofs = n - hint;
+      while (ofs < maxofs) { if (lt(key, x[base + hint + ofs])) break; lastofs = ofs; ofs = (ofs << 1) + 1; }
+      if (ofs > maxofs) ofs = maxofs;
+      lastofs += hint; ofs += hint;
+    }
+    lastofs++;
+    while (lastofs < ofs) { const m = lastofs + ((ofs - lastofs) >> 1); if (lt(key, x[base + m])) ofs = m; else lastofs = m + 1; }
+    return ofs;
+  }
+  function binarySort(lo, hi, start) {
+    if (start === lo) start++;
+    for (; start < hi; start++) {
+      const pivot = a[start];
+      let l = lo, rr = start;
+      while (l < rr) { const p = l + ((rr - l) >> 1); if (lt(pivot, a[p])) rr = p; else l = p + 1; }
+      for (let k = start; k > l; k--) set(k, a[k - 1]);
+      set(l, pivot);
+    }
+  }
+  function countRun(lo, hi) {
+    if (lo + 1 === hi) return 1;
+    let n = 2;
+    if (lt(a[lo + 1], a[lo])) {
+      for (let i = lo + 2; i < hi; i++, n++) if (!lt(a[i], a[i - 1])) break;
+      for (let i = lo, j = lo + n - 1; i < j; i++, j--) r.swap(i, j);
+    } else {
+      for (let i = lo + 2; i < hi; i++, n++) if (lt(a[i], a[i - 1])) break;
+    }
+    return n;
+  }
+  function mergeLo(baseA, na, baseB, nb) {
+    const tmp = a.slice(baseA, baseA + na);
+    let pa = 0, pb = baseB, dest = baseA;
+    const succeed = () => { while (na > 0) { set(dest++, tmp[pa++]); na--; } };
+    const copyB = () => { for (let q = 0; q < nb; q++) set(dest + q, a[pb + q]); set(dest + nb, tmp[pa]); };
+    set(dest++, a[pb++]); nb--;
+    if (nb === 0) return succeed();
+    if (na === 1) return copyB();
+    let mg = minGallop;
+    for (;;) {
+      let acount = 0, bcount = 0;
+      for (;;) {
+        if (lt(a[pb], tmp[pa])) {
+          set(dest++, a[pb++]); bcount++; acount = 0; nb--;
+          if (nb === 0) return succeed();
+          if (bcount >= mg) break;
+        } else {
+          set(dest++, tmp[pa++]); acount++; bcount = 0; na--;
+          if (na === 1) return copyB();
+          if (acount >= mg) break;
+        }
+      }
+      mg++;
+      do {
+        mg -= mg > 1 ? 1 : 0; minGallop = mg;
+        let k = gallopRight(a[pb], tmp, pa, na, 0); acount = k;
+        if (k) {
+          for (let q = 0; q < k; q++) set(dest++, tmp[pa++]);
+          na -= k;
+          if (na === 1) return copyB();
+          if (na === 0) return succeed();
+        }
+        set(dest++, a[pb++]); nb--;
+        if (nb === 0) return succeed();
+        k = gallopLeft(tmp[pa], a, pb, nb, 0); bcount = k;
+        if (k) {
+          for (let q = 0; q < k; q++) set(dest++, a[pb++]);
+          nb -= k;
+          if (nb === 0) return succeed();
+        }
+        set(dest++, tmp[pa++]); na--;
+        if (na === 1) return copyB();
+      } while (acount >= MIN_GALLOP || bcount >= MIN_GALLOP);
+      mg++; minGallop = mg;
+    }
+  }
+  function mergeHi(baseA, na, baseB, nb) {
+    const tmp = a.slice(baseB, baseB + nb);
+    let dest = baseB + nb - 1, pb = nb - 1, pa = baseA + na - 1;
+    const succeed = () => { for (let q = nb - 1; q >= 0; q--) set(dest - (nb - 1) + q, tmp[q]); };
+    const copyA = () => { for (let q = 0; q < na; q++) set(dest--, a[pa--]); set(dest, tmp[pb]); };
+    set(dest--, a[pa--]); na--;
+    if (na === 0) return succeed();
+    if (nb === 1) return copyA();
+    let mg = minGallop;
+    for (;;) {
+      let acount = 0, bcount = 0;
+      for (;;) {
+        if (lt(tmp[pb], a[pa])) {
+          set(dest--, a[pa--]); acount++; bcount = 0; na--;
+          if (na === 0) return succeed();
+          if (acount >= mg) break;
+        } else {
+          set(dest--, tmp[pb--]); bcount++; acount = 0; nb--;
+          if (nb === 1) return copyA();
+          if (bcount >= mg) break;
+        }
+      }
+      mg++;
+      do {
+        mg -= mg > 1 ? 1 : 0; minGallop = mg;
+        let k = gallopRight(tmp[pb], a, baseA, na, na - 1); k = na - k; acount = k;
+        if (k) {
+          for (let q = 0; q < k; q++) set(dest--, a[pa--]);
+          na -= k;
+          if (na === 0) return succeed();
+        }
+        set(dest--, tmp[pb--]); nb--;
+        if (nb === 1) return copyA();
+        k = gallopLeft(a[pa], tmp, 0, nb, nb - 1); k = nb - k; bcount = k;
+        if (k) {
+          for (let q = 0; q < k; q++) set(dest--, tmp[pb--]);
+          nb -= k;
+          if (nb === 1) return copyA();
+          if (nb === 0) return succeed();
+        }
+        set(dest--, a[pa--]); na--;
+        if (na === 0) return succeed();
+      } while (acount >= MIN_GALLOP || bcount >= MIN_GALLOP);
+      mg++; minGallop = mg;
+    }
+  }
+  const runs = [];
+  function mergeAt(i) {
+    let baseA = runs[i].base, na = runs[i].len;
+    const baseB = runs[i + 1].base;
+    let nb = runs[i + 1].len;
+    runs[i] = { base: baseA, len: na + nb }; runs.splice(i + 1, 1);
+    const k = gallopRight(a[baseB], a, baseA, na, 0);
+    baseA += k; na -= k;
+    if (na === 0) return;
+    nb = gallopLeft(a[baseA + na - 1], a, baseB, nb, nb - 1);
+    if (nb === 0) return;
+    if (na <= nb) mergeLo(baseA, na, baseB, nb); else mergeHi(baseA, na, baseB, nb);
+  }
+  function mergeCollapse() {
+    while (runs.length > 1) {
+      let n = runs.length - 2;
+      if ((n > 0 && runs[n - 1].len <= runs[n].len + runs[n + 1].len) || (n > 1 && runs[n - 2].len <= runs[n - 1].len + runs[n].len)) {
+        if (runs[n - 1].len < runs[n + 1].len) n--;
+        mergeAt(n);
+      } else if (runs[n].len <= runs[n + 1].len) mergeAt(n);
+      else break;
+    }
+  }
+  function mergeForceCollapse() {
+    while (runs.length > 1) { let n = runs.length - 2; if (n > 0 && runs[n - 1].len < runs[n + 1].len) n--; mergeAt(n); }
+  }
+  let nn = N, bit = 0;
+  while (nn >= 64) { bit |= nn & 1; nn >>= 1; }
+  const minrun = nn + bit;                      // 32 for 64 elements
+  let lo = 0, rem = N;
+  while (rem > 0) {
+    let n = countRun(lo, lo + rem);
+    if (n < minrun) { const force = rem <= minrun ? rem : minrun; binarySort(lo, lo + force, lo + n); n = force; }
+    runs.push({ base: lo, len: n }); mergeCollapse(); lo += n; rem -= n;
+  }
+  mergeForceCollapse();
+}
+
+const ALGOS = [
+  { id: 'bubble', name: 'Bubble sort', fn: bubbleSort },
+  { id: 'insertion', name: 'Insertion sort', fn: insertionSort },
+  { id: 'selection', name: 'Selection sort', fn: selectionSort },
+  { id: 'shell', name: 'Shell sort', fn: shellSort },
+  { id: 'merge', name: 'Merge sort', fn: mergeSort },
+  { id: 'quick', name: 'Quicksort', fn: quickSort },
+  { id: 'heap', name: 'Heapsort', fn: heapSort },
+  { id: 'tim', name: 'Tim sort', fn: timSort },
+];
+
+// Run every algorithm once on the same input.
+function inversions(s) { let k = 0; for (let i = 0; i < N; i++) { const v = s[i]; for (let j = i + 1; j < N; j++) if (s[j] < v) k++; } return k; }
+const INV0 = inversions(INPUT);
+for (const A of ALGOS) {
+  const r = recorder(INPUT);
+  A.fn(r);
+  Object.assign(A, r.finish());
+  A.sorted = A.final.every((v, i) => v === i + 1);
+  A.inv = Uint16Array.from(A.snaps, inversions);
+}
+
+// ---- timeline --------------------------------------------------------------
+const RS = 45;                                  // race start frame (1.5 s)
+const RD = 600;                                 // race length in frames: the slowest algorithm needs all of it
+const MAXC = Math.max(...ALGOS.map(A => A.comparisons));
+const MINC = Math.min(...ALGOS.map(A => A.comparisons));
+const clockAt = f => MAXC * clamp((f - RS) / RD);  // comparisons elapsed: one comparison per tick for everyone
+const finishFrame = A => RS + A.comparisons / MAXC * RD;
+{
+  const order = ALGOS.slice().sort((p, q) => p.comparisons - q.comparisons);
+  for (const A of ALGOS) A.rank = 1 + ALGOS.filter(B => B.comparisons < A.comparisons).length;   // ties share a place
+  ALGOS.order = order;
+}
+const LAST_FINISH = RS + RD;
+const POD = LAST_FINISH + 40;                   // podium sequence starts
+
+// Captions: written from the real numbers.
+const CAPTIONS = (() => {
+  const o = ALGOS.order, list = [{ f: 0, text: 'Same shuffled input for all eight. The clock counts comparisons.' }];
+  const groups = [];
+  for (const A of o) { const g = groups[groups.length - 1]; if (g && g.c === A.comparisons) g.items.push(A); else groups.push({ c: A.comparisons, items: [A] }); }
+  let finished = 0;
+  groups.forEach((g, gi) => {
+    finished += g.items.length;
+    const left = N_ALGOS() - finished;
+    const who = g.items.map(A => A.name).join(' and ');
+    let text;
+    if (gi === 0) text = `${who} ${g.items.length > 1 ? 'tie for first' : 'finishes first'}: ${fmt(g.c)} comparisons.`;
+    else if (left === 0) {
+      const sel = g.items.length === 1 && g.items[0].id === 'selection' && g.c === N * (N - 1) / 2;
+      text = sel ? `Selection sort: ${fmt(g.c)}, exactly n(n−1)/2 on any input.` : `${who} ${g.items.length > 1 ? 'finish' : 'finishes'} last: ${fmt(g.c)}.`;
+    } else if (finished >= 3 && finished - g.items.length < 3) text = `Podium decided after ${fmt(g.c)} comparisons. ${left} still sorting.`;
+    else if (left === 1) text = `${who} done at ${fmt(g.c)}. One left.`;
+    else text = `${who} done at ${fmt(g.c)}. ${left} still sorting.`;
+    const at = Math.ceil(RS + g.c / MAXC * RD), prev = groups[gi - 1];
+    if (left === 0 && gi > 1 && prev.items.length === 1 && g.items.length === 1 && (g.c - prev.c) / MAXC * RD < 36) {
+      list.pop();                                 // the last two arrive together: one caption for both
+      text = `Photo finish: ${prev.items[0].name} ${fmt(prev.c)}, ${g.items[0].name} ${fmt(g.c)}.`;
+    }
+    const key = gi === 0 || left === 0 || /^Podium/.test(text);
+    list.push({ f: at, text, key });
+  });
+  // the longest wait gets the reason for it
+  let gi = 1;
+  for (let i = 2; i < list.length; i++) if (list[i].f - list[i - 1].f > list[gi].f - list[gi - 1].f) gi = i;
+  if (list[gi].f - list[gi - 1].f > 240)
+    list.splice(gi, 0, { f: Math.round((list[gi].f + list[gi - 1].f) / 2), text: `For 64 items n·log₂n is ${N * Math.log2(N)}, but n(n−1)/2 is ${fmt(N * (N - 1) / 2)}.`, key: true });
+  list.push({ f: POD, text: '', key: true });
+  // Every caption stays up for at least READ frames: a key caption delays the next one,
+  // a minor caption that nobody could read yet is replaced by the newer event.
+  const READ = 40, out = [list[0]];
+  for (const c of list.slice(1)) {
+    const last = out[out.length - 1];
+    if (c.f - last.f >= READ || c.text === '') out.push(c);
+    else if (last.key || last.f === 0) out.push({ ...c, f: last.f + READ });
+    else { out.pop(); out.push({ ...c, f: Math.max(c.f, out[out.length - 1].f + READ) }); }
+  }
+  return out;
+})();
+function N_ALGOS() { return ALGOS.length; }
+
+// ---- layout ------------------------------------------------------------------
+const SAFE_L = 96, SAFE_R = 1824;
+const GRID = { x: 96, y: 206, w: 1236, h: 810, gap: 18 };
+const PW = (GRID.w - 3 * GRID.gap) / 4, PH = (GRID.h - GRID.gap) / 2;
+const panelRect = k => ({ x: GRID.x + (k % 4) * (PW + GRID.gap), y: GRID.y + Math.floor(k / 4) * (PH + GRID.gap), w: PW, h: PH });
+const SIDE = { x: 1372, y: 206, w: SAFE_R - 1372, rowH: 94 };
+
+function rr(x, y, w, h, r) { ctx.beginPath(); ctx.roundRect(x, y, w, h, r); }
+function text(str, x, y, { size = 30, weight = 600, color = C.text, align = 'left', spacing = 0, alpha = 1 } = {}) {
+  ctx.font = `${weight} ${size}px ${FONT}`;
+  ctx.letterSpacing = spacing + 'px';
+  ctx.textAlign = align; ctx.textBaseline = 'alphabetic';
+  ctx.globalAlpha = alpha; ctx.fillStyle = color;
+  ctx.fillText(str, x, y);
+  ctx.globalAlpha = 1; ctx.letterSpacing = '0px';
+}
+
+// ---- picture -------------------------------------------------------------------
+function stateOf(A, f) {
+  const c = clockAt(f);
+  const done = c >= A.comparisons;
+  const idx = done ? A.comparisons : Math.floor(c);
+  return { c, done, idx, snap: A.snaps[idx], count: done ? A.comparisons : Math.floor(c) };
+}
+
+function drawPanel(k, f) {
+  const A = ALGOS[k], P = panelRect(k), S = stateOf(A, f);
+  const ff = finishFrame(A);
+  const racing = f >= RS && !S.done;
+  // panel body; finished panels step back so the ones still working stand out
+  const dim = S.done ? lerp(1, 0.62, E.outCubic(prog(f, ff + 14, ff + 40))) : 1;
+  rr(P.x, P.y, P.w, P.h, 14); ctx.fillStyle = racing ? C.panelHi : C.panel; ctx.fill();
+  ctx.lineWidth = 2; ctx.strokeStyle = racing ? 'rgba(255,181,71,0.22)' : C.edge; ctx.stroke();
+  const flash = S.done ? 1 - E.outCubic(prog(f, ff, ff + 24)) : 0;
+  if (flash > 0) { rr(P.x, P.y, P.w, P.h, 14); ctx.lineWidth = 3; ctx.strokeStyle = `rgba(61,220,151,${0.9 * flash})`; ctx.stroke(); }
+
+  ctx.globalAlpha = dim;
+  text(A.name, P.x + 20, P.y + 46, { size: 30, weight: 700, alpha: dim });
+
+  // bars
+  const bx = P.x + 18, by = P.y + 70, bw = P.w - 36, bh = P.h - 70 - 74;
+  const step = bw / N, barW = step - 1.3;
+  const h1 = S.done || f < RS ? -1 : A.pairs[2 * S.idx], h2 = S.done || f < RS ? -1 : A.pairs[2 * S.idx + 1];
+  const sweep = S.done ? E.outCubic(prog(f, ff, ff + 14)) * (N + 6) : 0;
+  ctx.globalAlpha = dim;
+  for (let i = 0; i < N; i++) {
+    let v = S.snap[i];
+    if (f < RS) {                                // intro: sorted ramp shuffles into the input
+      const t = E.inOutCubic(prog(f, 4 + i * 0.42, 22 + i * 0.42));
+      v = lerp(i + 1, INPUT[i], t);
+    }
+    const hh = Math.max(3, v / N * bh);
+    let col = BAR_SHADE[Math.round(v)];
+    if (v === h1 || v === h2) col = C.accent;
+    if (S.done && i < sweep) col = C.done;
+    ctx.fillStyle = col;
+    ctx.fillRect(bx + i * step, by + bh - hh, barW, hh);
+  }
+  ctx.globalAlpha = 1;
+
+  // footer: what is being compared right now, or the final place
+  const fy = P.y + P.h - 26;
+  if (!S.done && f >= RS) {
+    text(`${h1} vs ${h2}`, P.x + 20, fy, { size: 30, weight: 700, color: C.accent });
+    const pct = Math.round(100 * (1 - A.inv[S.idx] / INV0));
+    text(`${pct}%`, P.x + P.w - 20, fy, { size: 30, weight: 600, color: C.muted, align: 'right' });
+  } else if (f < RS) {
+    text('ready', P.x + 20, fy, { size: 30, weight: 600, color: C.muted, alpha: 0.8 });
+  } else {
+    const pop = E.outBack(prog(f, ff + 4, ff + 16));
+    const top = A.rank <= 3;
+    ctx.save();
+    ctx.translate(P.x + 20, fy); ctx.scale(pop, pop);
+    text(ordinal(A.rank), 0, 0, { size: 34, weight: 800, color: top ? C.accent : C.text, alpha: dim });
+    ctx.restore();
+    text(fmt(A.comparisons), P.x + P.w - 20, fy, { size: 30, weight: 700, color: C.done, align: 'right', alpha: Math.max(dim, 0.8) * prog(f, ff, ff + 8) });
+  }
+}
+
+function drawSidebar(f) {
+  const x0 = SIDE.x, x1 = SIDE.x + SIDE.w;
+  ALGOS.forEach((A, k) => {
+    const y = SIDE.y + k * SIDE.rowH, S = stateOf(A, f), ff = finishFrame(A);
+    // rank chip
+    const cx = x0 + 20, cy = y + 34;
+    if (S.done && f >= RS) {
+      const pop = E.outBack(prog(f, ff + 2, ff + 14));
+      ctx.beginPath(); ctx.arc(cx, cy, 20 * pop, 0, Math.PI * 2);
+      ctx.fillStyle = A.rank <= 3 ? C.accent : '#2A3240'; ctx.fill();
+      if (pop > 0.5) text(String(A.rank), cx, cy + 10, { size: 28, weight: 800, color: A.rank <= 3 ? '#1A1206' : C.text, align: 'center' });
+    } else {
+      const live = f >= RS;
+      ctx.beginPath(); ctx.arc(cx, cy, live ? 6 + 2 * Math.abs(Math.sin(f * 0.35 + k)) : 6, 0, Math.PI * 2);
+      ctx.fillStyle = live ? C.accent : C.faint; ctx.fill();
+    }
+    text(A.name, x0 + 56, y + 45, { size: 30, weight: 600, color: S.done && f >= RS ? C.muted : C.text });
+    text(fmt(f < RS ? 0 : S.count), x1, y + 48, { size: 44, weight: 800, color: S.done && f >= RS ? C.done : C.text, align: 'right' });
+    // how sorted: share of out-of-order pairs already fixed
+    const p = f < RS ? 0 : 1 - A.inv[S.idx] / INV0;
+    const tx = x0 + 56, tw = x1 - tx, ty = y + 66;
+    rr(tx, ty, tw, 6, 3); ctx.fillStyle = '#1C2330'; ctx.fill();
+    if (p > 0) { rr(tx, ty, Math.max(6, tw * p), 6, 3); ctx.fillStyle = S.done ? C.done : 'rgba(238,242,247,0.55)'; ctx.fill(); }
+    if (k < ALGOS.length - 1) { ctx.fillStyle = C.edge; ctx.fillRect(x0, y + SIDE.rowH - 6, SIDE.w, 1); }
+  });
+  text('Bar: out-of-order pairs fixed', x0, SIDE.y + 8 * SIDE.rowH + 38, { size: 28, weight: 500, color: C.muted });
+}
+
+function drawHeader(f) {
+  text('Sorting Race', SAFE_L, 118, { size: 64, weight: 800, spacing: -1 });
+  // caption crossfade
+  let cur = 0;
+  for (let i = 0; i < CAPTIONS.length; i++) if (CAPTIONS[i].f <= f) cur = i;
+  const c = CAPTIONS[cur], a = E.outCubic(prog(f, c.f, c.f + 10));
+  if (cur > 0 && a < 1) text(CAPTIONS[cur - 1].text, SAFE_L, 172, { size: 30, weight: 500, color: C.muted, alpha: 1 - a });
+  text(c.text, SAFE_L + (1 - a) * 18, 172, { size: 30, weight: 500, color: cur > 0 ? C.text : C.muted, alpha: a });
+  // race clock
+  text('COMPARISONS', SAFE_R, 84, { size: 28, weight: 700, color: C.muted, align: 'right', spacing: 3 });
+  const live = f >= RS && f < LAST_FINISH;
+  text(fmt(clockAt(f)), SAFE_R, 162, { size: 76, weight: 800, color: live ? C.accent : C.text, align: 'right', spacing: -1 });
+  // race progress rule under the header
+  const p = clockAt(f) / MAXC;
+  ctx.fillStyle = C.edge; ctx.fillRect(SAFE_L, 192, SAFE_R - SAFE_L, 2);
+  ctx.fillStyle = C.accent; ctx.fillRect(SAFE_L, 192, (SAFE_R - SAFE_L) * p, 2);
+}
+
+function drawIntro(f) {
+  const out = prog(f, 26, 42);
+  if (out >= 1) return;
+  ctx.fillStyle = `rgba(7,9,13,${0.86 * (1 - E.inCubic(out))})`;
+  ctx.fillRect(0, 0, W, H);
+  const lines = [['8 sorting algorithms.', C.text], ['The same 64 numbers.', C.text], ['Who finishes first?', C.accent]];
+  lines.forEach(([s, col], i) => {
+    const o = E.inCubic(prog(f, 26 + i * 3, 38 + i * 3));
+    text(s, W / 2, 470 + i * 112 - o * 40, { size: 100, weight: 800, color: col, align: 'center', spacing: -2, alpha: 1 - o });
+  });
+}
+
+function drawPodium(f) {
+  const s = E.inOutCubic(prog(f, POD, POD + 22));
+  if (s <= 0) return;
+  ctx.fillStyle = `rgba(7,9,13,${0.975 * s})`;
+  ctx.fillRect(0, 0, W, H);
+  const o = ALGOS.order;
+  const ratio = MAXC / MINC;
+  const k1 = E.outCubic(prog(f, POD + 10, POD + 26));
+  text('FINAL · COMPARISONS NEEDED FOR THE SAME 64 NUMBERS', W / 2, 128, { size: 28, weight: 700, color: C.accent, align: 'center', spacing: 3, alpha: k1 });
+  text(`Same input. ${ratio.toFixed(1)}× the work.`, W / 2, 214 + (1 - k1) * 20, { size: 68, weight: 800, align: 'center', spacing: -1, alpha: k1 });
+
+  // podium: 2nd, 1st, 3rd
+  const base = 624;
+  const slots = [{ i: 1, x: W / 2 - 360, h: 130 }, { i: 0, x: W / 2, h: 180 }, { i: 2, x: W / 2 + 360, h: 96 }];
+  const delays = { 2: 0, 1: 6, 0: 12 };
+  for (const sl of slots) {
+    const A = o[sl.i]; if (!A) continue;
+    const st = POD + 24 + delays[sl.i];
+    const g = E.outBack(prog(f, st, st + 18)), tIn = E.outCubic(prog(f, st + 8, st + 22));
+    const bh = sl.h * g, top = base - bh, bw = 300;
+    rr(sl.x - bw / 2, top, bw, bh, [10, 10, 0, 0]);
+    ctx.fillStyle = sl.i === 0 ? '#2A2114' : '#161C27'; ctx.fill();
+    ctx.fillStyle = sl.i === 0 ? C.accent : 'rgba(238,242,247,0.35)'; ctx.fillRect(sl.x - bw / 2, top, bw, 3);
+    if (g > 0.6) text(ordinal(A.rank), sl.x, top + Math.min(bh, sl.h) / 2 + 26, { size: 72, weight: 800, align: 'center', color: sl.i === 0 ? C.accent : C.text, alpha: clamp((g - 0.6) / 0.4) });
+    const yT = Math.min(top, base - sl.h);   // labels ride the block through its overshoot
+    text(A.name, sl.x, yT - 70 + (1 - tIn) * 16, { size: 38, weight: 700, align: 'center', alpha: tIn });
+    text(fmt(A.comparisons), sl.x, yT - 16 + (1 - tIn) * 16, { size: 54, weight: 800, align: 'center', color: sl.i === 0 ? C.accent : C.text, alpha: tIn });
+  }
+  ctx.fillStyle = 'rgba(238,242,247,0.18)'; ctx.fillRect(W / 2 - 560, base, 1120, 2);
+
+  // every total, as a bar
+  const x0 = 720, maxW = 700, y0 = 690, rowH = 41;
+  o.forEach((A, r) => {
+    const st = POD + 44 + r * 4;
+    const a = E.outCubic(prog(f, st, st + 10)), g = E.outCubic(prog(f, st + 2, st + 26));
+    const y = y0 + r * rowH;
+    text(A.name, x0 - 22, y + 28, { size: 28, weight: 600, align: 'right', color: A.rank <= 3 ? C.text : C.muted, alpha: a });
+    const bw = Math.max(4, maxW * A.comparisons / MAXC * g);
+    rr(x0, y + 8, bw, 24, 4); ctx.fillStyle = r === 0 ? C.accent : A.rank <= 3 ? 'rgba(255,181,71,0.55)' : 'rgba(238,242,247,0.30)'; ctx.globalAlpha = a; ctx.fill(); ctx.globalAlpha = 1;
+    text(fmt(A.comparisons * g), x0 + bw + 16, y + 29, { size: 28, weight: 800, alpha: a });
+    ctx.font = `800 28px ${FONT}`;
+    const wv = ctx.measureText(fmt(A.comparisons)).width;
+    text(`· ${fmt(A.totalWrites)} writes`, x0 + bw + 16 + wv + 12, y + 29, { size: 28, weight: 500, color: C.muted, alpha: a * E.outCubic(prog(f, st + 20, st + 34)) });
+  });
+}
+
+function draw(f) {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; ctx.filter = 'none'; ctx.shadowBlur = 0;
+  ctx.fillStyle = C.bg; ctx.fillRect(0, 0, W, H);
+  // a slow push-in on the podium
+  const push = E.inOutCubic(prog(f, POD, FRAMES - 1));
+  drawHeader(f);
+  for (let k = 0; k < ALGOS.length; k++) drawPanel(k, f);
+  drawSidebar(f);
+  drawIntro(f);
+  if (push > 0) { ctx.save(); ctx.translate(W / 2, H / 2); const z = 1 + 0.025 * push; ctx.scale(z, z); ctx.translate(-W / 2, -H / 2); }
+  drawPodium(f);
+  if (push > 0) ctx.restore();
+  ctx.globalAlpha = 1; ctx.letterSpacing = '0px';
+}
+
+// ---- sound (rendered offline, returned as one AudioBuffer) ---------------
+// Every 4th comparison of every algorithm is a tick; its pitch is the larger
+// of the two values being compared (major pentatonic). A bell marks each finish,
+// a chord lands on the podium.
+async function renderAudio() {
+  const SR = 48000, dur = FRAMES / FPS, LEN = Math.round(SR * dur);
+  const ac = new OfflineAudioContext(2, LEN, SR);
+  const dry = ac.createBuffer(2, LEN, SR), L = dry.getChannelData(0), R = dry.getChannelData(1);
+  const PENTA = [0, 2, 4, 7, 9];
+  const pitch = v => { const s = Math.min(14, Math.floor((v - 1) / N * 15)); return 196 * Math.pow(2, (12 * Math.floor(s / 5) + PENTA[s % 5]) / 12); };
+  function tone(at, freq, len, gain, pan, decay, harm = 0, attack = 0.002) {
+    const s0 = Math.round(at * SR), n = Math.round(len * SR);
+    const gl = gain * Math.cos((pan + 1) * Math.PI / 4), gr = gain * Math.sin((pan + 1) * Math.PI / 4);
+    const w = 2 * Math.PI * freq / SR;
+    for (let k = 0; k < n; k++) {
+      const i = s0 + k; if (i < 0) continue; if (i >= LEN) break;
+      const env = Math.min(1, k / (attack * SR)) * Math.exp(-k / (decay * SR));
+      const v = (Math.sin(w * k) + harm * Math.sin(2 * w * k)) * env;
+      L[i] += v * gl; R[i] += v * gr;
+    }
+  }
+  function thump(at, gain) {                      // pitched-down sine, the "GO"
+    const s0 = Math.round(at * SR), n = Math.round(0.5 * SR);
+    let ph = 0;
+    for (let k = 0; k < n && s0 + k < LEN; k++) {
+      const t = k / SR, fr = 45 + 75 * Math.exp(-t / 0.05);
+      ph += 2 * Math.PI * fr / SR;
+      const v = Math.sin(ph) * Math.min(1, k / 48) * Math.exp(-t / 0.16) * gain;
+      L[s0 + k] += v; R[s0 + k] += v;
+    }
+  }
+  const PAN = [-0.7, -0.25, 0.25, 0.7];
+  // intro: the shuffle, one tick per bar as it moves
+  for (let i = 0; i < N; i += 2) tone((4 + i * 0.42 + 6) / FPS, pitch(INPUT[i]), 0.14, 0.05, -0.8 + 1.6 * i / N, 0.03, 0.2);
+  thump(RS / FPS, 0.26);
+  // the race: ticks
+  ALGOS.forEach((A, k) => {
+    const pan = PAN[k % 4] * (k < 4 ? 1 : 0.8), harm = k < 4 ? 0.12 : 0.4;
+    for (let i = 3; i < A.comparisons; i += 4) {
+      const at = (RS + (i + 1) / MAXC * RD) / FPS;
+      tone(at, pitch(Math.max(A.pairs[2 * i], A.pairs[2 * i + 1])), 0.12, 0.06, pan, 0.022, harm);
+    }
+  });
+  // a bell for every finish, pitched by place
+  const BELL = [659.26, 587.33, 493.88, 440, 392, 329.63, 293.66, 246.94];
+  ALGOS.forEach((A, k) => {
+    const at = finishFrame(A) / FPS, fr = BELL[A.rank - 1], g = A.rank <= 3 ? 0.16 : 0.1;
+    [[1, 1, 1.4], [2, 0.35, 0.6], [3.01, 0.18, 0.35], [4.2, 0.08, 0.2]].forEach(([m, a, d]) => tone(at, fr * m, 2.2, g * a, PAN[k % 4] * 0.6, d, 0, 0.003));
+  });
+  // the podium chord (A major add 9)
+  const chordAt = (POD + 36) / FPS;
+  [110, 164.81, 220, 277.18, 329.63, 493.88, 659.26].forEach((fr, i) => tone(chordAt, fr, Math.min(dur - chordAt, 4.6), i < 2 ? 0.12 : 0.08, (i % 2 ? 0.3 : -0.3), 1.8, 0.25, 0.06));
+
+  // mix: dry + generated room
+  const src = ac.createBufferSource(); src.buffer = dry;
+  const rev = ac.createConvolver(), irLen = Math.round(1.8 * SR), ir = ac.createBuffer(2, irLen, SR), rnd = mulberry32(909);
+  for (let c = 0; c < 2; c++) { const d = ir.getChannelData(c); for (let i = 0; i < irLen; i++) d[i] = (rnd() * 2 - 1) * Math.exp(-i / (0.42 * SR)); }
+  rev.buffer = ir;
+  const dryG = ac.createGain(); dryG.gain.value = 0.9;
+  const wetG = ac.createGain(); wetG.gain.value = 0.22;
+  src.connect(dryG).connect(ac.destination);
+  src.connect(rev).connect(wetG).connect(ac.destination);
+  src.start(0);
+  const out = await ac.startRendering();
+  // normalise to -1 dBFS-ish headroom
+  let peak = 0;
+  for (let c = 0; c < 2; c++) { const d = out.getChannelData(c); for (let i = 0; i < d.length; i++) { const v = Math.abs(d[i]); if (v > peak) peak = v; } }
+  const g = peak > 0 ? 0.88 / peak : 1;
+  for (let c = 0; c < 2; c++) { const d = out.getChannelData(c); for (let i = 0; i < d.length; i++) d[i] *= g; }
+  return out;
+}
+
+window.__motion = {
+  title: 'Sorting Race',
+  description: 'Eight sorting algorithms sort the same 64 numbers side by side, paced by their real comparison counts.',
+  fps: FPS, width: W, height: H, frames: FRAMES,
+  poster: 300,                 // optional: frame used for the README still
+  gifStart: 0,                 // optional: second where the README GIF starts
+  seek(i) { draw(Math.max(0, Math.min(FRAMES - 1, Math.floor(i)))); },
+  audio: renderAudio,
+  // the numbers behind the picture, for anyone who wants to check them
+  stats: ALGOS.map(A => ({ id: A.id, name: A.name, comparisons: A.comparisons, writes: A.totalWrites, rank: A.rank, sorted: A.sorted, finishFrame: finishFrame(A) })),
+  input: INPUT.slice(),
+  clockAt,
+};
+
+/* ==========================================================================
+   PLAYER — identical in every piece; keep as is.
+   Autoplays and loops, starts sound on the first click, ?frame=N pauses on a
+   frame. When the renderer sets window.__MOTION_RENDER__ it stays out of the way.
+   ========================================================================== */
+(function player() {
+  const M = window.__motion, btn = document.getElementById('sound');
+  const dur = M.frames / M.fps;
+  if (window.__MOTION_RENDER__) { btn.hidden = true; M.seek(0); return; }
+  const q = new URLSearchParams(location.search);
+  if (q.has('frame')) { btn.hidden = true; M.seek(+q.get('frame') || 0); return; }
+  let t0 = performance.now(), ac = null, src = null, buf = null, paused = false, pausedAt = 0;
+  const clock = () => ac && src ? (ac.currentTime - t0) : (performance.now() - t0) / 1000;
+  function loop() {
+    if (!paused) M.seek(Math.floor(((clock() % dur) + dur) % dur * M.fps));
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+  btn.addEventListener('click', async () => {
+    if (src) { src.stop(); src = null; btn.textContent = 'Click for sound'; t0 = performance.now(); return; }
+    btn.textContent = 'Loading sound…';
+    ac = ac || new AudioContext({ sampleRate: 48000 });
+    buf = buf || await M.audio();
+    await ac.resume();
+    src = ac.createBufferSource(); src.buffer = buf; src.loop = true; src.connect(ac.destination);
+    t0 = ac.currentTime + 0.05; src.start(t0);        // picture restarts from frame 0 in sync with the sound
+    btn.textContent = 'Sound on — click to mute';
+  });
+  addEventListener('keydown', e => {
+    if (e.code !== 'Space') return;
+    e.preventDefault(); paused = !paused;
+    if (ac) paused ? ac.suspend() : ac.resume();
+    if (!ac) { if (paused) pausedAt = performance.now(); else t0 += performance.now() - pausedAt; }
+  });
+})();
+</script>
+</body>
+</html>

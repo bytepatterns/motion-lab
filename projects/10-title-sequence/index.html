@@ -1,0 +1,522 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Signal — motion-lab</title>
+<style>
+  /* Player chrome. The piece itself lives entirely in the canvas. */
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  body { display: grid; place-items: center; font: 500 15px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #fff; }
+  canvas { display: block; width: min(100vw, calc(100vh * 16 / 9)); height: auto; aspect-ratio: 16 / 9; }
+  #sound { position: fixed; left: 16px; bottom: 16px; padding: 8px 14px; border: 1px solid rgba(255,255,255,.35); border-radius: 999px;
+           background: rgba(0,0,0,.55); color: #fff; font: inherit; cursor: pointer; }
+  #sound[hidden] { display: none; }
+</style>
+</head>
+<body>
+<canvas id="stage" width="1920" height="1080" aria-label="A documentary title sequence: a signal line, pulses and the title Signal"></canvas>
+<button id="sound" type="button">Click for sound</button>
+<script>
+'use strict';
+/* ==========================================================================
+   PIECE — Signal, a documentary title sequence.
+   One trace across the frame. A pulse that keeps coming back, faster each
+   time, until it cuts to silence and the title rises out of the line.
+   Picture and sound read the same pulse list, so they cannot drift.
+   ========================================================================== */
+const W = 1920, H = 1080, FPS = 30, FRAMES = 600;          // 20 s
+const cv = document.getElementById('stage');
+const ctx = cv.getContext('2d');
+const FONT = 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
+const SERIF = 'Georgia, "Times New Roman", Times, serif';
+const SERIF_IT = '"Palatino Linotype", Palatino, "Book Antiqua", Georgia, serif';
+const MONO = 'ui-monospace, "Cascadia Code", Consolas, Menlo, monospace';
+
+// ---- helpers -------------------------------------------------------------
+function mulberry32(a) { return function () { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a);
+  t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const lerp = (a, b, t) => a + (b - a) * t;
+const prog = (f, a, b) => clamp((f - a) / (b - a));           // 0..1 progress of f through [a, b]
+const E = {
+  inCubic: t => t * t * t,
+  outCubic: t => 1 - Math.pow(1 - t, 3),
+  inOutCubic: t => t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2,
+  outExpo: t => t === 1 ? 1 : 1 - Math.pow(2, -10 * t),
+  inExpo: t => t === 0 ? 0 : Math.pow(2, 10 * t - 10),
+  inOutExpo: t => t === 0 ? 0 : t === 1 ? 1 : t < .5 ? Math.pow(2, 20 * t - 10) / 2 : (2 - Math.pow(2, -20 * t + 10)) / 2,
+  outBack: t => 1 + 2.70158 * Math.pow(t - 1, 3) + 1.70158 * Math.pow(t - 1, 2),
+  inOutSine: t => -(Math.cos(Math.PI * t) - 1) / 2,
+};
+
+// ---- design tokens -------------------------------------------------------
+const C = {
+  bg: '#0E0C0A', bar: '#000000',
+  cream: '#EDE6D6', dim: 'rgba(237,230,214,0.55)', faint: 'rgba(237,230,214,0.10)',
+  amber: '#FFA24A', amberRGB: '255,162,74', roseRGB: '255,79,109',
+};
+const BAR = 132;                       // letterbox: 1920 x 816 picture (2.35:1)
+const LINE_Y = 584;                    // the signal line
+
+// ---- timeline (seconds) ----------------------------------------------------
+const T = FRAMES / FPS;
+const CUT = 498 / FPS;                 // 16.6 s: hard cut to silence
+const TITLE = 507 / FPS;               // 16.9 s: the line returns, the title rises
+// The pulse: every interval 7 % shorter than the last, never faster than 0.26 s.
+const PULSES = (() => {
+  const p = []; let t = 0, k = 0;
+  while (t < CUT - 0.12) { p.push(+t.toFixed(4)); t += Math.max(0.26, 1.34 * Math.pow(0.93, k++)); }
+  return p;
+})();
+function pulseEnv(t, tau = 0.24) {     // sum of decaying pulses already fired
+  let e = 0;
+  for (const p of PULSES) { if (p > t) break; e += Math.exp(-(t - p) / tau); }
+  return Math.min(1.6, e);
+}
+const build = t => E.inCubic(clamp(t / CUT));          // 0 -> 1 over the whole run-up
+
+// ---- grain: six seeded tiles, picked per frame ------------------------------
+const GRAIN = (() => {
+  const tiles = [], S = 256;
+  for (let k = 0; k < 6; k++) {
+    const c = document.createElement('canvas'); c.width = c.height = S;
+    const g = c.getContext('2d'), img = g.createImageData(S, S), r = mulberry32(1000 + k);
+    for (let i = 0; i < S * S; i++) {
+      const v = (r() + r() + r() - 1.5) / 1.5;                   // roughly gaussian, -1..1
+      const w = v > 0 ? 255 : 0;
+      img.data[4 * i] = img.data[4 * i + 1] = img.data[4 * i + 2] = w;
+      img.data[4 * i + 3] = Math.min(255, Math.abs(v) * 150);
+    }
+    g.putImageData(img, 0, 0);
+    tiles.push(c);
+  }
+  return tiles;
+})();
+
+// ---- drawing helpers --------------------------------------------------------
+function text(str, x, y, { font, color = C.cream, align = 'center', spacing = 0, alpha = 1 } = {}) {
+  ctx.font = font; ctx.letterSpacing = spacing.toFixed(2) + 'px';
+  ctx.textAlign = align; ctx.textBaseline = 'alphabetic';
+  const a0 = ctx.globalAlpha; ctx.globalAlpha = a0 * alpha; ctx.fillStyle = color;
+  // canvas adds the tracking after the last glyph too; shift centred text back by half of it
+  ctx.fillText(str, align === 'center' ? x + spacing / 2 : x, y);
+  ctx.globalAlpha = a0; ctx.letterSpacing = '0px';
+}
+// A card fades in with a defocus and slowly tightens its tracking for its whole life.
+function card(t, t0, t1, fn) {
+  const a = E.outCubic(prog(t, t0, t0 + 0.8)) * (1 - E.inCubic(prog(t, t1 - 0.6, t1)));
+  if (a <= 0.002) return;
+  const life = prog(t, t0, t1);
+  ctx.save();
+  ctx.globalAlpha = a;
+  const blur = (1 - a) * 9;
+  if (blur > 0.25) ctx.filter = `blur(${blur.toFixed(2)}px)`;
+  fn(life, a);
+  ctx.restore();
+}
+// camera: a slow dolly in, with depth-dependent parallax
+function camera(t) {
+  if (t < CUT) return { z: 1 + 0.11 * E.inOutSine(clamp(t / CUT)), x: 36 * Math.sin(t * 0.21), y: 10 * Math.sin(t * 0.17 + 1) };
+  return { z: 1 + 0.035 * E.outCubic(prog(t, CUT, T)), x: 0, y: 0 };
+}
+function layer(cam, depth) {
+  const z = 1 + (cam.z - 1) * depth;
+  ctx.setTransform(z, 0, 0, z, W / 2 * (1 - z) + cam.x * depth, H / 2 * (1 - z) + cam.y * depth);
+}
+
+// the trace: slow carrier + pulse packets travelling left to right
+function wave(x, t) {
+  const b = build(t);
+  const A = 6 + 22 * b;
+  let y = A * (0.55 * Math.sin(x * 0.0105 + t * 2.3) + 0.3 * Math.sin(x * 0.027 - t * 3.1 + 1.3) + 0.15 * Math.sin(x * 0.061 + t * 5.7));
+  for (let k = 0; k < PULSES.length; k++) {
+    const age = t - PULSES[k];
+    if (age < 0) break;
+    if (age > 1.8) continue;
+    // each pulse leaves the centre and travels out both ways
+    const P = (46 + 26 * k / PULSES.length) * Math.exp(-age * 1.4), off = age * 1100;
+    for (const xc of [W / 2 - off, W / 2 + off]) {
+      const d = (x - xc) / 70;
+      if (d * d < 16) y += P * Math.exp(-d * d) * Math.sin((x - xc) * 0.16) * (off < 60 ? 0.5 + off / 120 : 1);
+    }
+  }
+  const edge = Math.min(1, x / 260, (W - x) / 260);
+  return y * (0.25 + 0.75 * clamp(edge));
+}
+
+function drawGrid(t, cam) {
+  layer(cam, 0.35);
+  ctx.fillStyle = 'rgba(237,230,214,0.075)';
+  for (let x = 24; x < W; x += 48) for (let y = BAR + 24; y < H - BAR; y += 48) ctx.fillRect(x - 1, y - 1, 2, 2);
+  // ruler ticks along the line
+  ctx.fillStyle = 'rgba(237,230,214,0.16)';
+  for (let x = 0; x <= W; x += 24) { const big = x % 192 === 0; ctx.fillRect(x, LINE_Y + 34, 1, big ? 12 : 5); }
+}
+
+function drawRadar(t, cam) {
+  layer(cam, 0.55);
+  const cx = 1500, cy = 470, e = pulseEnv(t);
+  ctx.lineWidth = 1;
+  for (let r = 70; r <= 420; r += 70) {
+    ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2);
+    ctx.strokeStyle = `rgba(237,230,214,${0.05 + 0.03 * e})`; ctx.stroke();
+  }
+  // cross hair
+  ctx.fillStyle = 'rgba(237,230,214,0.12)';
+  ctx.fillRect(cx - 440, cy, 880, 1); ctx.fillRect(cx, cy - 440, 1, 880);
+  // sweep
+  const ang = t * 0.9 - 1.2;
+  const g = ctx.createConicGradient(ang, cx, cy);
+  g.addColorStop(0, `rgba(${C.amberRGB},0.16)`); g.addColorStop(0.12, `rgba(${C.amberRGB},0)`); g.addColorStop(1, `rgba(${C.amberRGB},0)`);
+  ctx.beginPath(); ctx.moveTo(cx, cy); ctx.arc(cx, cy, 420, ang - 0.001, ang - Math.PI * 2 * 0.12, true); ctx.closePath();
+  ctx.fillStyle = g; ctx.fill();
+  // rings thrown by each pulse
+  for (const p of PULSES) {
+    const age = t - p; if (age < 0) break; if (age > 1.4) continue;
+    const r = 30 + age * 520, a = (1 - age / 1.4) * 0.35;
+    ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2);
+    ctx.strokeStyle = `rgba(${C.amberRGB},${a})`; ctx.lineWidth = 1.5; ctx.stroke();
+  }
+  // blips: fixed seeded targets, lit as the sweep passes
+  const r = mulberry32(77);
+  for (let k = 0; k < 9; k++) {
+    const ba = r() * Math.PI * 2, br = 90 + r() * 310;
+    let d = ((ang - ba) % (Math.PI * 2) + Math.PI * 2) % (Math.PI * 2);
+    const lit = Math.exp(-d * 1.6);
+    ctx.fillStyle = `rgba(237,230,214,${0.08 + 0.7 * lit})`;
+    ctx.fillRect(cx + Math.cos(ba) * br - 2, cy + Math.sin(ba) * br - 2, 4, 4);
+  }
+}
+
+function drawPlots(t, cam) {
+  layer(cam, 0.6);
+  // spectrum (bottom left): a fixed seeded profile, breathing with the pulse
+  const x0 = 150, y0 = 910, e = pulseEnv(t), r = mulberry32(5);
+  for (let k = 0; k < 48; k++) {
+    const base = 0.25 + 0.75 * Math.exp(-k / 14) * (0.6 + 0.4 * r());
+    const h = 8 + 70 * base * (0.35 + 0.45 * build(t) + 0.35 * e * Math.exp(-k / 20)) * (0.85 + 0.15 * Math.sin(t * 7 + k * 0.9));
+    ctx.fillStyle = k < 6 ? `rgba(${C.amberRGB},0.55)` : 'rgba(237,230,214,0.22)';
+    ctx.fillRect(x0 + k * 8, y0 - h, 5, h);
+  }
+  ctx.fillStyle = 'rgba(237,230,214,0.25)'; ctx.fillRect(x0, y0 + 6, 48 * 8, 1);
+  text('SPECTRUM  20 Hz — 20 kHz', x0, y0 + 30, { font: `500 16px ${MONO}`, color: 'rgba(237,230,214,0.4)', align: 'left', spacing: 2 });
+  // pulse history (bottom right): the last four seconds of the envelope
+  const px = 1390, pw = 380, py = 910, ph = 70;
+  ctx.fillStyle = 'rgba(237,230,214,0.25)'; ctx.fillRect(px, py + 6, pw, 1);
+  ctx.beginPath();
+  for (let i = 0; i <= 95; i++) {
+    const tt = t - 4 + 4 * i / 95, v = tt < 0 ? 0 : pulseEnv(tt) / 1.6;
+    const X = px + pw * i / 95, Y = py - v * ph;
+    i ? ctx.lineTo(X, Y) : ctx.moveTo(X, Y);
+  }
+  ctx.strokeStyle = `rgba(${C.amberRGB},0.7)`; ctx.lineWidth = 1.5; ctx.stroke();
+  text('PULSE  Δt ' + nextInterval(t).toFixed(2) + ' s', px, py + 30, { font: `500 16px ${MONO}`, color: 'rgba(237,230,214,0.4)', align: 'left', spacing: 2 });
+}
+function nextInterval(t) {
+  let k = 0; while (k < PULSES.length - 1 && PULSES[k + 1] <= t) k++;
+  return k < PULSES.length - 1 ? PULSES[k + 1] - PULSES[k] : 0.26;
+}
+
+function drawTrace(t, cam, alpha = 1) {
+  layer(cam, 1);
+  const e = pulseEnv(t);
+  const pts = [];
+  for (let x = -40; x <= W + 40; x += 4) pts.push(x, LINE_Y + wave(x, t));
+  const path = () => { ctx.beginPath(); for (let i = 0; i < pts.length; i += 2) i ? ctx.lineTo(pts[i], pts[i + 1]) : ctx.moveTo(pts[i], pts[i + 1]); };
+  // ghost: the same trace 80 ms ago
+  ctx.beginPath();
+  for (let x = -40; x <= W + 40; x += 6) { const y = LINE_Y + wave(x, t - 0.08) * 1.15; x > -40 ? ctx.lineTo(x, y) : ctx.moveTo(x, y); }
+  ctx.strokeStyle = `rgba(${C.roseRGB},${0.18 * alpha})`; ctx.lineWidth = 1; ctx.stroke();
+  path(); ctx.strokeStyle = `rgba(${C.amberRGB},${(0.10 + 0.12 * e) * alpha})`; ctx.lineWidth = 9; ctx.stroke();
+  path(); ctx.strokeStyle = `rgba(237,230,214,${(0.82 + 0.18 * Math.min(1, e)) * alpha})`; ctx.lineWidth = 1.8; ctx.stroke();
+  // a flare at the source of every pulse
+  if (e > 0.02) {
+    ctx.globalCompositeOperation = 'screen';
+    const g0 = ctx.createRadialGradient(W / 2, LINE_Y, 0, W / 2, LINE_Y, 420);
+    g0.addColorStop(0, `rgba(255,214,170,${Math.min(0.55, 0.4 * e) * alpha})`); g0.addColorStop(0.25, `rgba(${C.amberRGB},${Math.min(0.2, 0.14 * e) * alpha})`); g0.addColorStop(1, `rgba(${C.amberRGB},0)`);
+    ctx.fillStyle = g0; ctx.fillRect(W / 2 - 420, LINE_Y - 420, 840, 840);
+    ctx.globalCompositeOperation = 'source-over';
+  }
+  // anamorphic streak on every pulse
+  if (e > 0.02) {
+    const g = ctx.createLinearGradient(0, 0, W, 0);
+    g.addColorStop(0, `rgba(${C.amberRGB},0)`); g.addColorStop(0.5, `rgba(255,214,170,${Math.min(0.75, 0.5 * e) * alpha})`); g.addColorStop(1, `rgba(${C.amberRGB},0)`);
+    ctx.fillStyle = g; const h = 2 + 5 * Math.min(1, e);
+    ctx.fillRect(0, LINE_Y - h / 2, W, h);
+  }
+}
+
+function drawLeaks(t, cam, k = 1) {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalCompositeOperation = 'screen';
+  const e = pulseEnv(t), b = build(t);
+  const blobs = [
+    { x: 260 + 180 * Math.sin(t * 0.23), y: 300 + 90 * Math.sin(t * 0.31 + 2), r: 760, c: C.amberRGB, a: 0.16 + 0.05 * Math.sin(t * 0.7) },
+    { x: 1700 + 140 * Math.sin(t * 0.19 + 1), y: 820 + 70 * Math.sin(t * 0.27), r: 820, c: C.roseRGB, a: 0.10 + 0.04 * Math.sin(t * 0.5 + 1) },
+    { x: W / 2, y: LINE_Y, r: 900, c: '255,200,150', a: 0.05 + 0.10 * Math.min(1, e) + 0.10 * b },
+  ];
+  for (const L of blobs) {
+    const g = ctx.createRadialGradient(L.x, L.y, 0, L.x, L.y, L.r);
+    g.addColorStop(0, `rgba(${L.c},${L.a * k})`); g.addColorStop(1, `rgba(${L.c},0)`);
+    ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  }
+  // a burn sweeping across at each card change
+  for (const s of [4.25, 8.25, 12.25]) {
+    const p = prog(t, s - 0.4, s + 0.9);
+    if (p <= 0 || p >= 1) continue;
+    const x = lerp(-500, W + 500, E.inOutCubic(p)), a = Math.sin(Math.PI * p) * 0.28 * k;
+    const g = ctx.createLinearGradient(x - 420, 0, x + 420, 0);
+    g.addColorStop(0, `rgba(${C.amberRGB},0)`); g.addColorStop(0.5, `rgba(255,170,90,${a})`); g.addColorStop(1, `rgba(${C.roseRGB},0)`);
+    ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  }
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+function drawCards(t, cam) {
+  layer(cam, 0.85);
+  const above = LINE_Y - 100, below = LINE_Y + 118;
+  card(t, 0.7, 4.1, (life) => {
+    text('BYTEPATTERNS MOTION LAB', W / 2, above, { font: `600 32px ${FONT}`, spacing: 16 + 8 * (1 - E.outCubic(life)) });
+    text('presents', W / 2, below, { font: `italic 400 46px ${SERIF_IT}`, color: C.dim });
+  });
+  card(t, 4.4, 8.1, (life) => {
+    text('A FILM DRAWN IN CODE', W / 2, above, { font: `700 66px ${FONT}`, spacing: 16 + 10 * (1 - E.outCubic(life)) });
+    text('Every frame computed. Nothing filmed.', W / 2, below, { font: `italic 400 44px ${SERIF_IT}`, color: C.dim });
+  });
+  card(t, 8.4, 12.1, (life) => {
+    text('EPISODE 1', W / 2, above - 176, { font: `600 32px ${FONT}`, color: C.amber, spacing: 18 + 8 * (1 - E.outCubic(life)) });
+    text('Origins', W / 2, above - 6, { font: `italic 700 168px ${SERIF}`, spacing: 2 + 10 * (1 - E.outCubic(life)) });
+  });
+  card(t, 12.4, CUT - 0.25, (life) => {
+    const words = ['NO CAMERA.', 'NO FOOTAGE.', 'NO SAMPLES.'];
+    // each phrase lands on a pulse
+    const beats = PULSES.filter(p => p >= 12.4).slice(0, 5);
+    const at = [beats[0] ?? 12.4, beats[2] ?? 13.2, beats[4] ?? 14];
+    ctx.font = `800 52px ${FONT}`; ctx.letterSpacing = '8px';
+    const widths = words.map(s => ctx.measureText(s).width);
+    ctx.letterSpacing = '0px';
+    const gap = 44, total = widths.reduce((a, b) => a + b, 0) + gap * 2;
+    let x = W / 2 - total / 2;
+    words.forEach((s, i) => {
+      const k = E.outExpo(prog(t, at[i], at[i] + 0.35));
+      text(s, x, above + (1 - k) * 24, { font: `800 52px ${FONT}`, align: 'left', spacing: 8, alpha: k, color: i === 2 ? C.amber : C.cream });
+      x += widths[i] + gap;
+    });
+    const k = E.outCubic(prog(t, at[2] + 0.5, at[2] + 1.3));
+    text('Only a signal.', W / 2, below, { font: `italic 400 46px ${SERIF_IT}`, color: C.dim, alpha: k });
+  });
+}
+
+function drawTitle(t, cam) {
+  layer(cam, 1);
+  // the line comes back from the centre
+  const w = 1180 * E.outExpo(prog(t, TITLE, TITLE + 0.8));
+  if (w > 1) {
+    const g = ctx.createLinearGradient(W / 2 - w / 2, 0, W / 2 + w / 2, 0);
+    g.addColorStop(0, `rgba(${C.amberRGB},0)`); g.addColorStop(0.18, `rgba(${C.amberRGB},0.95)`);
+    g.addColorStop(0.82, `rgba(${C.amberRGB},0.95)`); g.addColorStop(1, `rgba(${C.amberRGB},0)`);
+    ctx.fillStyle = g; ctx.fillRect(W / 2 - w / 2, LINE_Y - 1, w, 2);
+    ctx.fillStyle = `rgba(${C.amberRGB},0.10)`; ctx.fillRect(W / 2 - w / 2 * 0.8, LINE_Y - 5, w * 0.8, 10);
+  }
+  // the title rises out of it
+  const rise = E.outCubic(prog(t, TITLE + 0.25, TITLE + 1.35));
+  const track = lerp(96, 34, E.outExpo(prog(t, TITLE + 0.25, T - 0.2)));
+  if (rise > 0) {
+    ctx.save();
+    ctx.beginPath(); ctx.rect(0, LINE_Y - 8 - 300 * rise, W, 300 * rise); ctx.clip();
+    const y = LINE_Y - 44 + (1 - rise) * 190;
+    const font = `700 232px ${SERIF}`;
+    const ab = (1 - rise) * 10 + 1.5;               // a little chromatic split that settles
+    ctx.globalCompositeOperation = 'screen';
+    text('SIGNAL', W / 2 - ab, y, { font, spacing: track, color: `rgba(${C.roseRGB},0.55)` });
+    text('SIGNAL', W / 2 + ab, y, { font, spacing: track, color: 'rgba(120,200,255,0.30)' });
+    ctx.globalCompositeOperation = 'source-over';
+    text('SIGNAL', W / 2, y, { font, spacing: track, color: C.cream });
+    ctx.restore();
+  }
+  const s = E.outCubic(prog(t, TITLE + 1.2, TITLE + 2.0));
+  text('EPISODE 1  ·  ORIGINS', W / 2, LINE_Y + 76 + (1 - s) * 10, { font: `600 32px ${FONT}`, color: C.dim, spacing: 14, alpha: s });
+}
+
+function drawOverlays(t, f, live) {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  // grain: a different seeded tile and offset each frame
+  const r = mulberry32((f >> 1) * 7919 + 17);        // grain changes on twos, like projected film
+  const tile = GRAIN[Math.floor(r() * GRAIN.length)];
+  const pat = ctx.createPattern(tile, 'repeat');
+  pat.setTransform(new DOMMatrix([2.1, 0, 0, 2.1, Math.floor(r() * 256), Math.floor(r() * 256)]));
+  ctx.globalAlpha = 0.28; ctx.fillStyle = pat; ctx.fillRect(0, 0, W, H); ctx.globalAlpha = 1;
+  // exposure flicker
+  const fl = r();
+  ctx.fillStyle = `rgba(0,0,0,${0.035 * fl})`; ctx.fillRect(0, 0, W, H);
+  // vignette
+  const g = ctx.createRadialGradient(W / 2, H / 2, 300, W / 2, H / 2, 1150);
+  g.addColorStop(0, 'rgba(0,0,0,0)'); g.addColorStop(1, 'rgba(0,0,0,0.62)');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  // letterbox with a slate readout
+  ctx.fillStyle = C.bar; ctx.fillRect(0, 0, W, BAR); ctx.fillRect(0, H - BAR, W, BAR);
+  if (live) {
+    const s = Math.floor(f / FPS), fr = f % FPS;
+    const tc = `TC 00:00:${String(s).padStart(2, '0')}:${String(fr).padStart(2, '0')}`;
+    const dim = 'rgba(237,230,214,0.42)';
+    text(tc, 96, 84, { font: `500 20px ${MONO}`, color: dim, align: 'left', spacing: 2 });
+    text('CH 01  ·  48 kHz  ·  STEREO', 1824, 84, { font: `500 20px ${MONO}`, color: dim, align: 'right', spacing: 2 });
+    const lvl = -38 + 30 * Math.min(1, pulseEnv(t) * 0.8 + build(t) * 0.4);
+    text(`LEVEL ${lvl.toFixed(1)} dB`, 96, H - 70, { font: `500 20px ${MONO}`, color: dim, align: 'left', spacing: 2 });
+    // tiny level meter
+    ctx.fillStyle = 'rgba(237,230,214,0.12)'; ctx.fillRect(330, H - 82, 240, 8);
+    ctx.fillStyle = `rgba(${C.amberRGB},0.8)`; ctx.fillRect(330, H - 82, 240 * clamp((lvl + 40) / 36), 8);
+    text(`PULSE ${String(PULSES.filter(p => p <= t).length).padStart(2, '0')} / ${PULSES.length}`, 1824, H - 70, { font: `500 20px ${MONO}`, color: dim, align: 'right', spacing: 2 });
+  } else {
+    const a = E.outCubic(prog(t, TITLE + 1.8, TITLE + 2.6));
+    text('BYTEPATTERNS  ·  MOTION LAB', W / 2, H - 66, { font: `500 20px ${MONO}`, color: 'rgba(237,230,214,0.42)', spacing: 4, alpha: a });
+  }
+}
+
+// ---- picture -------------------------------------------------------------
+function draw(f) {
+  const t = f / FPS;
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; ctx.filter = 'none'; ctx.shadowBlur = 0; ctx.letterSpacing = '0px';
+  ctx.fillStyle = C.bg; ctx.fillRect(0, 0, W, H);
+  const cam = camera(t);
+  // gate weave: sub-pixel jitter, seeded per frame
+  const jr = mulberry32(f * 131 + 7);
+  cam.x += (jr() - 0.5) * 1.2; cam.y += (jr() - 0.5) * 1.2;
+
+  if (t < CUT) {
+    drawLeaks(t, cam, 1);
+    drawGrid(t, cam);
+    drawRadar(t, cam);
+    drawPlots(t, cam);
+    drawTrace(t, cam);
+    drawCards(t, cam);
+    // the last half second: the frame overexposes into the cut
+    const burn = E.inExpo(prog(t, CUT - 0.55, CUT));
+    if (burn > 0) { ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.fillStyle = `rgba(255,226,196,${0.55 * burn})`; ctx.fillRect(0, 0, W, H); }
+    drawOverlays(t, f, true);
+  } else {
+    // silence: the dark frame keeps only a faint grid, then the title
+    const back = E.outCubic(prog(t, TITLE, T));
+    drawLeaks(t, cam, 0.25 + 0.35 * back);
+    ctx.globalAlpha = 0.5 * back; drawGrid(t, cam); ctx.globalAlpha = 1;
+    drawTitle(t, cam);
+    drawOverlays(t, f, false);
+  }
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; ctx.filter = 'none'; ctx.letterSpacing = '0px';
+}
+
+// ---- sound (rendered offline, returned as one AudioBuffer) ---------------
+// A low drone that opens up, a pulse on every entry of PULSES, a noise riser,
+// then everything stops at CUT. The title plays in silence.
+async function renderAudio() {
+  const SR = 48000, dur = FRAMES / FPS, LEN = Math.round(SR * dur);
+  const ac = new OfflineAudioContext(2, LEN, SR);
+  const master = ac.createGain();
+  master.gain.setValueAtTime(1, 0); master.gain.setValueAtTime(1, CUT - 0.008); master.gain.linearRampToValueAtTime(0, CUT);
+  master.connect(ac.destination);
+  const comp = ac.createDynamicsCompressor();
+  comp.threshold.value = -16; comp.ratio.value = 3; comp.attack.value = 0.004; comp.release.value = 0.25; comp.knee.value = 8;
+  comp.connect(master);
+  const bus = ac.createGain(); bus.gain.value = 1; bus.connect(comp);
+  // room: generated impulse response
+  const irLen = Math.round(2.6 * SR), ir = ac.createBuffer(2, irLen, SR), rr = mulberry32(4242);
+  for (let c = 0; c < 2; c++) { const d = ir.getChannelData(c); for (let i = 0; i < irLen; i++) d[i] = (rr() * 2 - 1) * Math.pow(1 - i / irLen, 2.2) * Math.exp(-i / (0.7 * SR)); }
+  const rev = ac.createConvolver(); rev.buffer = ir;
+  const wet = ac.createGain(); wet.gain.value = 0.32; rev.connect(wet).connect(comp);
+  // seeded noise
+  const nb = ac.createBuffer(2, 2 * SR, SR), nr = mulberry32(99);
+  for (let c = 0; c < 2; c++) { const d = nb.getChannelData(c); for (let i = 0; i < d.length; i++) d[i] = nr() * 2 - 1; }
+
+  // drone: detuned saws through a slowly opening low-pass
+  const droneLP = ac.createBiquadFilter(); droneLP.type = 'lowpass'; droneLP.Q.value = 3.5;
+  droneLP.frequency.setValueAtTime(110, 0); droneLP.frequency.exponentialRampToValueAtTime(260, 8); droneLP.frequency.exponentialRampToValueAtTime(1100, CUT);
+  const droneG = ac.createGain();
+  droneG.gain.setValueAtTime(0.0001, 0); droneG.gain.exponentialRampToValueAtTime(0.20, 1.6); droneG.gain.linearRampToValueAtTime(0.30, CUT - 0.5);
+  droneLP.connect(droneG); droneG.connect(bus); droneG.connect(rev);
+  [[41.2, 'sawtooth', -0.4, 0.5], [41.45, 'sawtooth', 0.4, 0.5], [82.4, 'sawtooth', 0, 0.25], [61.74, 'triangle', -0.2, 0.3], [41.2, 'sine', 0, 0.9]].forEach(([fr, type, pan, g]) => {
+    const o = ac.createOscillator(); o.type = type; o.frequency.value = fr;
+    const gg = ac.createGain(); gg.gain.value = g; const p = ac.createStereoPanner(); p.pan.value = pan;
+    o.connect(gg).connect(p).connect(droneLP); o.start(0); o.stop(CUT + 0.05);
+  });
+  // a faint carrier tone, the "signal", from the second card on
+  const car = ac.createOscillator(); car.frequency.value = 880;
+  const carG = ac.createGain(); carG.gain.setValueAtTime(0, 0); carG.gain.setValueAtTime(0, 4.4); carG.gain.linearRampToValueAtTime(0.012, 6); carG.gain.linearRampToValueAtTime(0.02, CUT);
+  car.connect(carG); carG.connect(bus); carG.connect(rev); car.start(0); car.stop(CUT + 0.05);
+
+  // the pulse
+  PULSES.forEach((at, k) => {
+    const g = 0.55 + 0.45 * k / PULSES.length;
+    const o = ac.createOscillator(); o.frequency.setValueAtTime(128, at); o.frequency.exponentialRampToValueAtTime(40, at + 0.2);
+    const og = ac.createGain(); og.gain.setValueAtTime(0.0001, at); og.gain.exponentialRampToValueAtTime(0.9 * g, at + 0.004); og.gain.exponentialRampToValueAtTime(0.0001, at + 0.55);
+    o.connect(og); og.connect(bus); og.connect(rev); o.start(at); o.stop(at + 0.6);
+    const n = ac.createBufferSource(); n.buffer = nb; n.loopStart = 0; n.loop = true;
+    const bp = ac.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 2200; bp.Q.value = 1.1;
+    const ng = ac.createGain(); ng.gain.setValueAtTime(0.0001, at); ng.gain.exponentialRampToValueAtTime(0.35 * g, at + 0.002); ng.gain.exponentialRampToValueAtTime(0.0001, at + 0.05);
+    n.connect(bp).connect(ng); ng.connect(bus); ng.connect(rev); n.start(at, (k * 0.137) % 1.5); n.stop(at + 0.08);
+  });
+  // riser into the cut
+  const rs = ac.createBufferSource(); rs.buffer = nb; rs.loop = true;
+  const rbp = ac.createBiquadFilter(); rbp.type = 'bandpass'; rbp.Q.value = 1.4;
+  rbp.frequency.setValueAtTime(380, 12.6); rbp.frequency.exponentialRampToValueAtTime(5200, CUT);
+  const rg = ac.createGain(); rg.gain.setValueAtTime(0.0001, 12.6); rg.gain.exponentialRampToValueAtTime(0.22, CUT);
+  rs.connect(rbp).connect(rg); rg.connect(bus); rg.connect(rev); rs.start(12.6); rs.stop(CUT + 0.02);
+
+  const out = await ac.startRendering();
+  let peak = 0;
+  for (let c = 0; c < 2; c++) { const d = out.getChannelData(c); for (let i = 0; i < d.length; i++) { const v = Math.abs(d[i]); if (v > peak) peak = v; } }
+  const g = peak > 0 ? 0.88 / peak : 1;
+  for (let c = 0; c < 2; c++) { const d = out.getChannelData(c); for (let i = 0; i < d.length; i++) d[i] *= g; }
+  return out;
+}
+
+window.__motion = {
+  title: 'Signal',
+  description: 'A documentary title sequence: one trace, a pulse that keeps quickening, then silence and the title.',
+  fps: FPS, width: W, height: H, frames: FRAMES,
+  poster: 330,                 // optional: frame used for the README still
+  gifStart: 12,                // optional: second where the README GIF starts
+  seek(i) { draw(Math.max(0, Math.min(FRAMES - 1, Math.floor(i)))); },
+  audio: renderAudio,
+};
+
+/* ==========================================================================
+   PLAYER — identical in every piece; keep as is.
+   Autoplays and loops, starts sound on the first click, ?frame=N pauses on a
+   frame. When the renderer sets window.__MOTION_RENDER__ it stays out of the way.
+   ========================================================================== */
+(function player() {
+  const M = window.__motion, btn = document.getElementById('sound');
+  const dur = M.frames / M.fps;
+  if (window.__MOTION_RENDER__) { btn.hidden = true; M.seek(0); return; }
+  const q = new URLSearchParams(location.search);
+  if (q.has('frame')) { btn.hidden = true; M.seek(+q.get('frame') || 0); return; }
+  let t0 = performance.now(), ac = null, src = null, buf = null, paused = false, pausedAt = 0;
+  const clock = () => ac && src ? (ac.currentTime - t0) : (performance.now() - t0) / 1000;
+  function loop() {
+    if (!paused) M.seek(Math.floor(((clock() % dur) + dur) % dur * M.fps));
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+  btn.addEventListener('click', async () => {
+    if (src) { src.stop(); src = null; btn.textContent = 'Click for sound'; t0 = performance.now(); return; }
+    btn.textContent = 'Loading sound…';
+    ac = ac || new AudioContext({ sampleRate: 48000 });
+    buf = buf || await M.audio();
+    await ac.resume();
+    src = ac.createBufferSource(); src.buffer = buf; src.loop = true; src.connect(ac.destination);
+    t0 = ac.currentTime + 0.05; src.start(t0);        // picture restarts from frame 0 in sync with the sound
+    btn.textContent = 'Sound on — click to mute';
+  });
+  addEventListener('keydown', e => {
+    if (e.code !== 'Space') return;
+    e.preventDefault(); paused = !paused;
+    if (ac) paused ? ac.suspend() : ac.resume();
+    if (!ac) { if (paused) pausedAt = performance.now(); else t0 += performance.now() - pausedAt; }
+  });
+})();
+</script>
+</body>
+</html>

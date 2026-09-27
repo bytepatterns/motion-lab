@@ -1,0 +1,557 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="author" content="teambytepatterns">
+<meta name="description" content="2,400 starlings follow three local rules at dusk, dodge a hawk and draw a letter in the sky.">
+<title>Murmuration — motion-lab</title>
+<style>
+  /* Player chrome. The piece itself lives entirely in the canvas. */
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  body { display: grid; place-items: center; font: 500 15px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #fff; }
+  canvas { display: block; width: min(100vw, calc(100vh * 16 / 9)); height: auto; aspect-ratio: 16 / 9; }
+  #sound { position: fixed; left: 16px; bottom: 16px; padding: 8px 14px; border: 1px solid rgba(255,255,255,.35); border-radius: 999px;
+           background: rgba(0,0,0,.55); color: #fff; font: inherit; cursor: pointer; }
+  #sound[hidden] { display: none; }
+</style>
+</head>
+<body>
+<canvas id="stage" width="1920" height="1080" aria-label="A flock of starlings at dusk forming shapes in the sky"></canvas>
+<button id="sound" type="button">Click for sound</button>
+<script>
+'use strict';
+/* ==========================================================================
+   PIECE — Murmuration.
+   A boids flock (separation, alignment, cohesion) drifting in a flow-field
+   wind. A hawk dives through it once; later one extra rule pulls every bird
+   toward a point on a letter "M", then lets go.
+
+   Determinism: the simulation is a fixed-step integrator seeded by mulberry32.
+   State after step f depends only on f. seek(i) restores the nearest cached
+   checkpoint (every 15 frames) and steps forward, so drawing frame i never
+   depends on what was drawn before — it only gets faster.
+   ========================================================================== */
+const W = 1920, H = 1080, FPS = 30, FRAMES = 720;          // 24 s
+const cv = document.getElementById('stage');
+const ctx = cv.getContext('2d');
+const FONT = 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
+
+// ---- helpers -------------------------------------------------------------
+function mulberry32(a) { return function () { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a);
+  t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const lerp = (a, b, t) => a + (b - a) * t;
+const prog = (f, a, b) => clamp((f - a) / (b - a));
+const smooth = t => t * t * (3 - 2 * t);
+const E = {
+  inCubic: t => t * t * t,
+  outCubic: t => 1 - Math.pow(1 - t, 3),
+  inOutCubic: t => t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2,
+  outExpo: t => t === 1 ? 1 : 1 - Math.pow(2, -10 * t),
+  inExpo: t => t === 0 ? 0 : Math.pow(2, 10 * t - 10),
+  inOutExpo: t => t === 0 ? 0 : t === 1 ? 1 : t < .5 ? Math.pow(2, 20 * t - 10) / 2 : (2 - Math.pow(2, -20 * t + 10)) / 2,
+  outBack: t => 1 + 2.70158 * Math.pow(t - 1, 3) + 1.70158 * Math.pow(t - 1, 2),
+};
+
+// ---- palette: dusk violet, coral, amber + near-black ink, warm white -------
+const C = {
+  ink: '#140c1a', paper: '#FFF4E8', amber: '#FFC98F',
+  sky: [[0, '#241a4a'], [0.30, '#5a3478'], [0.58, '#c65f7e'], [0.80, '#f59a78'], [0.86, '#ffc488']],
+};
+
+// ---- timeline (frames) ---------------------------------------------------
+const T = {
+  hawkIn: 282, hawkOut: 390,            // one predator pass
+  form0: 432, form1: 486, hold: 600, release: 628,   // the letter
+  leave: 606,                           // flock streams off to the upper right
+};
+
+// ---- flock state -----------------------------------------------------------
+const N = 2400, CK = 15;
+const PX = new Float64Array(N), PY = new Float64Array(N), VX = new Float64Array(N), VY = new Float64Array(N);
+const NVX = new Float64Array(N), NVY = new Float64Array(N);
+const SC = new Float32Array(N), PH = new Float32Array(N);          // depth scale, wing phase (static)
+const TX = new Float32Array(N), TY = new Float32Array(N), TP = new Float32Array(N); // letter targets
+let targetsReady = false;
+const ckpt = [];                                                    // ckpt[k] = state after k*CK steps
+const spread = new Float32Array(FRAMES), speedM = new Float32Array(FRAMES), cenX = new Float32Array(FRAMES);
+const cenY = new Float32Array(FRAMES);
+const hawkX = new Float32Array(FRAMES).fill(NaN), hawkY = new Float32Array(FRAMES).fill(NaN);
+let simF = -1;                                                      // frame currently held in PX..VY
+let maxF = -1;                                                      // furthest frame ever simulated
+
+function initFlock() {
+  const r = mulberry32(0x5EED06);
+  for (let i = 0; i < N; i++) {
+    const a = r() * Math.PI * 2, d = Math.sqrt(r());
+    const rx = 300 * d, ry = 150 * d;
+    PX[i] = 1040 + Math.cos(a) * rx; PY[i] = 470 + Math.sin(a) * ry;
+    const sp = 4.2 + r() * 1.4;                                     // swirling ball: tangential velocity
+    VX[i] = -Math.sin(a) * sp + (r() - .5) * .6; VY[i] = Math.cos(a) * sp * .55 + (r() - .5) * .6;
+    SC[i] = 0.55 + 0.85 * Math.pow(r(), 1.6);
+    PH[i] = r() * Math.PI * 2;
+  }
+  simF = 0;
+}
+
+// Letter "M" as a stroked polyline, sampled with jitter across the stroke.
+function buildTargets() {
+  const r = mulberry32(0xA11CE);
+  const cx = 960, cy = 440, w = 470, h = 260;
+  const pts = [[-w, h], [-w, -h], [0, 90], [w, -h], [w, h]];
+  const segs = []; let total = 0;
+  for (let k = 0; k < pts.length - 1; k++) {
+    const [ax, ay] = pts[k], [bx, by] = pts[k + 1], L = Math.hypot(bx - ax, by - ay);
+    segs.push({ ax, ay, bx, by, L, s0: total }); total += L;
+  }
+  const tx = new Float32Array(N), ty = new Float32Array(N);
+  for (let i = 0; i < N; i++) {
+    let s = (i + r() * 0.9) / N * total, sg = segs[0];
+    for (const g of segs) if (s >= g.s0) sg = g;
+    const u = (s - sg.s0) / sg.L, nx = -(sg.by - sg.ay) / sg.L, ny = (sg.bx - sg.ax) / sg.L;
+    const off = (r() + r() + r() - 1.5) * 26;
+    tx[i] = cx + sg.ax + (sg.bx - sg.ax) * u + nx * off;
+    ty[i] = cy + sg.ay + (sg.by - sg.ay) * u + ny * off;
+  }
+  // assign by x-order so birds do not all cross each other on the way in
+  const bi = Array.from({ length: N }, (_, i) => i).sort((a, b) => PX[a] - PX[b] || a - b);
+  const ti = Array.from({ length: N }, (_, i) => i).sort((a, b) => tx[a] - tx[b] || a - b);
+  for (let k = 0; k < N; k++) { TX[bi[k]] = tx[ti[k]]; TY[bi[k]] = ty[ti[k]]; TP[bi[k]] = r() * Math.PI * 2; }
+  targetsReady = true;
+}
+
+// uniform grid for neighbour queries
+const CELL = 36, GOX = -400, GOY = -400, GW = Math.ceil((W + 800) / CELL), GH = Math.ceil((H + 800) / CELL);
+const RING = [0, 0, 1, 0, -1, 0, 0, 1, 0, -1, 1, 1, -1, -1, 1, -1, -1, 1];
+const cellStart = new Int32Array(GW * GH + 1), cellOf = new Int32Array(N), order = new Int32Array(N), cursor = new Int32Array(GW * GH);
+function buildGrid() {
+  cellStart.fill(0);
+  for (let i = 0; i < N; i++) {
+    const gx = clamp(((PX[i] - GOX) / CELL) | 0, 0, GW - 1), gy = clamp(((PY[i] - GOY) / CELL) | 0, 0, GH - 1);
+    const c = gy * GW + gx; cellOf[i] = c; cellStart[c + 1]++;
+  }
+  for (let c = 0; c < GW * GH; c++) cellStart[c + 1] += cellStart[c];
+  cursor.set(cellStart.subarray(0, GW * GH));
+  for (let i = 0; i < N; i++) order[cursor[cellOf[i]]++] = i;
+}
+
+function attractor(s) {
+  return [980 + 520 * Math.sin(s * 0.36 + 0.4), 430 + 150 * Math.sin(s * 0.57 + 1.3)];
+}
+const formWeight = f => f < T.form0 ? 0 : f < T.form1 ? smooth(prog(f, T.form0, T.form1)) : f < T.hold ? 1 : 1 - smooth(prog(f, T.hold, T.release));
+function hawkAt(f) {                                       // quadratic path through the flock's centre at frame f
+  if (f < T.hawkIn || f > T.hawkOut) return null;
+  const t = prog(f, T.hawkIn, T.hawkOut);
+  const u = t + 0.8 * Math.sin(2 * Math.PI * t) / (2 * Math.PI);  // fast dive, slow through the flock, fast exit
+  const cx = cenX[f], cy = cenY[f];
+  const p0 = [cx - 1250, cy - 520], p2 = [cx + 1250, cy - 420];
+  const c1 = [2 * cx - (p0[0] + p2[0]) / 2, 2 * (cy + 40) - (p0[1] + p2[1]) / 2];
+  const a = (1 - u) * (1 - u), b = 2 * u * (1 - u), c = u * u;
+  return [a * p0[0] + b * c1[0] + c * p2[0], a * p0[1] + b * c1[1] + c * p2[1]];
+}
+
+function record(f) {                                       // per-frame metrics (used by the soundtrack)
+  let sx = 0, sy = 0, sv = 0;
+  for (let i = 0; i < N; i++) { sx += PX[i]; sy += PY[i]; sv += Math.sqrt(VX[i] * VX[i] + VY[i] * VY[i]); }
+  sx /= N; sy /= N;
+  let d2 = 0; for (let i = 0; i < N; i++) { const dx = PX[i] - sx, dy = PY[i] - sy; d2 += dx * dx + dy * dy; }
+  spread[f] = Math.sqrt(d2 / N); speedM[f] = sv / N; cenX[f] = sx; cenY[f] = sy;
+  const h = hawkAt(f); if (h) { hawkX[f] = h[0]; hawkY[f] = h[1]; }
+}
+
+function step(f) {                                          // state(f) -> state(f+1)
+  const s = f / FPS;
+  buildGrid();
+  const R2 = 40 * 40, S2 = 13 * 13, K = 12;
+  const [ax0, ay0] = attractor(s);
+  const hk = hawkX[f] === hawkX[f] ? [hawkX[f], hawkY[f]] : null;
+  const wf = formWeight(f);
+  const leaving = E.inOutCubic(prog(f, T.leave, T.leave + 70));
+  const social = 1 - 0.9 * wf;
+  for (let i = 0; i < N; i++) {
+    const x = PX[i], y = PY[i], vx = VX[i], vy = VY[i];
+    const gx = cellOf[i] % GW, gy = (cellOf[i] / GW) | 0;
+    // own cell first, then the ring; a bird only looks at ~70 candidates (it sees its
+    // near neighbours, not the whole crowd), which also keeps dense frames cheap
+    let n = 0, avx = 0, avy = 0, cx = 0, cy = 0, sx = 0, sy = 0, seen = 0;
+    for (let r9 = 0; r9 < 9 && seen < 70; r9++) {
+      const xx = gx + RING[r9 * 2], yy = gy + RING[r9 * 2 + 1];
+      if (yy < 0 || yy >= GH || xx < 0 || xx >= GW) continue;
+      const c = yy * GW + xx;
+      for (let k = cellStart[c], e = cellStart[c + 1]; k < e && seen < 70; k++) {
+        const j = order[k]; if (j === i) continue;
+        seen++;
+        const dx = PX[j] - x, dy = PY[j] - y, d2 = dx * dx + dy * dy;
+        if (d2 > R2) continue;
+        if (n < K) { avx += VX[j]; avy += VY[j]; cx += dx; cy += dy; n++; }
+        if (d2 < S2 && d2 > 1e-4) { sx -= dx / d2; sy -= dy / d2; }
+      }
+    }
+    let fx = 0, fy = 0;
+    if (n > 0) {
+      fx += (avx / n - vx) * 0.11 * social + (cx / n) * 0.0016 * social;
+      fy += (avy / n - vy) * 0.11 * social + (cy / n) * 0.0016 * social;
+    }
+    fx += sx * 1.5; fy += sy * 1.5;
+    // flow-field wind
+    const th = 2.3 * Math.sin(x * 0.0036 + s * 0.41) + 1.8 * Math.cos(y * 0.0052 - s * 0.29) + 0.9 * Math.sin((x + y) * 0.0019 + s * 0.19);
+    const wind = (0.075 + 0.045 * Math.sin(s * 0.9)) * social;
+    fx += Math.cos(th) * wind; fy += Math.sin(th) * wind * 0.7;
+    // loose pull toward a roaming point, later toward the sun
+    const tx = lerp(ax0, 2500, leaving), ty = lerp(ay0, -260, leaving);
+    fx += clamp((tx - x) * 0.0005 * social, -0.3, 0.3) + leaving * 0.12;
+    fy += clamp((ty - y) * 0.0005 * social, -0.3, 0.3) - leaving * 0.06;
+    // soft walls (only before the flock leaves)
+    const wall = 1 - leaving;
+    if (x < 180) fx += (180 - x) * 0.004 * wall; else if (x > 1740) fx -= (x - 1740) * 0.004 * wall;
+    if (y < 150) fy += (150 - y) * 0.005 * wall; else if (y > 740) fy -= (y - 740) * 0.006;
+    // predator: flee
+    if (hk) {
+      const dx = x - hk[0], dy = y - hk[1], d = Math.sqrt(dx * dx + dy * dy);
+      if (d < 300 && d > 1e-3) { const k = (1 - d / 300); fx += dx / d * k * k * 2.4; fy += dy / d * k * k * 2.4; }
+    }
+    // the letter: steer to a target that circles a tiny orbit
+    if (wf > 0) {
+      const o = f * 0.21 + TP[i];
+      const gx2 = TX[i] + Math.cos(o) * 6, gy2 = TY[i] + Math.sin(o) * 6;
+      let dvx = (gx2 - x) * 0.11, dvy = (gy2 - y) * 0.11; const m = Math.sqrt(dvx * dvx + dvy * dvy);
+      if (m > 24) { dvx *= 24 / m; dvy *= 24 / m; }
+      fx += (dvx - vx) * 0.2 * wf; fy += (dvy - vy) * 0.2 * wf;
+    }
+    let nvx = vx + fx, nvy = vy + fy;
+    const sp = Math.sqrt(nvx * nvx + nvy * nvy), vmax = 7.4 + 17 * wf * (1 - prog(f, T.form1, T.form1 + 30)) + leaving * 5, vmin = 3.6 * (1 - wf);
+    if (sp > vmax) { nvx *= vmax / sp; nvy *= vmax / sp; }
+    else if (sp < vmin && sp > 1e-6) { nvx *= vmin / sp; nvy *= vmin / sp; }
+    NVX[i] = nvx; NVY[i] = nvy;
+  }
+  for (let i = 0; i < N; i++) { VX[i] = NVX[i]; VY[i] = NVY[i]; PX[i] += VX[i]; PY[i] += VY[i]; }
+  if (f + 1 === T.form0 && !targetsReady) buildTargets();
+}
+
+function saveCk(k) { const a = new Float64Array(4 * N); a.set(PX, 0); a.set(PY, N); a.set(VX, 2 * N); a.set(VY, 3 * N); ckpt[k] = a; }
+function loadCk(k) { const a = ckpt[k]; PX.set(a.subarray(0, N)); PY.set(a.subarray(N, 2 * N)); VX.set(a.subarray(2 * N, 3 * N)); VY.set(a.subarray(3 * N)); simF = k * CK; }
+
+function simTo(f) {
+  if (simF < 0) { initFlock(); saveCk(0); record(0); maxF = 0; }
+  if (targetsReady === false && T.form0 <= f && maxF < T.form0) { /* built during stepping */ }
+  if (f < simF || f - simF > CK) {                        // jump: restore the best checkpoint
+    const k = Math.min(Math.floor(f / CK), Math.floor(maxF / CK));
+    if (!(simF <= f && simF >= k * CK)) loadCk(k);
+  }
+  while (simF < f) {
+    step(simF); simF++;
+    if (simF > maxF) { maxF = simF; record(simF); if (simF % CK === 0) saveCk(simF / CK); }
+  }
+}
+
+// ---- static layers ---------------------------------------------------------
+const land = document.createElement('canvas'); land.width = W; land.height = H;
+(function drawLand() {
+  const g = land.getContext('2d'), r = mulberry32(0x1A2D);
+  const ridge = (base, amp, freq, seed) => { const pts = []; const q = mulberry32(seed); const ph = [q() * 9, q() * 9, q() * 9];
+    for (let x = -10; x <= W + 10; x += 6) pts.push([x, base - amp * (0.55 * Math.sin(x * freq + ph[0]) + 0.3 * Math.sin(x * freq * 2.3 + ph[1]) + 0.15 * Math.sin(x * freq * 5.1 + ph[2]))]);
+    return pts; };
+  const fillRidge = (pts, col) => { g.beginPath(); g.moveTo(-10, H); for (const [x, y] of pts) g.lineTo(x, y); g.lineTo(W + 10, H); g.closePath(); g.fillStyle = col; g.fill(); };
+  fillRidge(ridge(868, 26, 0.0021, 7), 'rgba(92,44,86,0.55)');
+  fillRidge(ridge(900, 22, 0.0033, 11), '#3a1d3f');
+  // tree line: many small crowns on the near ridge
+  const near = ridge(935, 14, 0.0047, 23);
+  fillRidge(near, '#170d1d');
+  g.fillStyle = '#170d1d';
+  for (let x = -20; x < W + 20; x += 7 + r() * 12) {
+    const base = 935 - 14 * (0.55 * Math.sin(x * 0.0047) ), hgt = 18 + r() * 46 * (0.4 + 0.6 * Math.abs(Math.sin(x * 0.004)));
+    g.beginPath(); g.ellipse(x, base - hgt * 0.5, 7 + r() * 11, hgt * 0.62, 0, 0, Math.PI * 2); g.fill();
+  }
+  g.fillRect(0, 940, W, H - 940);
+})();
+
+// ---- picture -------------------------------------------------------------
+function sky(f) {
+  const p = f / (FRAMES - 1);
+  const g = ctx.createLinearGradient(0, 0, 0, 900);
+  for (const [o, c] of C.sky) g.addColorStop(o, c);
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  // the sun sinks a little over the piece
+  const sx = 1420, sy = 846 + p * 50;
+  const glow = ctx.createRadialGradient(sx, sy, 20, sx, sy, 760);
+  glow.addColorStop(0, 'rgba(255,226,170,0.95)'); glow.addColorStop(0.08, 'rgba(255,196,130,0.55)');
+  glow.addColorStop(0.35, 'rgba(255,150,120,0.18)'); glow.addColorStop(1, 'rgba(255,150,120,0)');
+  ctx.fillStyle = glow; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = 'rgba(255,238,205,0.95)'; ctx.beginPath(); ctx.arc(sx, sy, 46, 0, Math.PI * 2); ctx.fill();
+  // thin cloud streaks, drifting
+  const r = mulberry32(0xC10D);
+  for (let k = 0; k < 9; k++) {
+    const y = 560 + r() * 250, len = 300 + r() * 700, x = ((r() * (W + len) + f * (0.25 + r() * 0.35)) % (W + len)) - len;
+    const cg = ctx.createLinearGradient(x, 0, x + len, 0);
+    const a = 0.10 + r() * 0.12;
+    cg.addColorStop(0, 'rgba(255,190,160,0)'); cg.addColorStop(0.5, `rgba(255,200,170,${a})`); cg.addColorStop(1, 'rgba(255,190,160,0)');
+    ctx.fillStyle = cg; ctx.fillRect(x, y, len, 3 + r() * 5);
+  }
+  // dusk deepens toward the end
+  ctx.fillStyle = `rgba(20,10,40,${0.22 * E.inOutCubic(prog(f, 560, 719))})`; ctx.fillRect(0, 0, W, H);
+}
+
+function birds(f) {
+  const flap = f * 0.9;
+  const buckets = [[0.55, 0.85, 'rgba(46,26,56,0.78)', 1.3], [0.85, 1.1, 'rgba(28,16,36,0.9)', 1.8], [1.1, 9, C.ink, 2.4]];
+  ctx.lineCap = 'round';
+  for (const [lo, hi, col, lw] of buckets) {
+    ctx.beginPath();
+    for (let i = 0; i < N; i++) {
+      const s = SC[i]; if (s < lo || s >= hi) continue;
+      const x = PX[i], y = PY[i]; if (x < -40 || x > W + 40 || y < -40 || y > H + 40) continue;
+      const vx = VX[i], vy = VY[i], sp = Math.hypot(vx, vy) + 1e-6, ux = vx / sp, uy = vy / sp;
+      const L = (2.2 + sp * 0.55) * s;
+      const wing = (1.6 + 1.4 * Math.sin(flap + PH[i])) * s;      // tiny wing flick perpendicular to heading
+      ctx.moveTo(x + ux * L * 0.5, y + uy * L * 0.5); ctx.lineTo(x - ux * L * 0.5, y - uy * L * 0.5);
+      const bx = x - ux * L * 0.35, by = y - uy * L * 0.35;          // wings: a small chevron
+      ctx.moveTo(bx - uy * wing, by + ux * wing); ctx.lineTo(x + ux * L * 0.1, y + uy * L * 0.1); ctx.lineTo(bx + uy * wing, by - ux * wing);
+    }
+    ctx.strokeStyle = col; ctx.lineWidth = lw; ctx.stroke();
+  }
+}
+
+function hawk(f) {
+  if (!(hawkX[f] === hawkX[f])) return;                   // NaN check
+  const x = hawkX[f], y = hawkY[f];
+  const px = f > 0 && hawkX[f - 1] === hawkX[f - 1] ? hawkX[f - 1] : x - 1, py = f > 0 && hawkY[f - 1] === hawkY[f - 1] ? hawkY[f - 1] : y;
+  const a = Math.atan2(y - py, x - px), beat = Math.sin(f * 0.55);
+  ctx.save(); ctx.translate(x, y); ctx.rotate(a);
+  ctx.fillStyle = C.ink;
+  ctx.beginPath();
+  ctx.moveTo(26, 0); ctx.quadraticCurveTo(8, -6, -4, -6);
+  ctx.quadraticCurveTo(-4, -30 - 16 * beat, -20, -46 - 18 * beat); ctx.quadraticCurveTo(-10, -20, -18, -5);
+  ctx.lineTo(-38, -9); ctx.lineTo(-34, 0); ctx.lineTo(-38, 9); ctx.lineTo(-18, 5);
+  ctx.quadraticCurveTo(-10, 20, -20, 46 + 18 * beat); ctx.quadraticCurveTo(-4, 30 + 16 * beat, -4, 6);
+  ctx.quadraticCurveTo(8, 6, 26, 0); ctx.closePath(); ctx.fill();
+  ctx.restore();
+}
+
+function text(str, x, y, size, weight, color, alpha, spacing = 0, align = 'left') {
+  if (alpha <= 0.002) return;
+  ctx.globalAlpha = alpha; ctx.fillStyle = color; ctx.textAlign = align; ctx.textBaseline = 'alphabetic';
+  ctx.font = `${weight} ${size}px ${FONT}`; ctx.letterSpacing = spacing + 'px';
+  ctx.fillText(str, x, y);
+  ctx.globalAlpha = 1; ctx.letterSpacing = '0px';
+}
+// fade envelope with a small rise; returns [alpha, dy]
+function env(f, a, b, fin = 14, fout = 12) {
+  const i = E.outCubic(prog(f, a, a + fin)), o = 1 - E.inCubic(prog(f, b - fout, b));
+  return [Math.min(i, o), (1 - i) * 26 - (1 - o) * 10];
+}
+
+function captions(f) {
+  // hook: title slams in within the first half second
+  {
+    const k = E.outExpo(prog(f, -4, 14)), o = 1 - E.inCubic(prog(f, 96, 112));
+    ctx.save(); ctx.translate(96, 238); ctx.scale(lerp(1.08, 1, k), lerp(1.08, 1, k));
+    text('MURMURATION', 0, 0, 150, 800, C.paper, Math.min(k, o), 10);
+    ctx.restore();
+    const [a2, d2] = env(f, 10, 112, 16, 16);
+    text('2,400 birds · three local rules · no leader', 100, 312 + d2, 44, 500, C.amber, a2, 0.5);
+  }
+  // bottom band sits on the dark tree line
+  const rows = [
+    [128, 176, 'SEPARATION', 'steer away from crowding'],
+    [176, 224, 'ALIGNMENT', 'match your neighbours’ heading'],
+    [224, 272, 'COHESION', 'drift toward their centre'],
+    [300, 388, 'ONE HAWK', 'the panic ripples through the flock'],
+    [452, 580, 'ONE MORE RULE', 'pull each bird toward a point'],
+  ];
+  for (const [a, b, big, small] of rows) {
+    const [al, dy] = env(f, a, b, 10, 10);
+    if (al <= 0) continue;
+    ctx.font = `800 64px ${FONT}`; ctx.letterSpacing = '4px';
+    const w = ctx.measureText(big).width; ctx.letterSpacing = '0px';
+    text(big, 96, 1004 + dy, 64, 800, C.paper, al, 4);
+    text(small, 96 + w + 34, 1004 + dy, 38, 500, C.amber, al * 0.95, 0.3);
+  }
+  // end card
+  {
+    const k = E.outCubic(prog(f, 636, 664));
+    if (k > 0) {
+      text('MURMURATION', W / 2, 478 + (1 - k) * 30, 132, 800, C.paper, k, 12, 'center');
+      const k2 = E.outCubic(prog(f, 650, 678));
+      text('separation · alignment · cohesion', W / 2, 556 + (1 - k2) * 20, 42, 500, C.amber, k2, 1, 'center');
+      const k3 = E.outCubic(prog(f, 668, 692));
+      text('bytepatterns · motion lab', W / 2, 1000, 32, 600, C.paper, k3 * 0.8, 3, 'center');
+    }
+  }
+}
+
+function vignette() {
+  const g = ctx.createRadialGradient(W / 2, H * 0.45, H * 0.35, W / 2, H * 0.45, H * 1.05);
+  g.addColorStop(0, 'rgba(10,4,20,0)'); g.addColorStop(1, 'rgba(10,4,20,0.5)');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+}
+
+function draw(f) {
+  simTo(f);
+  if (ctx.reset) ctx.reset();                              // every frame starts from a clean context state
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; ctx.filter = 'none'; ctx.shadowBlur = 0;
+  sky(f);
+  birds(f);
+  hawk(f);
+  ctx.drawImage(land, 0, 0);
+  vignette();
+  captions(f);
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.letterSpacing = '0px';
+}
+
+// ---- sound: wind + a pad that swells with the flock's density --------------
+async function renderAudio() {
+  simTo(FRAMES - 1);                                      // metrics for every frame
+  const SR = 48000, dur = FRAMES / FPS, LEN = Math.round(SR * dur);
+  const ac = new OfflineAudioContext(2, LEN, SR);
+  const comp = ac.createDynamicsCompressor();
+  comp.threshold.value = -14; comp.ratio.value = 3; comp.attack.value = 0.02; comp.release.value = 0.3;
+  const master = ac.createGain(); master.gain.value = 1.15;
+  master.connect(comp).connect(ac.destination);
+  master.gain.setValueAtTime(1.15, dur - 0.7); master.gain.linearRampToValueAtTime(0.0001, dur - 0.02);
+
+  // per-frame control curves derived from the simulation
+  const dens = new Float32Array(FRAMES), gust = new Float32Array(FRAMES), pan = new Float32Array(FRAMES);
+  for (let f = 0; f < FRAMES; f++) {
+    dens[f] = Math.max(clamp((330 - spread[f]) / 250), 0.85 * formWeight(f));   // the letter is the climax
+    gust[f] = clamp((speedM[f] - 3) / 5);
+    pan[f] = clamp((cenX[f] - W / 2) / (W / 2) * 0.7, -0.7, 0.7);
+  }
+  const curve = (arr, fn) => { const c = new Float32Array(arr.length); for (let k = 0; k < arr.length; k++) c[k] = fn(arr[k], k); return c; };
+
+  // seeded pink noise (stereo)
+  const rnd = mulberry32(0x0A11D06);
+  const noise = ac.createBuffer(2, LEN, SR);
+  for (let ch = 0; ch < 2; ch++) {
+    const d = noise.getChannelData(ch); let b0 = 0, b1 = 0, b2 = 0;
+    for (let k = 0; k < LEN; k++) { const w = rnd() * 2 - 1;
+      b0 = 0.99765 * b0 + w * 0.0990460; b1 = 0.96300 * b1 + w * 0.2965164; b2 = 0.57000 * b2 + w * 1.0526913;
+      d[k] = (b0 + b1 + b2 + w * 0.1848) * 0.18; }
+  }
+  // reverb impulse from the same PRNG
+  const ir = ac.createBuffer(2, SR * 3, SR);
+  for (let ch = 0; ch < 2; ch++) { const d = ir.getChannelData(ch); for (let k = 0; k < d.length; k++) d[k] = (rnd() * 2 - 1) * Math.pow(1 - k / d.length, 3.2); }
+  const verb = ac.createConvolver(); verb.buffer = ir; const verbOut = ac.createGain(); verbOut.gain.value = 0.35;
+  verb.connect(verbOut).connect(master);
+
+  // wind: two band-passed noise layers following speed, panned with the flock
+  for (const [lo, hi, g0, g1, q] of [[220, 900, 0.30, 0.75, 0.8], [1400, 3800, 0.05, 0.16, 1.2]]) {
+    const src = ac.createBufferSource(); src.buffer = noise;
+    const bp = ac.createBiquadFilter(); bp.type = 'bandpass'; bp.Q.value = q;
+    bp.frequency.setValueCurveAtTime(curve(gust, (g, k) => lo + (hi - lo) * g * (0.8 + 0.2 * Math.sin(k * 0.07))), 0, dur);
+    const g = ac.createGain(); g.gain.setValueCurveAtTime(curve(gust, (v, k) => g0 + (g1 - g0) * v * (0.75 + 0.25 * Math.sin(k * 0.043 + 1))), 0, dur);
+    const p = ac.createStereoPanner(); p.pan.setValueCurveAtTime(curve(pan, v => v), 0, dur);
+    src.connect(bp).connect(g).connect(p).connect(master); src.start(0);
+  }
+
+  // pad: detuned saws through a low-pass that opens with density
+  const padBus = ac.createGain();
+  padBus.gain.setValueCurveAtTime(curve(dens, d => 0.08 + 0.2 * d), 0, dur);
+  const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.Q.value = 0.9;
+  lp.frequency.setValueCurveAtTime(curve(dens, d => 380 + 2200 * d * d), 0, dur);
+  padBus.connect(lp); lp.connect(master); lp.connect(verb);
+  const hz = m => 440 * Math.pow(2, (m - 69) / 12);
+  const chords = [                                        // [startFrame, endFrame, midi notes]
+    [0, 150, [50, 57, 61, 64, 66]],        // Dmaj9
+    [140, 290, [47, 54, 57, 62, 66]],      // Bm7
+    [280, 450, [43, 50, 54, 61, 64]],      // Gmaj7#11 — the hawk
+    [440, 630, [45, 52, 57, 61, 64, 69]],  // A — the letter
+    [620, 720, [50, 57, 62, 66, 69, 76]],  // D — home
+  ];
+  for (const [fa, fb, notes] of chords) {
+    const a = fa / FPS, b = Math.min(dur, fb / FPS);
+    for (const m of notes) for (const det of [-7, 6]) {
+      const o = ac.createOscillator(); o.type = 'sawtooth'; o.frequency.value = hz(m); o.detune.value = det;
+      const g = ac.createGain(); g.gain.setValueAtTime(0, a);
+      g.gain.linearRampToValueAtTime(0.13, a + (fa === 0 ? 0.05 : 1.4)); g.gain.setValueAtTime(0.13, Math.max(a + 1.4, b - 1.2));
+      g.gain.linearRampToValueAtTime(0, b);
+      o.connect(g).connect(padBus); o.start(a); o.stop(b + 0.05);
+    }
+  }
+
+  // hook: a soft low hit and a gust on frame 0
+  const hit = (at, f0, f1, amp, len) => { const o = ac.createOscillator(), g = ac.createGain();
+    o.frequency.setValueAtTime(f0, at); o.frequency.exponentialRampToValueAtTime(f1, at + len * 0.7);
+    g.gain.setValueAtTime(0.0001, at); g.gain.exponentialRampToValueAtTime(amp, at + 0.012); g.gain.exponentialRampToValueAtTime(0.0001, at + len);
+    o.connect(g).connect(master); g.connect(verb); o.start(at); o.stop(at + len + 0.05); };
+  hit(0.0, 95, 42, 0.55, 1.4);
+  const whoosh = (at, len, f0, f1, amp, panFn) => { const s = ac.createBufferSource(); s.buffer = noise;
+    const bp = ac.createBiquadFilter(); bp.type = 'bandpass'; bp.Q.value = 2.2;
+    bp.frequency.setValueAtTime(f0, at); bp.frequency.exponentialRampToValueAtTime(f1, at + len * 0.55); bp.frequency.exponentialRampToValueAtTime(f0 * 1.2, at + len);
+    const g = ac.createGain(); g.gain.setValueAtTime(0.0001, at); g.gain.exponentialRampToValueAtTime(amp, at + len * 0.5); g.gain.exponentialRampToValueAtTime(0.0001, at + len);
+    const p = ac.createStereoPanner(); if (panFn) panFn(p.pan); s.connect(bp).connect(g).connect(p).connect(master); p.connect(verb);
+    s.start(at, (at * 7.3) % 10); s.stop(at + len + 0.05); };
+  whoosh(0, 1.3, 300, 1800, 0.9, null);
+
+  // the hawk: a low boom and a whoosh that follows its path across the stereo field
+  const ha = T.hawkIn / FPS, hlen = (T.hawkOut - T.hawkIn) / FPS;
+  hit(ha + hlen * 0.42, 70, 34, 0.45, 2.2);
+  const hpan = new Float32Array(T.hawkOut - T.hawkIn);
+  for (let k = 0; k < hpan.length; k++) { const x = hawkX[T.hawkIn + k]; hpan[k] = x === x ? clamp((x - W / 2) / (W / 2), -1, 1) : 0; }
+  whoosh(ha, hlen, 250, 2600, 0.9, pp => pp.setValueCurveAtTime(hpan, ha, hlen));
+
+  // the letter locks in: a rising run of bell tones
+  const bell = (at, m, amp, p) => { for (const [ratio, a2, dec] of [[1, 1, 2.6], [2.76, 0.35, 1.1], [5.4, 0.12, 0.5]]) {
+      const o = ac.createOscillator(); o.frequency.value = hz(m) * ratio; const g = ac.createGain();
+      g.gain.setValueAtTime(0.0001, at); g.gain.exponentialRampToValueAtTime(amp * a2, at + 0.006); g.gain.exponentialRampToValueAtTime(0.0001, at + dec);
+      const sp = ac.createStereoPanner(); sp.pan.value = p; o.connect(g).connect(sp).connect(master); sp.connect(verb); o.start(at); o.stop(at + dec + 0.05); } };
+  [69, 73, 76, 81, 85].forEach((m, k) => bell((T.form1 - 30 + k * 9) / FPS, m, 0.11, -0.6 + k * 0.3));
+  bell(T.hold / FPS, 81, 0.08, 0.4); bell((T.hold + 6) / FPS, 76, 0.07, -0.4);
+  // end card chime
+  [74, 78, 81, 86].forEach((m, k) => bell((640 + k * 7) / FPS, m, 0.09, -0.45 + k * 0.3));
+
+  const buf = await ac.startRendering();
+  let peak = 0; for (let ch = 0; ch < 2; ch++) { const d = buf.getChannelData(ch); for (let k = 0; k < d.length; k++) { const v = Math.abs(d[k]); if (v > peak) peak = v; } }
+  if (peak > 0.89) { const g = 0.89 / peak; for (let ch = 0; ch < 2; ch++) { const d = buf.getChannelData(ch); for (let k = 0; k < d.length; k++) d[k] *= g; } }
+  return buf;
+}
+
+window.__motion = {
+  title: 'Murmuration',
+  description: '2,400 starlings follow three local rules at dusk, dodge a hawk and draw a letter in the sky.',
+  fps: FPS, width: W, height: H, frames: FRAMES,
+  poster: 545,
+  gifStart: 14,
+  seek(i) { draw(Math.max(0, Math.min(FRAMES - 1, Math.floor(i)))); },
+  audio: renderAudio,
+};
+
+/* ==========================================================================
+   PLAYER — identical in every piece; keep as is.
+   Autoplays and loops, starts sound on the first click, ?frame=N pauses on a
+   frame. When the renderer sets window.__MOTION_RENDER__ it stays out of the way.
+   ========================================================================== */
+(function player() {
+  const M = window.__motion, btn = document.getElementById('sound');
+  const dur = M.frames / M.fps;
+  if (window.__MOTION_RENDER__) { btn.hidden = true; M.seek(0); return; }
+  const q = new URLSearchParams(location.search);
+  if (q.has('frame')) { btn.hidden = true; M.seek(+q.get('frame') || 0); return; }
+  let t0 = performance.now(), ac = null, src = null, buf = null, paused = false, pausedAt = 0;
+  const clock = () => ac && src ? (ac.currentTime - t0) : (performance.now() - t0) / 1000;
+  function loop() {
+    if (!paused) M.seek(Math.floor(((clock() % dur) + dur) % dur * M.fps));
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+  btn.addEventListener('click', async () => {
+    if (src) { src.stop(); src = null; btn.textContent = 'Click for sound'; t0 = performance.now(); return; }
+    btn.textContent = 'Loading sound…';
+    ac = ac || new AudioContext({ sampleRate: 48000 });
+    buf = buf || await M.audio();
+    await ac.resume();
+    src = ac.createBufferSource(); src.buffer = buf; src.loop = true; src.connect(ac.destination);
+    t0 = ac.currentTime + 0.05; src.start(t0);        // picture restarts from frame 0 in sync with the sound
+    btn.textContent = 'Sound on — click to mute';
+  });
+  addEventListener('keydown', e => {
+    if (e.code !== 'Space') return;
+    e.preventDefault(); paused = !paused;
+    if (ac) paused ? ac.suspend() : ac.resume();
+    if (!ac) { if (paused) pausedAt = performance.now(); else t0 += performance.now() - pausedAt; }
+  });
+})();
+</script>
+</body>
+</html>

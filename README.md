@@ -46,38 +46,38 @@ Click a preview to open the piece live in your browser (click once more there fo
 <br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/05-double-pendulum/">open in browser</a> · <a href="out/05-double-pendulum.png">still</a> · <a href="projects/05-double-pendulum/index.html">source</a></sub>
 </td>
 <td width="50%" valign="top">
-<em>not rendered yet</em>
+<a href="https://bytepatterns.github.io/motion-lab/projects/06-murmuration/"><img src="out/06-murmuration.gif" width="100%" alt="Murmuration — animated preview"></a>
 <br><b>06 · Murmuration</b> <sub>24 s</sub>
 <br>2,400 starlings follow three local rules at dusk, dodge a hawk and draw a letter in the sky.
-<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/06-murmuration/">open in browser</a> · <a href="projects/06-murmuration/index.html">source</a></sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/06-murmuration/">open in browser</a> · <a href="out/06-murmuration.png">still</a> · <a href="projects/06-murmuration/index.html">source</a></sub>
 </td>
 </tr>
 <tr>
 <td width="50%" valign="top">
-<em>not rendered yet</em>
+<a href="https://bytepatterns.github.io/motion-lab/projects/07-raymarch-city/"><img src="out/07-raymarch-city.gif" width="100%" alt="Raymarch City — animated preview"></a>
 <br><b>07 · Raymarch City</b> <sub>20 s</sub>
 <br>A camera flight through a neon city that exists only as a distance function in one fragment shader.
-<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/07-raymarch-city/">open in browser</a> · <a href="projects/07-raymarch-city/index.html">source</a></sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/07-raymarch-city/">open in browser</a> · <a href="out/07-raymarch-city.png">still</a> · <a href="projects/07-raymarch-city/index.html">source</a></sub>
 </td>
 <td width="50%" valign="top">
-<em>not rendered yet</em>
+<a href="https://bytepatterns.github.io/motion-lab/projects/08-neon-breakout/"><img src="out/08-neon-breakout.gif" width="100%" alt="Neon Breakout — animated preview"></a>
 <br><b>08 · Neon Breakout</b> <sub>20 s</sub>
 <br>A neon Breakout level that plays itself: deterministic physics, multi-ball, a fire-ball and every brick cleared.
-<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/08-neon-breakout/">open in browser</a> · <a href="projects/08-neon-breakout/index.html">source</a></sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/08-neon-breakout/">open in browser</a> · <a href="out/08-neon-breakout.png">still</a> · <a href="projects/08-neon-breakout/index.html">source</a></sub>
 </td>
 </tr>
 <tr>
 <td width="50%" valign="top">
-<em>not rendered yet</em>
+<a href="https://bytepatterns.github.io/motion-lab/projects/09-sorting-race/"><img src="out/09-sorting-race.gif" width="100%" alt="Sorting Race — animated preview"></a>
 <br><b>09 · Sorting Race</b> <sub>28 s</sub>
 <br>Eight sorting algorithms sort the same 64 numbers side by side, paced by their real comparison counts.
-<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/09-sorting-race/">open in browser</a> · <a href="projects/09-sorting-race/index.html">source</a></sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/09-sorting-race/">open in browser</a> · <a href="out/09-sorting-race.png">still</a> · <a href="projects/09-sorting-race/index.html">source</a></sub>
 </td>
 <td width="50%" valign="top">
-<em>not rendered yet</em>
+<a href="https://bytepatterns.github.io/motion-lab/projects/10-title-sequence/"><img src="out/10-title-sequence.gif" width="100%" alt="Signal — animated preview"></a>
 <br><b>10 · Signal</b> <sub>20 s</sub>
 <br>A documentary title sequence: one trace, a pulse that keeps quickening, then silence and the title.
-<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/10-title-sequence/">open in browser</a> · <a href="projects/10-title-sequence/index.html">source</a></sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/10-title-sequence/">open in browser</a> · <a href="out/10-title-sequence.png">still</a> · <a href="projects/10-title-sequence/index.html">source</a></sub>
 </td>
 </tr>
 </table>
