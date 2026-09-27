@@ -112,6 +112,9 @@ The player is the only place a clock is allowed.
 - Camera moves use eased curves (cubic / expo / back), not linear ramps.
 - **No names of AI tools, models or companies anywhere in a piece.**
 - English text only in the pieces.
+- Full-frame film grain or per-frame noise over the whole canvas makes the
+  README GIF (<= 3 MB) blurry or impossible; keep texture subtle, static, or
+  local to an element.
 
 ## 6. Definition of done
 

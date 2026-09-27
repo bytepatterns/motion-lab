@@ -24,18 +24,21 @@ let start = Number(flags.start ?? meta.gifStart ?? 0) || 0;
 start = Math.max(0, Math.min(start, total - dur));
 
 const gif = outPath(`${slug}.gif`);
+// Grain and gradients are what make GIFs heavy: scale with area averaging and
+// denoise first, then trade dither, frame rate, palette and length for size.
 const tries = [
-  { fps: 15, colors: 256, dither: 'bayer:bayer_scale=4' },
-  { fps: 15, colors: 160, dither: 'bayer:bayer_scale=3' },
-  { fps: 12, colors: 160, dither: 'bayer:bayer_scale=3' },
-  { fps: 12, colors: 96, dither: 'bayer:bayer_scale=2' },
-  { fps: 10, colors: 96, dither: 'bayer:bayer_scale=2' },
-  { fps: 10, colors: 64, dither: 'bayer:bayer_scale=2', dur: 6 },
-  { fps: 8, colors: 48, dither: 'bayer:bayer_scale=2', dur: 6 },
+  { fps: 15, colors: 256, dither: 'bayer:bayer_scale=3' },
+  { fps: 12, colors: 256, dither: 'bayer:bayer_scale=2' },
+  { fps: 12, colors: 192, dither: 'none' },
+  { fps: 12, colors: 128, dither: 'none' },
+  { fps: 10, colors: 128, dither: 'none' },
+  { fps: 10, colors: 96, dither: 'none', dur: 6 },
+  { fps: 10, colors: 64, dither: 'none', dur: 6 },
+  { fps: 8, colors: 64, dither: 'none', dur: 6 },
 ];
 for (const t of tries) {
   const d = Math.min(dur, t.dur ?? dur);
-  const vf = `fps=${t.fps},scale=960:-1:flags=lanczos,split[a][b];` +
+  const vf = `fps=${t.fps},scale=960:-1:flags=area,hqdn3d=8:8:12:12,split[a][b];` +
     `[a]palettegen=max_colors=${t.colors}:stats_mode=diff[p];[b][p]paletteuse=dither=${t.dither}:diff_mode=rectangle`;
   const r = await run('ffmpeg', ['-y', '-loglevel', 'error', '-ss', String(start), '-t', String(d), '-i', mp4, '-an', '-filter_complex', vf, '-loop', '0', gif]);
   if (r.code !== 0) fail(`ffmpeg: ${r.stderr}`);
