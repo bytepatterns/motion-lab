@@ -1,0 +1,635 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="author" content="teambytepatterns">
+<meta name="description" content="A Gray-Scott reaction-diffusion simulation grows coral, splits it into spots and folds it into fingerprints by changing two numbers.">
+<title>Two Numbers — motion-lab</title>
+<style>
+  /* Player chrome. The piece itself lives entirely in the canvas. */
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  body { display: grid; place-items: center; font: 500 15px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #fff; }
+  canvas { display: block; width: min(100vw, calc(100vh * 16 / 9)); height: auto; aspect-ratio: 16 / 9; }
+  #sound { position: fixed; left: 16px; bottom: 16px; padding: 8px 14px; border: 1px solid rgba(255,255,255,.35); border-radius: 999px;
+           background: rgba(0,0,0,.55); color: #fff; font: inherit; cursor: pointer; }
+  #sound[hidden] { display: none; }
+</style>
+</head>
+<body>
+<canvas id="stage" width="1920" height="1080" aria-label="A reaction-diffusion pattern growing as coral, splitting into spots and folding into fingerprints"></canvas>
+<button id="sound" type="button">Click for sound</button>
+<script>
+'use strict';
+/* ==========================================================================
+   PIECE — Two Numbers.
+   The Gray-Scott model: two chemicals, u and v, spread out (diffusion) and
+   react (u + 2v -> 3v); u is fed in at rate F, v is removed at rate F + k.
+   The simulation runs on a 384 x 216 grid in Float32Arrays (20 steps per
+   frame, a torus, the usual 3x3 Laplacian); one WebGL2 fragment shader turns
+   v into a lit, glossy height field at full resolution. Over the piece only F
+   and k change: coral, then spots, then fingerprints.
+   Determinism: the state after frame f depends only on f. seek(i) restores
+   the nearest cached checkpoint (every 10 frames) and steps forward.
+   ========================================================================== */
+const W = 1920, H = 1080, FPS = 30, FRAMES = 720;          // 24 s
+const cv = document.getElementById('stage');
+const ctx = cv.getContext('2d');
+const FONT = 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
+const MONO = 'ui-monospace, "Cascadia Code", Consolas, Menlo, monospace';
+
+// ---- helpers -------------------------------------------------------------
+function mulberry32(a) { return function () { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a);
+  t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const lerp = (a, b, t) => a + (b - a) * t;
+const prog = (f, a, b) => clamp((f - a) / (b - a));
+const smooth = t => t * t * (3 - 2 * t);
+const E = {
+  inCubic: t => t * t * t,
+  outCubic: t => 1 - Math.pow(1 - t, 3),
+  inOutCubic: t => t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2,
+  outExpo: t => t === 1 ? 1 : 1 - Math.pow(2, -10 * t),
+  inExpo: t => t === 0 ? 0 : Math.pow(2, 10 * t - 10),
+  inOutExpo: t => t === 0 ? 0 : t === 1 ? 1 : t < .5 ? Math.pow(2, 20 * t - 10) / 2 : (2 - Math.pow(2, -20 * t + 10)) / 2,
+  outBack: t => 1 + 2.70158 * Math.pow(t - 1, 3) + 1.70158 * Math.pow(t - 1, 2),
+};
+function text(g, str, x, y, { size = 40, weight = 600, color = '#fff', alpha = 1, spacing = 0, align = 'left', fam = FONT, base = 'alphabetic' } = {}) {
+  if (alpha <= 0.002 || !str) return 0;
+  g.font = `${weight} ${size}px ${fam}`; g.letterSpacing = spacing + 'px';
+  g.textAlign = align; g.textBaseline = base;
+  const a0 = g.globalAlpha; g.globalAlpha = a0 * alpha; g.fillStyle = color;
+  g.fillText(str, x, y);
+  const w = g.measureText(str).width;
+  g.globalAlpha = a0; g.letterSpacing = '0px';
+  return w;
+}
+const env = (f, a, b, fin = 12, fout = 10) => {
+  const i = E.outCubic(prog(f, a, a + fin)), o = 1 - E.inCubic(prog(f, b - fout, b));
+  return [Math.min(i, o), (1 - i) * 24 - (1 - o) * 10];
+};
+
+// ---- palette -------------------------------------------------------------
+const C = { ink: '#070B12', inkRGB: '7,11,18', paper: '#F3EEE6', dim: 'rgba(243,238,230,0.66)', faint: 'rgba(243,238,230,0.34)',
+  coral: '#FF7A59', cyan: '#5CE1FF', amber: '#F5B83D' };
+
+// ---- the regimes: [from frame, to frame (fully there), F, k, name, colour] ----
+const REG = [
+  { at: 0, F: 0.0545, k: 0.0620, name: 'Coral', what: 'fronts grow and branch', color: C.coral },
+  { at: 250, to: 310, F: 0.0367, k: 0.0649, name: 'Spots', what: 'every stripe splits into dots', color: C.cyan },
+  { at: 450, to: 510, F: 0.0290, k: 0.0570, name: 'Fingerprints', what: 'the dots join into ridges', color: C.amber },
+];
+const T = { hook: 110, eq: 110, end: 640 };
+function params(f) {                                       // F, k and the palette position at frame f
+  let F = REG[0].F, k = REG[0].k, pal = 0;
+  for (let r = 1; r < REG.length; r++) {
+    const t = smooth(prog(f, REG[r].at, REG[r].to));
+    F = lerp(F, REG[r].F, t); k = lerp(k, REG[r].k, t); pal += t;
+  }
+  return { F, k, pal };
+}
+const regimeAt = f => f >= REG[2].at + 30 ? 2 : f >= REG[1].at + 30 ? 1 : 0;
+
+// ---- simulation ----------------------------------------------------------------
+const GW = 384, GH = 216, GN = GW * GH, IPF = 20, PREROLL = 1000, CK = 10;
+let U = new Float32Array(GN), V = new Float32Array(GN), U2 = new Float32Array(GN), V2 = new Float32Array(GN);
+const XM = new Int32Array(GW), XP = new Int32Array(GW);
+for (let x = 0; x < GW; x++) { XM[x] = (x + GW - 1) % GW; XP[x] = (x + 1) % GW; }
+const ckpt = [];
+let simF = -1, maxF = -1;
+const meanV = new Float32Array(FRAMES), edge = new Float32Array(FRAMES);   // for the soundtrack
+
+function step(F, k) {
+  const fk = F + k;
+  for (let y = 0; y < GH; y++) {
+    const ym = ((y + GH - 1) % GH) * GW, y0 = y * GW, yp = ((y + 1) % GH) * GW;
+    for (let x = 0; x < GW; x++) {
+      const xm = XM[x], xp = XP[x], i = y0 + x, u = U[i], v = V[i];
+      const lu = 0.2 * (U[y0 + xm] + U[y0 + xp] + U[ym + x] + U[yp + x]) + 0.05 * (U[ym + xm] + U[ym + xp] + U[yp + xm] + U[yp + xp]) - u;
+      const lv = 0.2 * (V[y0 + xm] + V[y0 + xp] + V[ym + x] + V[yp + x]) + 0.05 * (V[ym + xm] + V[ym + xp] + V[yp + xm] + V[yp + xp]) - v;
+      const uvv = u * v * v;
+      U2[i] = u + lu - uvv + F * (1 - u);
+      V2[i] = v + 0.5 * lv + uvv - fk * v;
+    }
+  }
+  let t = U; U = U2; U2 = t; t = V; V = V2; V2 = t;
+}
+function initSim() {
+  U.fill(1); V.fill(0);
+  const r = mulberry32(0x6A5C077);
+  for (let s = 0; s < 40; s++) {
+    const cx = Math.floor(r() * GW), cy = Math.floor(r() * GH), rad = 2 + Math.floor(r() * 4);
+    for (let y = -rad; y <= rad; y++) for (let x = -rad; x <= rad; x++) if (x * x + y * y <= rad * rad) {
+      const i = ((cy + y + GH) % GH) * GW + (cx + x + GW) % GW; U[i] = 0.5; V[i] = 0.25 + r() * 0.02;
+    }
+  }
+  for (let j = 0; j < PREROLL; j++) step(REG[0].F, REG[0].k);
+  simF = 0;
+}
+function record(f) {
+  let s = 0, e = 0;
+  for (let y = 0; y < GH; y += 2) for (let x = 0; x < GW; x += 2) { const i = y * GW + x, v = V[i]; s += v; e += Math.abs(v - V[y * GW + XP[x]]); }
+  meanV[f] = s / (GN / 4); edge[f] = e / (GN / 4);
+}
+function saveCk(k) { const a = new Float32Array(2 * GN); a.set(U, 0); a.set(V, GN); ckpt[k] = a; }
+function loadCk(k) { const a = ckpt[k]; U.set(a.subarray(0, GN)); V.set(a.subarray(GN)); simF = k * CK; }
+function simTo(f) {
+  if (simF < 0) { initSim(); saveCk(0); record(0); maxF = 0; }
+  if (f < simF || f - simF > CK) {
+    const k = Math.min(Math.floor(f / CK), Math.floor(maxF / CK));
+    if (!(simF <= f && simF >= k * CK)) loadCk(k);
+  }
+  while (simF < f) {
+    const { F, k } = params(simF);
+    for (let j = 0; j < IPF; j++) step(F, k);
+    simF++;
+    if (simF > maxF) { maxF = simF; record(simF); if (simF % CK === 0) saveCk(simF / CK); }
+  }
+}
+
+// ---- WebGL: v as a lit height field ----------------------------------------------
+const VS = `#version 300 es
+in vec2 a; out vec2 v_uv;
+void main(){ v_uv = a * 0.5 + 0.5; gl_Position = vec4(a, 0.0, 1.0); }`;
+const FS = `#version 300 es
+precision highp float;
+in vec2 v_uv; out vec4 o;
+uniform sampler2D u_v; uniform vec4 u_src; uniform vec2 u_res; uniform float u_pal; uniform float u_time; uniform float u_fade;
+vec4 cubic(float v){ vec4 n = vec4(1.0, 2.0, 3.0, 4.0) - v; vec4 s = n * n * n;
+  float x = s.x, y = s.y - 4.0 * s.x, z = s.z - 4.0 * s.y + 6.0 * s.x; return vec4(x, y, z, 6.0 - x - y - z) * (1.0 / 6.0); }
+// smooth B-spline sample from four bilinear taps; p in texels
+float field(vec2 p){
+  vec2 ts = vec2(textureSize(u_v, 0)), inv = 1.0 / ts;
+  p -= 0.5; vec2 fx = fract(p); p -= fx;
+  vec4 xc = cubic(fx.x), yc = cubic(fx.y);
+  vec4 c = p.xxyy + vec2(-0.5, 1.5).xyxy;
+  vec4 s = vec4(xc.xz + xc.yw, yc.xz + yc.yw);
+  vec4 off = (c + vec4(xc.yw, yc.yw) / s) * inv.xxyy;
+  float s0 = texture(u_v, off.xz).r, s1 = texture(u_v, off.yz).r, s2 = texture(u_v, off.xw).r, s3 = texture(u_v, off.yw).r;
+  float sx = s.x / (s.x + s.y), sy = s.z / (s.z + s.w);
+  return mix(mix(s3, s2, sx), mix(s1, s0, sx), sy);
+}
+vec3 hexc(float r, float g, float b){ return vec3(r, g, b) / 255.0; }
+void main(){
+  vec2 uv = vec2(v_uv.x, 1.0 - v_uv.y);
+  vec2 p = u_src.xy + uv * u_src.zw;                       // texel position in the simulation
+  float e = 0.6;
+  float h = field(p);
+  float hx = field(p + vec2(e, 0.0)) - field(p - vec2(e, 0.0));
+  float hy = field(p + vec2(0.0, e)) - field(p - vec2(0.0, e));
+  vec3 n = normalize(vec3(-hx * 5.5, hy * 5.5, 1.0));
+  float t = smoothstep(0.04, 0.36, h);
+  // three palettes, blended by u_pal (0 coral, 1 spots, 2 fingerprints): low, mid, high, peak
+  vec3 L0 = hexc(9.0, 22.0, 32.0),  M0 = hexc(24.0, 96.0, 104.0),  H0 = hexc(255.0, 122.0, 89.0), P0 = hexc(255.0, 228.0, 200.0);
+  vec3 L1 = hexc(8.0, 12.0, 34.0),  M1 = hexc(36.0, 60.0, 150.0),  H1 = hexc(92.0, 225.0, 255.0), P1 = hexc(236.0, 252.0, 255.0);
+  vec3 L2 = hexc(20.0, 9.0, 26.0),  M2 = hexc(96.0, 38.0, 110.0),  H2 = hexc(245.0, 184.0, 61.0), P2 = hexc(255.0, 242.0, 208.0);
+  float a1 = clamp(u_pal, 0.0, 1.0), a2 = clamp(u_pal - 1.0, 0.0, 1.0);
+  vec3 lo = mix(mix(L0, L1, a1), L2, a2), mi = mix(mix(M0, M1, a1), M2, a2), hi = mix(mix(H0, H1, a1), H2, a2), pk = mix(mix(P0, P1, a1), P2, a2);
+  vec3 col = mix(lo, mi, smoothstep(0.0, 0.45, t));
+  col = mix(col, hi, smoothstep(0.35, 0.85, t));
+  col = mix(col, pk, smoothstep(0.88, 1.0, t) * 0.7);
+  float ang = 0.9 + 0.0 * u_time;                          // a fixed light: still pixels stay still
+  vec3 Ld = normalize(vec3(cos(ang) * -0.55, sin(ang) * 0.55, 0.62));
+  float dif = 0.62 + 0.38 * dot(n, Ld);
+  vec3 hv = normalize(Ld + vec3(0.0, 0.0, 1.0));
+  float spec = pow(max(dot(n, hv), 0.0), 48.0) * (0.25 + 0.6 * t);
+  col = col * dif + vec3(1.0, 0.97, 0.92) * spec * 0.55;
+  vec2 d = v_uv - 0.5; d.x *= u_res.x / u_res.y;
+  col *= 1.0 - 0.38 * smoothstep(0.35, 1.05, length(d));   // vignette
+  o = vec4(col * u_fade, 1.0);
+}`;
+function makeRD(w, h) {
+  const gcv = document.createElement('canvas'); gcv.width = w; gcv.height = h;
+  const gl = gcv.getContext('webgl2', { preserveDrawingBuffer: true, antialias: false, alpha: false, premultipliedAlpha: false });
+  if (!gl) return null;
+  const sh = (type, src) => { const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s)); return s; };
+  const p = gl.createProgram(); gl.attachShader(p, sh(gl.VERTEX_SHADER, VS)); gl.attachShader(p, sh(gl.FRAGMENT_SHADER, FS));
+  gl.bindAttribLocation(p, 0, 'a'); gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  const u = {}; for (const nm of ['u_v', 'u_src', 'u_res', 'u_pal', 'u_time', 'u_fade']) u[nm] = gl.getUniformLocation(p, nm);
+  const vb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, vb);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+  const tex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+  return {
+    canvas: gcv,
+    render(f, src, fade = 1) {
+      const { pal } = params(f);
+      gl.viewport(0, 0, w, h); gl.useProgram(p);
+      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.R16F, GW, GH, 0, gl.RED, gl.FLOAT, V);
+      gl.uniform1i(u.u_v, 0); gl.uniform4f(u.u_src, src[0], src[1], src[2], src[3]); gl.uniform2f(u.u_res, w, h);
+      gl.uniform1f(u.u_pal, pal); gl.uniform1f(u.u_time, f / FPS); gl.uniform1f(u.u_fade, fade);
+      gl.drawArrays(gl.TRIANGLES, 0, 3); gl.finish();
+    },
+  };
+}
+let RD = null, RDtried = false;
+/** Draws the field into g at rect r; src is the texel window [x, y, w, h]. Falls back to a 2D greyscale if WebGL2 is missing. */
+const fb = document.createElement('canvas'); fb.width = GW; fb.height = GH;
+function drawField(g, f, r, src, renderer) {
+  if (renderer) { renderer.render(f, src); g.drawImage(renderer.canvas, r.x, r.y, r.w, r.h); return; }
+  const fx = fb.getContext('2d'), img = fx.createImageData(GW, GH);
+  for (let i = 0; i < GN; i++) { const v = clamp(V[i] * 2.6) * 255; img.data[4 * i] = v; img.data[4 * i + 1] = v * 0.7; img.data[4 * i + 2] = v * 0.6; img.data[4 * i + 3] = 255; }
+  fx.putImageData(img, 0, 0);
+  g.imageSmoothingEnabled = true; g.drawImage(fb, src[0], src[1], src[2], src[3], r.x, r.y, r.w, r.h);
+}
+
+// ---- overlays ---------------------------------------------------------------------
+/** The F-k plane: where each regime lives, and the dot that walks between them. */
+function paramMap(g, f, x, y, w, h, alpha) {
+  if (alpha <= 0.002) return;
+  const k0 = 0.052, k1 = 0.069, F0 = 0.02, F1 = 0.065;
+  const X = k => x + (k - k0) / (k1 - k0) * w, Y = F => y + h - (F - F0) / (F1 - F0) * h;
+  g.save(); g.globalAlpha = alpha;
+  g.fillStyle = `rgba(${C.inkRGB},0.72)`; g.beginPath(); g.roundRect(x - 26, y - 64, w + 52, h + 128, 16); g.fill();
+  g.strokeStyle = 'rgba(243,238,230,0.22)'; g.lineWidth = 1.5; g.beginPath(); g.moveTo(x, y); g.lineTo(x, y + h); g.lineTo(x + w, y + h); g.stroke();
+  text(g, 'the F–k plane', x, y - 26, { size: 28, weight: 700, color: C.paper });
+  text(g, 'k →', x + w, y + h + 40, { size: 28, weight: 600, fam: MONO, color: C.faint, align: 'right' });
+  text(g, 'F ↑', x - 4, y + h + 40, { size: 28, weight: 600, fam: MONO, color: C.faint });
+  // trail
+  g.strokeStyle = 'rgba(243,238,230,0.5)'; g.setLineDash([4, 6]); g.beginPath();
+  for (let q = 0; q <= f; q += 3) { const { F, k } = params(q); q ? g.lineTo(X(k), Y(F)) : g.moveTo(X(k), Y(F)); }
+  g.stroke(); g.setLineDash([]);
+  REG.forEach((rg, i) => {
+    const on = f >= (i ? rg.at : 0);
+    g.fillStyle = rg.color; g.globalAlpha = alpha * (on ? 1 : 0.4);
+    g.beginPath(); g.arc(X(rg.k), Y(rg.F), 7, 0, Math.PI * 2); g.fill(); g.globalAlpha = alpha;
+    text(g, rg.name.toLowerCase(), X(rg.k) + 16, Y(rg.F) + 10, { size: 28, weight: 700, color: rg.color, alpha: on ? 1 : 0.45 });
+  });
+  const { F, k } = params(f);
+  g.fillStyle = C.paper; g.beginPath(); g.arc(X(k), Y(F), 10, 0, Math.PI * 2); g.fill();
+  g.strokeStyle = C.ink; g.lineWidth = 3; g.stroke();
+  g.restore();
+}
+
+// ---- landscape picture ---------------------------------------------------------------
+const SRC_L = [0, 0, GW, GH];
+function draw(f) {
+  simTo(f);
+  if (!RDtried) { RDtried = true; try { RD = makeRD(W, H); } catch (e) { RD = null; } }
+  if (ctx.reset) ctx.reset();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; ctx.filter = 'none'; ctx.shadowBlur = 0;
+  ctx.fillStyle = C.ink; ctx.fillRect(0, 0, W, H);
+  drawField(ctx, f, { x: 0, y: 0, w: W, h: H }, SRC_L, RD);
+  const endK = E.inOutCubic(prog(f, T.end, T.end + 22));
+  // scrims for the type
+  let g = ctx.createLinearGradient(0, 0, 1180, 0);
+  g.addColorStop(0, `rgba(${C.inkRGB},0.86)`); g.addColorStop(0.6, `rgba(${C.inkRGB},0.6)`); g.addColorStop(1, `rgba(${C.inkRGB},0)`);
+  ctx.fillStyle = g; ctx.fillRect(0, 0, 1180, H);
+  g = ctx.createLinearGradient(0, 0, 0, 180); g.addColorStop(0, `rgba(${C.inkRGB},0.7)`); g.addColorStop(1, `rgba(${C.inkRGB},0)`);
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, 180);
+  if (endK > 0) { ctx.fillStyle = `rgba(${C.inkRGB},${0.7 * endK})`; ctx.fillRect(0, 0, W, H); }
+  const a = 1 - endK;
+  text(ctx, 'REACTION–DIFFUSION  ·  GRAY–SCOTT', 120, 104, { size: 26, weight: 600, color: C.dim, spacing: 5, alpha: a });
+  text(ctx, 'BYTEPATTERNS', 1800, 104, { size: 26, weight: 600, color: C.dim, spacing: 5, align: 'right', alpha: a });
+  // hook
+  {
+    const k = E.outExpo(prog(f, -6, 14)), o = 1 - E.inCubic(prog(f, T.hook - 16, T.hook));
+    text(ctx, 'Two chemicals.', 116, 430 + (1 - k) * 30, { size: 132, weight: 850, color: C.paper, spacing: -3, alpha: Math.min(k, o) });
+    const k2 = E.outExpo(prog(f, 6, 24));
+    text(ctx, 'Two numbers.', 116, 570 + (1 - k2) * 30, { size: 132, weight: 850, color: C.coral, spacing: -3, alpha: Math.min(k2, o) });
+    const [a3, d3] = env(f, 30, T.hook, 14, 14);
+    text(ctx, 'Every pattern in this film is the same equation.', 120, 660 + d3, { size: 40, weight: 500, color: C.dim, alpha: a3 });
+  }
+  // the equation, then the regime titles
+  {
+    const [ae, de] = env(f, T.eq, T.end, 16, 16);
+    const ea = ae * a;
+    text(ctx, 'u + 2v  →  3v', 120, 250 + de, { size: 60, weight: 700, fam: MONO, color: C.paper, alpha: ea });
+    text(ctx, "u' = Du ∇²u − uv² + F(1 − u)", 122, 330 + de, { size: 34, weight: 500, fam: MONO, color: C.dim, alpha: ea });
+    text(ctx, "v' = Dv ∇²v + uv² − (F + k)v", 122, 380 + de, { size: 34, weight: 500, fam: MONO, color: C.dim, alpha: ea });
+    const [a2, d2] = env(f, T.eq + 24, T.end, 16, 16);
+    text(ctx, 'F feeds u in.  k takes v out.', 122, 440 + d2, { size: 34, weight: 600, color: C.paper, alpha: a2 * a });
+    REG.forEach((rg, i) => {
+      const s0 = i ? rg.at + 10 : T.eq + 40, s1 = i < REG.length - 1 ? REG[i + 1].at + 6 : T.end;
+      const [al, dy] = env(f, s0, s1, 16, 12);
+      if (al <= 0.002) return;
+      text(ctx, rg.name, 116, 900 + dy, { size: 120, weight: 850, color: rg.color, spacing: -3, alpha: al * a });
+      text(ctx, `F ${rg.F.toFixed(4)}  ·  k ${rg.k.toFixed(4)}  —  ${rg.what}`, 122, 966 + dy, { size: 32, weight: 500, fam: MONO, color: C.paper, alpha: al * a * 0.9 });
+    });
+    paramMap(ctx, f, 1420, 690, 360, 210, E.outCubic(prog(f, T.eq + 30, T.eq + 50)) * a);
+  }
+  if (endK > 0) {
+    const k1 = E.outCubic(prog(f, T.end + 6, T.end + 30)), k2 = E.outCubic(prog(f, T.end + 18, T.end + 42)), k3 = E.outCubic(prog(f, T.end + 30, T.end + 54));
+    text(ctx, 'Two Numbers', W / 2, 500 + (1 - k1) * 30, { size: 136, weight: 850, color: C.paper, spacing: -3, align: 'center', alpha: k1 });
+    text(ctx, 'Gray–Scott reaction–diffusion  ·  the idea Turing proposed in 1952', W / 2, 580 + (1 - k2) * 20, { size: 40, weight: 500, color: C.amber, align: 'center', alpha: k2 });
+    text(ctx, 'bytepatterns · motion lab', W / 2, 1000, { size: 32, weight: 600, color: C.paper, spacing: 3, align: 'center', alpha: k3 * 0.8 });
+  }
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.letterSpacing = '0px';
+}
+
+// ---- sound: a drone that opens up with the pattern, bubbles while it grows -----------
+async function renderAudio() {
+  simTo(FRAMES - 1);
+  const SR = 48000, dur = FRAMES / FPS, LEN = Math.round(SR * dur);
+  const ac = new OfflineAudioContext(2, LEN, SR);
+  const comp = ac.createDynamicsCompressor();
+  comp.threshold.value = -16; comp.ratio.value = 3; comp.attack.value = 0.01; comp.release.value = 0.25;
+  const master = ac.createGain(); master.gain.value = 0.95; master.connect(comp).connect(ac.destination);
+  master.gain.setValueAtTime(0.95, dur - 0.8); master.gain.linearRampToValueAtTime(0.0001, dur - 0.02);
+  const rnd = mulberry32(0x13D1FF);
+  const ir = ac.createBuffer(2, SR * 3, SR);
+  for (let c = 0; c < 2; c++) { const d = ir.getChannelData(c); for (let k = 0; k < d.length; k++) d[k] = (rnd() * 2 - 1) * Math.pow(1 - k / d.length, 3.4); }
+  const verb = ac.createConvolver(); verb.buffer = ir; const vg = ac.createGain(); vg.gain.value = 0.4; verb.connect(vg).connect(master);
+  const hz = m => 440 * Math.pow(2, (m - 69) / 12);
+  // control curves from the simulation
+  let mMax = 1e-6, eMax = 1e-6; for (let f = 0; f < FRAMES; f++) { mMax = Math.max(mMax, meanV[f]); eMax = Math.max(eMax, edge[f]); }
+  const curve = fn => { const c = new Float32Array(FRAMES); for (let f = 0; f < FRAMES; f++) c[f] = fn(f); return c; };
+  // drone per regime, through a low-pass that follows how much of the plane v covers
+  const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.Q.value = 1.2;
+  lp.frequency.setValueCurveAtTime(curve(f => 260 + 2400 * Math.pow(meanV[f] / mMax, 1.5)), 0, dur);
+  const bus = ac.createGain(); bus.gain.value = 1; bus.connect(lp); lp.connect(master); lp.connect(verb);
+  const chords = [[0, 280, [40, 47, 52, 55, 59]], [260, 480, [38, 45, 50, 57, 62, 66]], [460, FRAMES, [43, 50, 55, 59, 62, 69]]];
+  for (const [fa, fb, notes] of chords) {
+    const a = fa / FPS, b = Math.min(dur, fb / FPS);
+    for (const m of notes) for (const det of [-8, 7]) {
+      const o = ac.createOscillator(); o.type = 'sawtooth'; o.frequency.value = hz(m); o.detune.value = det;
+      const g = ac.createGain(); g.gain.setValueAtTime(0, a); g.gain.linearRampToValueAtTime(0.028, a + (fa === 0 ? 0.08 : 1.2));
+      g.gain.setValueAtTime(0.028, Math.max(a + 1.2, b - 0.8)); g.gain.linearRampToValueAtTime(0, b);
+      o.connect(g).connect(bus); o.start(a); o.stop(b + 0.05);
+    }
+  }
+  // bubbles: short sine drops, denser while the pattern is still changing fast
+  const bubble = (at, f0, amp, pan) => {
+    const o = ac.createOscillator(), g = ac.createGain(), p = ac.createStereoPanner();
+    o.frequency.setValueAtTime(f0, at); o.frequency.exponentialRampToValueAtTime(f0 * 1.9, at + 0.06);
+    g.gain.setValueAtTime(0.0001, at); g.gain.exponentialRampToValueAtTime(amp, at + 0.005); g.gain.exponentialRampToValueAtTime(0.0001, at + 0.09);
+    p.pan.value = pan; o.connect(g).connect(p); p.connect(master); p.connect(verb); o.start(at); o.stop(at + 0.12);
+  };
+  for (let f = 1; f < FRAMES - 20; f++) {
+    const change = Math.abs(meanV[f] - meanV[f - 1]) / mMax * 60 + Math.abs(edge[f] - edge[f - 1]) / eMax * 40;
+    const n = rnd() < clamp(change * 1.6 + 0.08) ? 1 : 0;
+    if (n) bubble(f / FPS + rnd() * 0.03, 500 + rnd() * 900, 0.035 + 0.05 * clamp(change), rnd() * 1.6 - 0.8);
+  }
+  // each regime arrives with a low swell and a bell
+  const bell = (at, m, amp, pan) => { for (const [ratio, a2, dec] of [[1, 1, 2.4], [2.76, 0.35, 1.0], [5.4, 0.1, 0.5]]) {
+    const o = ac.createOscillator(); o.frequency.value = hz(m) * ratio; const g = ac.createGain(), p = ac.createStereoPanner();
+    g.gain.setValueAtTime(0.0001, at); g.gain.exponentialRampToValueAtTime(amp * a2, at + 0.006); g.gain.exponentialRampToValueAtTime(0.0001, at + dec);
+    p.pan.value = pan; o.connect(g).connect(p); p.connect(master); p.connect(verb); o.start(at); o.stop(at + dec + 0.05); } };
+  const swell = (at, m, len) => { const o = ac.createOscillator(), g = ac.createGain(); o.type = 'sine'; o.frequency.value = hz(m);
+    g.gain.setValueAtTime(0.0001, at); g.gain.exponentialRampToValueAtTime(0.3, at + len * 0.6); g.gain.exponentialRampToValueAtTime(0.0001, at + len);
+    o.connect(g).connect(master); o.start(at); o.stop(at + len + 0.05); };
+  swell(0, 28, 2.2); bell(0.05, 76, 0.1, 0);
+  [[REG[1].at, [74, 78, 81]], [REG[2].at, [79, 83, 86]]].forEach(([fa, ms]) => {
+    swell(fa / FPS, 26, 2.6);
+    ms.forEach((m, i) => bell(fa / FPS + 0.9 + i * 0.22, m, 0.09, -0.5 + i * 0.5));
+  });
+  [71, 74, 79, 83].forEach((m, i) => bell((T.end + 8 + i * 6) / FPS, m, 0.09, -0.45 + i * 0.3));
+
+  const buf = await ac.startRendering();
+  let peak = 0; for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let k = 0; k < d.length; k++) peak = Math.max(peak, Math.abs(d[k])); }
+  if (peak > 0.89) for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let k = 0; k < d.length; k++) d[k] *= 0.89 / peak; }
+  return buf;
+}
+
+/* ==========================================================================
+   VERTICAL CUT — shared block, identical in every piece.
+   1080x1920 for Reels, Shorts and TikTok (__motion.variants.vertical). The
+   piece's own scene code is re-used and recomposed for a phone: everything a
+   viewer must read stays inside the area no platform covers (x 60..900,
+   y 230..1400); outside it there is only dimmed texture.
+   ========================================================================== */
+const VW = 1080, VH = 1920, SAFE = { x: 60, y: 230, w: 840, h: 1170, r: 900, b: 1400 };
+const vcv = document.createElement('canvas'); vcv.width = VW; vcv.height = VH;
+const vx = vcv.getContext('2d', { willReadFrequently: true });   // CPU raster: identical pixels on every redraw
+const VL = 96, VR = 864;                                          // text column inside the safe area
+
+function vReset() {
+  vx.setTransform(1, 0, 0, 1, 0, 0); vx.globalAlpha = 1; vx.globalCompositeOperation = 'source-over';
+  vx.filter = 'none'; vx.shadowBlur = 0; vx.shadowColor = 'transparent'; vx.letterSpacing = '0px'; vx.setLineDash([]);
+  vx.textAlign = 'left'; vx.textBaseline = 'alphabetic'; vx.lineCap = 'butt'; vx.lineJoin = 'miter';
+}
+/** Canvas text on the vertical frame; `max` shrinks the size until the line fits. */
+function vText(str, x, y, { size = 40, weight = 700, color = '#FFFFFF', align = 'left', spacing = 0, alpha = 1, fam = FONT, max = 0 } = {}) {
+  if (alpha <= 0.002 || !str) return size;
+  vx.font = `${weight} ${size}px ${fam}`; vx.letterSpacing = spacing + 'px';
+  if (max) { const w = vx.measureText(str).width; if (w > max) { size = size * max / w; vx.font = `${weight} ${size}px ${fam}`; } }
+  vx.textAlign = align; vx.textBaseline = 'alphabetic';
+  const a0 = vx.globalAlpha; vx.globalAlpha = a0 * alpha; vx.fillStyle = color;
+  vx.fillText(str, x + (align === 'center' ? spacing / 2 : align === 'right' ? spacing : 0), y);   // tracking is added after the last glyph too
+  vx.globalAlpha = a0; vx.letterSpacing = '0px';
+  return size;
+}
+/** Word-wraps with the given font; returns the lines. */
+function vWrap(str, maxW, size, weight = 700, fam = FONT) {
+  vx.font = `${weight} ${size}px ${fam}`; vx.letterSpacing = '0px';
+  const words = str.split(' '), lines = []; let cur = '';
+  for (const w of words) { const t = cur ? cur + ' ' + w : w; if (vx.measureText(t).width > maxW && cur) { lines.push(cur); cur = w; } else cur = t; }
+  if (cur) lines.push(cur);
+  return lines;
+}
+/** Fade envelope with a small rise: [alpha, dy]. */
+function vEnv(v, a, b, fin = 8, fout = 8) {
+  const i = E.outCubic(prog(v, a, a + fin)), o = 1 - E.inCubic(prog(v, b - fout, b));
+  return [Math.min(i, o), (1 - i) * 22 - (1 - o) * 10];
+}
+/** Which segment of a cut list a vertical frame is in: segs = [{ at, src, len }] in frames. */
+function vSeg(segs, v) {
+  let k = 0; while (k < segs.length - 1 && v >= segs[k + 1].at) k++;
+  const s = segs[k];
+  return { k, s, local: v - s.at, src: s.src + (v - s.at) };
+}
+/** Dims everything outside the safe area to a quiet texture (brightness x 0.2), with a soft inner edge. */
+function vShade(rgb, a = 0.8, feather = 40) {
+  vx.save(); vx.setTransform(1, 0, 0, 1, 0, 0); vx.globalAlpha = 1; vx.globalCompositeOperation = 'source-over';
+  vx.fillStyle = `rgba(${rgb},${a})`;
+  vx.beginPath(); vx.rect(0, 0, VW, VH); vx.rect(SAFE.x, SAFE.y, SAFE.w, SAFE.h); vx.fill('evenodd');
+  const strip = (x0, y0, x1, y1, rx, ry, rw, rh) => {
+    const g = vx.createLinearGradient(x0, y0, x1, y1);
+    g.addColorStop(0, `rgba(${rgb},${a})`); g.addColorStop(1, `rgba(${rgb},0)`);
+    vx.fillStyle = g; vx.fillRect(rx, ry, rw, rh);
+  };
+  strip(SAFE.x, 0, SAFE.x + feather, 0, SAFE.x, SAFE.y, feather, SAFE.h);
+  strip(SAFE.r, 0, SAFE.r - feather, 0, SAFE.r - feather, SAFE.y, feather, SAFE.h);
+  strip(0, SAFE.y, 0, SAFE.y + feather, SAFE.x, SAFE.y, SAFE.w, feather);
+  strip(0, SAFE.b, 0, SAFE.b - feather, SAFE.x, SAFE.b - feather, SAFE.w, feather);
+  vx.restore();
+}
+/** Series tag at the top of the safe area, e.g. MADE IN CODE · 04. */
+function vTag(label, color, alpha = 1) {
+  vText('MADE IN CODE', VL, 292, { size: 28, weight: 800, color, spacing: 5, alpha });
+  vx.font = `800 28px ${FONT}`; vx.letterSpacing = '5px';
+  const w = vx.measureText('MADE IN CODE').width; vx.letterSpacing = '0px';
+  vText('·  ' + label, VL + w + 14, 292, { size: 28, weight: 600, color: 'rgba(255,255,255,0.72)', spacing: 3, alpha, max: VR - VL - w - 14 });
+}
+/** Big hook lines, left-aligned from y0; visible from frame 0, settles in a few frames. */
+function vHook(v, lines, y0, { size = 84, lh = 1.08, color = '#FFFFFF', accent = null, weight = 800, spacing = -1.5, alpha = 1 } = {}) {
+  const k = E.outExpo(prog(v, -6, 12));
+  lines.forEach((ln, i) => {
+    const kk = E.outExpo(prog(v, -12 + i * 2, 8 + i * 2));
+    vText(ln, VL, y0 + i * size * lh + (1 - kk) * 30, { size, weight, spacing, color: accent && i === lines.length - 1 ? accent : color, alpha: alpha * Math.max(0.25, kk), max: VR - VL });
+  });
+  return k;
+}
+/** Closing card, the last 60 frames: piece title, "drawn in code · bytepatterns.com". l = frames into the card. */
+function vEndCard(l, { title, line = '', ink = '#FFFFFF', dim = 'rgba(255,255,255,0.66)', accent = '#FFFFFF', scrim = '0,0,0', a = 0.84 }) {
+  const k = E.outCubic(prog(l, 0, 12));
+  vx.save(); vx.setTransform(1, 0, 0, 1, 0, 0);
+  vx.fillStyle = `rgba(${scrim},${a * k})`; vx.fillRect(0, 0, VW, VH);
+  vx.restore();
+  const t1 = E.outExpo(prog(l, 3, 19)), t2 = E.outExpo(prog(l, 11, 27)), t3 = E.outExpo(prog(l, 19, 35));
+  vx.fillStyle = accent; vx.globalAlpha = t1; vx.fillRect(VL, 742, 88 * t1, 7); vx.globalAlpha = 1;
+  const size = vText(title, VL, 850 + (1 - t1) * 40, { size: 92, weight: 800, color: ink, spacing: -2, alpha: t1, max: VR - VL });
+  const y2 = 850 + Math.max(size, 60) * 0.25 + 70;
+  vx.font = `600 44px ${FONT}`;
+  const lead = 'drawn in code  ·  ', lw = vx.measureText(lead).width;
+  vText(lead, VL, y2 + (1 - t2) * 24, { size: 44, weight: 600, color: dim, alpha: t2 });
+  vText('bytepatterns.com', VL + lw, y2 + (1 - t2) * 24, { size: 44, weight: 800, color: accent, alpha: t2 });
+  if (line) vText(line, VL, y2 + 72 + (1 - t3) * 18, { size: 32, weight: 500, color: dim, alpha: t3, max: VR - VL });
+}
+/** Seeks a cut. The first frame a page draws is drawn twice: the very first read of a
+ *  GPU-backed source canvas can come out a shade different from every later one. */
+let vWarm = false;
+function vSeek(draw, i, frames) {
+  const f = Math.max(0, Math.min(frames - 1, Math.floor(i)));
+  if (!vWarm) { vWarm = true; draw(f); }
+  draw(f);
+}
+/** The soundtrack of a cut: the piece's own audio() spliced to the same segments as the picture. */
+async function vAudio(segs, frames, { xf = 0.025, fadeOut = 0.6, extra = null } = {}) {
+  const src = await renderAudio();
+  const SR = 48000, dur = frames / FPS, ac = new OfflineAudioContext(2, Math.round(SR * dur), SR);
+  const out = ac.createGain(); out.connect(ac.destination);
+  out.gain.setValueAtTime(1, 0); out.gain.setValueAtTime(1, dur - fadeOut); out.gain.linearRampToValueAtTime(0, dur - 0.01);
+  segs.forEach((s, k) => {
+    const at = s.at / FPS, off = s.src / FPS, d = s.len / FPS;
+    const pre = k === 0 ? 0 : Math.min(xf, off), post = k === segs.length - 1 ? 0 : xf;
+    const b = ac.createBufferSource(), g = ac.createGain(); b.buffer = src;
+    g.gain.setValueAtTime(pre ? 0 : 1, at - pre);
+    if (pre) g.gain.linearRampToValueAtTime(1, at + pre);
+    if (post) { g.gain.setValueAtTime(1, at + d - post); g.gain.linearRampToValueAtTime(0, at + d + post); }
+    b.connect(g).connect(out); b.start(at - pre, off - pre, d + pre + post);
+  });
+  if (extra) extra(ac, out);
+  const buf = await ac.startRendering();
+  let peak = 0; for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) peak = Math.max(peak, Math.abs(d[i])); }
+  if (peak > 0.9) for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) d[i] *= 0.9 / peak; }
+  return buf;
+}
+/** A soft three-partial bell, for the closing card. */
+function vChime(ac, dest, at, freq, vol = 0.08) {
+  for (const [mul, v, dec] of [[1, 1, 1.8], [2.01, 0.35, 0.8], [3.02, 0.12, 0.4]]) {
+    const o = ac.createOscillator(), g = ac.createGain(); o.type = 'sine'; o.frequency.value = freq * mul;
+    g.gain.setValueAtTime(0.0001, at); g.gain.exponentialRampToValueAtTime(vol * v, at + 0.006); g.gain.exponentialRampToValueAtTime(0.0001, at + dec);
+    o.connect(g).connect(dest); o.start(at); o.stop(at + dec + 0.05);
+  }
+}
+
+/* VERTICAL CUT — this piece */
+// The same simulation, a portrait window of it (155 x 216 texels) rendered by
+// the shader at the safe area's own size, so nothing is cropped from a bitmap.
+const VSEG = [
+  { at: 0, src: 0, len: 72 },                               // hook
+  { at: 72, src: 150, len: 90 },                            // coral
+  { at: 162, src: REG[1].at, len: 150 },                    // coral splits into spots
+  { at: 312, src: REG[2].at, len: 168 },                    // spots join into fingerprints
+  { at: 480, src: T.end, len: 60 },                         // closing card
+];
+const VFR = 540, VEND = VFR - 60;
+const VWIN = { x: SAFE.x, y: SAFE.y, w: SAFE.w, h: SAFE.h }, VSRC = [118, 0, Math.round(GH * SAFE.w / SAFE.h), GH];
+let VRD = null, VRDtried = false;
+function vDraw(v) {
+  const { k: seg, src } = vSeg(VSEG, v), f = Math.min(FRAMES - 1, src);
+  simTo(f);
+  if (!VRDtried) { VRDtried = true; try { VRD = makeRD(VWIN.w, VWIN.h); } catch (e) { VRD = null; } }
+  vReset();
+  vx.fillStyle = C.ink; vx.fillRect(0, 0, VW, VH);
+  vx.save(); vx.beginPath(); vx.roundRect(VWIN.x, VWIN.y, VWIN.w, VWIN.h, 26); vx.clip();
+  drawField(vx, f, VWIN, VSRC, VRD);
+  vx.restore();
+  // scrims under the type
+  let g = vx.createLinearGradient(0, SAFE.y, 0, 820);
+  g.addColorStop(0, `rgba(${C.inkRGB},0.9)`); g.addColorStop(0.7, `rgba(${C.inkRGB},0.7)`); g.addColorStop(1, `rgba(${C.inkRGB},0)`);
+  vx.fillStyle = g; vx.fillRect(SAFE.x, SAFE.y, SAFE.w, 820 - SAFE.y);
+  g = vx.createLinearGradient(0, 1040, 0, SAFE.b);
+  g.addColorStop(0, `rgba(${C.inkRGB},0)`); g.addColorStop(1, `rgba(${C.inkRGB},0.88)`);
+  vx.fillStyle = g; vx.fillRect(SAFE.x, 1040, SAFE.w, SAFE.b - 1040);
+  vShade(C.inkRGB);
+  vTag('REACTION–DIFFUSION', C.coral);
+  if (seg === 0) {
+    const o = 1 - E.inCubic(prog(v, 60, 72));
+    vHook(v, ['Two chemicals.', 'Two numbers.'], 440, { size: 96, color: C.paper, accent: C.coral, alpha: o });
+    vText('Every pattern here is one equation.', VL, 650, { size: 38, weight: 500, color: C.dim, alpha: o * E.outCubic(prog(v, 16, 30)), max: VR - VL });
+  } else {
+    const [ae, de] = vEnv(v, 72, VEND, 10, 10);
+    vText('u + 2v → 3v', VL, 420 + de, { size: 64, weight: 700, fam: MONO, color: C.paper, alpha: ae });
+    vText('F feeds u in. k takes v out.', VL, 484 + de, { size: 38, weight: 600, color: C.dim, alpha: ae, max: VR - VL });
+    const rg = REG[Math.min(2, seg - 1)], s0 = VSEG[seg].at;
+    const [al, dy] = vEnv(v, s0 + (seg === 1 ? 6 : 24), s0 + VSEG[seg].len + 4, 12, 8);
+    vText(rg.name, VL, 1300 + dy, { size: 104, weight: 850, color: rg.color, spacing: -2, alpha: al, max: VR - VL });
+    vText(`F ${rg.F.toFixed(4)} · k ${rg.k.toFixed(4)}`, VL, 1362 + dy, { size: 34, weight: 600, fam: MONO, color: C.paper, alpha: al * 0.92, max: VR - VL });
+  }
+  if (v >= VEND) vEndCard(v - VEND, { title: 'Two Numbers', line: 'Gray–Scott reaction–diffusion · coral, spots, fingerprints',
+    ink: C.paper, dim: 'rgba(243,238,230,0.72)', accent: C.amber, scrim: C.inkRGB, a: 0.8 });
+  vReset();
+}
+
+window.__motion = {
+  title: 'Two Numbers',
+  description: 'A Gray-Scott reaction-diffusion simulation grows coral, splits it into spots and folds it into fingerprints by changing two numbers.',
+  fps: FPS, width: W, height: H, frames: FRAMES,
+  poster: 400,
+  gifStart: 10.5,
+  seek(i) { draw(Math.max(0, Math.min(FRAMES - 1, Math.floor(i)))); },
+  audio: renderAudio,
+  variants: {
+    vertical: {
+      width: VW, height: VH, frames: VFR, canvas: vcv,
+      poster: 250, gifStart: 5,
+      seek(i) { vSeek(vDraw, i, VFR); },
+      audio: () => { simTo(FRAMES - 1); return vAudio(VSEG, VFR); },
+    },
+  },
+};
+
+/* ==========================================================================
+   PLAYER — identical in every piece; keep as is.
+   Autoplays and loops, starts sound on the first click, ?frame=N pauses on a
+   frame, ?variant=vertical plays the vertical cut (if the piece has one).
+   When the renderer sets window.__MOTION_RENDER__ it stays out of the way.
+   ========================================================================== */
+(function player() {
+  const btn = document.getElementById('sound'), q = new URLSearchParams(location.search);
+  let M = window.__motion;
+  const V = !window.__MOTION_RENDER__ && M.variants && M.variants[q.get('variant')];
+  if (V) {                                                // show the variant's own canvas instead
+    M = Object.assign({}, M, V);
+    V.canvas.style.cssText = `width:min(100vw,calc(100vh*${V.width}/${V.height}));height:auto;aspect-ratio:${V.width}/${V.height}`;
+    document.querySelector('canvas').replaceWith(V.canvas);
+  }
+  const dur = M.frames / M.fps;
+  if (window.__MOTION_RENDER__) { btn.hidden = true; M.seek(0); return; }
+  if (q.has('frame')) { btn.hidden = true; M.seek(+q.get('frame') || 0); return; }
+  let t0 = performance.now(), ac = null, src = null, buf = null, paused = false, pausedAt = 0;
+  const clock = () => ac && src ? (ac.currentTime - t0) : (performance.now() - t0) / 1000;
+  function loop() {
+    if (!paused) M.seek(Math.floor(((clock() % dur) + dur) % dur * M.fps));
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+  btn.addEventListener('click', async () => {
+    if (src) { src.stop(); src = null; btn.textContent = 'Click for sound'; t0 = performance.now(); return; }
+    btn.textContent = 'Loading sound…';
+    ac = ac || new AudioContext({ sampleRate: 48000 });
+    buf = buf || await M.audio();
+    await ac.resume();
+    src = ac.createBufferSource(); src.buffer = buf; src.loop = true; src.connect(ac.destination);
+    t0 = ac.currentTime + 0.05; src.start(t0);        // picture restarts from frame 0 in sync with the sound
+    btn.textContent = 'Sound on — click to mute';
+  });
+  addEventListener('keydown', e => {
+    if (e.code !== 'Space') return;
+    e.preventDefault(); paused = !paused;
+    if (ac) paused ? ac.suspend() : ac.resume();
+    if (!ac) { if (paused) pausedAt = performance.now(); else t0 += performance.now() - pausedAt; }
+  });
+})();
+</script>
+</body>
+</html>

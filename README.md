@@ -141,6 +141,71 @@ Click a preview to open the piece live in your browser (click once more there fo
 <br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/10-title-sequence/?variant=vertical">open</a> · <a href="out/10-title-sequence.vertical.png">still</a></sub>
 </td>
 </tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/11-game-of-life/"><img src="out/11-game-of-life.gif" width="100%" alt="The Glider Gun — animated preview"></a>
+<br><b>11 · The Glider Gun</b> <sub>24 s</sub>
+<br>Conway's Game of Life for real: a random soup, the four rules on the R-pentomino, and a Gosper gun firing a glider every 30 generations.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/11-game-of-life/">open in browser</a> · <a href="out/11-game-of-life.png">still</a> · <a href="projects/11-game-of-life/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/11-game-of-life/?variant=vertical"><img src="out/11-game-of-life.vertical.gif" width="100%" alt="The Glider Gun — vertical cut, animated preview"></a>
+<br><sub>9:16 · 18 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/11-game-of-life/?variant=vertical">open</a> · <a href="out/11-game-of-life.vertical.png">still</a></sub>
+</td>
+</tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/12-maze-search/"><img src="out/12-maze-search.gif" width="100%" alt="Two Ways Out — animated preview"></a>
+<br><b>12 · Two Ways Out</b> <sub>22 s</sub>
+<br>Dijkstra and A* search the same maze at the same speed: one 62-step path, and A* opens a third of the cells to find it.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/12-maze-search/">open in browser</a> · <a href="out/12-maze-search.png">still</a> · <a href="projects/12-maze-search/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/12-maze-search/?variant=vertical"><img src="out/12-maze-search.vertical.gif" width="100%" alt="Two Ways Out — vertical cut, animated preview"></a>
+<br><sub>9:16 · 18 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/12-maze-search/?variant=vertical">open</a> · <a href="out/12-maze-search.vertical.png">still</a></sub>
+</td>
+</tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/13-reaction-diffusion/"><img src="out/13-reaction-diffusion.gif" width="100%" alt="Two Numbers — animated preview"></a>
+<br><b>13 · Two Numbers</b> <sub>24 s</sub>
+<br>A Gray-Scott reaction-diffusion simulation grows coral, splits it into spots and folds it into fingerprints by changing two numbers.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/13-reaction-diffusion/">open in browser</a> · <a href="out/13-reaction-diffusion.png">still</a> · <a href="projects/13-reaction-diffusion/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/13-reaction-diffusion/?variant=vertical"><img src="out/13-reaction-diffusion.vertical.gif" width="100%" alt="Two Numbers — vertical cut, animated preview"></a>
+<br><sub>9:16 · 18 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/13-reaction-diffusion/?variant=vertical">open</a> · <a href="out/13-reaction-diffusion.vertical.png">still</a></sub>
+</td>
+</tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/14-six-lines/"><img src="out/14-six-lines.gif" width="100%" alt="Six Lines — animated preview"></a>
+<br><b>14 · Six Lines</b> <sub>20 s</sub>
+<br>A title sequence typed live: six lines of code, each one running the moment it is entered, until the last one writes the title.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/14-six-lines/">open in browser</a> · <a href="out/14-six-lines.png">still</a> · <a href="projects/14-six-lines/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/14-six-lines/?variant=vertical"><img src="out/14-six-lines.vertical.gif" width="100%" alt="Six Lines — vertical cut, animated preview"></a>
+<br><sub>9:16 · 18 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/14-six-lines/?variant=vertical">open</a> · <a href="out/14-six-lines.vertical.png">still</a></sub>
+</td>
+</tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/15-verlet-flag/"><img src="out/15-verlet-flag.gif" width="100%" alt="Held by Springs — animated preview"></a>
+<br><b>15 · Held by Springs</b> <sub>24 s</sub>
+<br>A flag of 864 Verlet points and 4,886 springs catches the wind, then a blade cuts 235 springs and it tears.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/15-verlet-flag/">open in browser</a> · <a href="out/15-verlet-flag.png">still</a> · <a href="projects/15-verlet-flag/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/15-verlet-flag/?variant=vertical"><img src="out/15-verlet-flag.vertical.gif" width="100%" alt="Held by Springs — vertical cut, animated preview"></a>
+<br><sub>9:16 · 18 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/15-verlet-flag/?variant=vertical">open</a> · <a href="out/15-verlet-flag.vertical.png">still</a></sub>
+</td>
+</tr>
 </table>
 <!-- gallery:end -->
 
