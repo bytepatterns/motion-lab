@@ -1,0 +1,592 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="author" content="teambytepatterns">
+<meta name="description" content="A WebGL shader zooms a thousand times into the Mandelbrot set, then opens the Julia set that lives at the point it zoomed into.">
+<title>The Mandelbrot Map — motion-lab</title>
+<style>
+  /* Player chrome. The piece itself lives entirely in the canvas. */
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  body { display: grid; place-items: center; font: 500 15px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #fff; }
+  canvas { display: block; width: min(100vw, calc(100vh * 16 / 9)); height: auto; aspect-ratio: 16 / 9; }
+  #sound { position: fixed; left: 16px; bottom: 16px; padding: 8px 14px; border: 1px solid rgba(255,255,255,.35); border-radius: 999px;
+           background: rgba(0,0,0,.55); color: #fff; font: inherit; cursor: pointer; }
+  #sound[hidden] { display: none; }
+</style>
+</head>
+<body>
+<canvas id="stage" width="1920" height="1080" aria-label="A slow zoom into the Mandelbrot set that turns into a morphing Julia set"></canvas>
+<button id="sound" type="button">Click for sound</button>
+<script>
+'use strict';
+/* ==========================================================================
+   PIECE — The Mandelbrot Map.
+   One fragment shader: for every pixel c, iterate z -> z^2 + c and count how
+   many steps it takes |z| to pass 16 (smooth count: n + 1 - log2(log2|z|)).
+   The camera zooms exponentially toward c0 = -0.743643887 + 0.131825904i
+   ("seahorse valley") until the view is a thousand times smaller, then the
+   same loop runs with c fixed and z starting at the pixel: the Julia set of
+   c0 grows out of the centre, and c walks a short path so it keeps changing.
+   A thousand times keeps 32-bit floats honest (a pixel is still ~25 float
+   steps wide), so there is no deep-zoom trickery to hide.
+   Determinism: every uniform is a function of the frame number; the 2D
+   canvas copies the WebGL canvas inside seek(i).
+   ========================================================================== */
+const W = 1920, H = 1080, FPS = 30, FRAMES = 720;          // 24 s
+const cv = document.getElementById('stage');
+const ctx = cv.getContext('2d');
+const FONT = 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
+const MONO = 'ui-monospace, "Cascadia Code", Consolas, Menlo, monospace';
+
+// ---- helpers -------------------------------------------------------------
+function mulberry32(a) { return function () { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a);
+  t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const lerp = (a, b, t) => a + (b - a) * t;
+const prog = (f, a, b) => clamp((f - a) / (b - a));
+const smooth = t => t * t * (3 - 2 * t);
+const E = {
+  inCubic: t => t * t * t,
+  outCubic: t => 1 - Math.pow(1 - t, 3),
+  inOutCubic: t => t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2,
+  outExpo: t => t === 1 ? 1 : 1 - Math.pow(2, -10 * t),
+  inExpo: t => t === 0 ? 0 : Math.pow(2, 10 * t - 10),
+  inOutExpo: t => t === 0 ? 0 : t === 1 ? 1 : t < .5 ? Math.pow(2, 20 * t - 10) / 2 : (2 - Math.pow(2, -20 * t + 10)) / 2,
+  outBack: t => 1 + 2.70158 * Math.pow(t - 1, 3) + 1.70158 * Math.pow(t - 1, 2),
+};
+function text(g, str, x, y, { size = 40, weight = 600, color = '#fff', alpha = 1, spacing = 0, align = 'left', fam = FONT, base = 'alphabetic' } = {}) {
+  if (alpha <= 0.002 || !str) return 0;
+  g.font = `${weight} ${size}px ${fam}`; g.letterSpacing = spacing + 'px';
+  g.textAlign = align; g.textBaseline = base;
+  const a0 = g.globalAlpha; g.globalAlpha = a0 * alpha; g.fillStyle = color;
+  g.fillText(str, x, y);
+  const w = g.measureText(str).width;
+  g.globalAlpha = a0; g.letterSpacing = '0px';
+  return w;
+}
+const env = (f, a, b, fin = 12, fout = 10) => {
+  const i = E.outCubic(prog(f, a, a + fin)), o = 1 - E.inCubic(prog(f, b - fout, b));
+  return [Math.min(i, o), (1 - i) * 24 - (1 - o) * 10];
+};
+
+// ---- palette -------------------------------------------------------------
+const C = { ink: '#060A14', inkRGB: '6,10,20', paper: '#F3EEE6', dim: 'rgba(243,238,230,0.68)', faint: 'rgba(243,238,230,0.32)',
+  amber: '#F5B83D', teal: '#58C4B8', coral: '#FF7A59' };
+
+// ---- the camera ----------------------------------------------------------------
+const C0 = [-0.743643887037151, 0.131825904205330];
+const START = [-1.62, 0], H0 = 3.0;                         // centre and view height (complex units) at zoom 1
+const ZMAX = 1000;
+const T = { hook: 96, zoom0: 40, zoom1: 470, dive: 470, dive1: 520, julia: 520, end: 650 };
+const zoomAt = f => Math.pow(ZMAX, E.inOutCubic(prog(f, T.zoom0, T.zoom1)));
+function camAt(f, st = START) {
+  const Z = zoomAt(f), w = 1 - smooth(prog(Math.log10(Z), 0, 1.6));
+  return { Z, cx: C0[0] + (st[0] - C0[0]) * w, cy: C0[1] + (st[1] - C0[1]) * w, h: H0 / Z,
+    iter: Math.round(120 + 115 * Math.log10(Z)) };
+}
+// the Julia phase: c walks a short smooth path starting at C0
+const JP = [C0, [-0.7450, 0.1130], [-0.7600, 0.0880], [-0.7700, 0.1060], [-0.7530, 0.1270]];
+function juliaC(f) {
+  const u = E.inOutCubic(prog(f, T.julia + 10, T.end + 70)) * (JP.length - 1), k = Math.min(JP.length - 2, Math.floor(u)), r = smooth(u - k);
+  return [lerp(JP[k][0], JP[k + 1][0], r), lerp(JP[k][1], JP[k + 1][1], r)];
+}
+
+// ---- WebGL -------------------------------------------------------------------------
+const VS = `#version 300 es
+in vec2 a; out vec2 v_uv;
+void main(){ v_uv = a * 0.5 + 0.5; gl_Position = vec4(a, 0.0, 1.0); }`;
+const FS = `#version 300 es
+precision highp float;
+in vec2 v_uv; out vec4 o;
+uniform vec2 u_res; uniform vec2 u_cen; uniform float u_h; uniform int u_iter;
+uniform vec2 u_c; uniform vec2 u_joff; uniform float u_jh; uniform float u_rev; uniform float u_fade; uniform float u_mode;
+vec3 pal(float t){
+  // ink -> deep blue -> teal -> paper -> amber, cycling slowly
+  vec3 a = vec3(0.46, 0.40, 0.40), b = vec3(0.46, 0.38, 0.36), c = vec3(1.0, 1.0, 1.0), d = vec3(0.00, 0.12, 0.26);
+  return a + b * cos(6.2831853 * (c * t + d));
+}
+vec3 shade(float nu, float inside){
+  if (inside > 0.5) return vec3(0.022, 0.035, 0.07);
+  float t = log2(nu + 1.0) * 0.34;
+  vec3 col = pal(t + 0.55);
+  float edge = smoothstep(0.0, 6.0, nu);
+  return mix(vec3(0.03, 0.05, 0.10), col, edge);
+}
+// returns smooth count; inside = 1 when the orbit never left
+float iterate(vec2 z, vec2 c, int maxi, out float inside){
+  inside = 0.0;
+  for (int i = 0; i < 1200; i++) {
+    if (i >= maxi) break;
+    z = vec2(z.x * z.x - z.y * z.y, 2.0 * z.x * z.y) + c;
+    float m = dot(z, z);
+    if (m > 256.0) return float(i) + 1.0 - log2(0.5 * log2(m));
+  }
+  inside = 1.0; return 0.0;
+}
+vec3 mandel(vec2 p){
+  vec2 c = u_cen + p * u_h;
+  float q = (c.x - 0.25) * (c.x - 0.25) + c.y * c.y;         // main cardioid and period-2 bulb: inside, skip the loop
+  if (q * (q + (c.x - 0.25)) <= 0.25 * c.y * c.y || (c.x + 1.0) * (c.x + 1.0) + c.y * c.y <= 0.0625) return shade(0.0, 1.0);
+  float ins; float nu = iterate(vec2(0.0), c, u_iter, ins);
+  return shade(nu, ins);
+}
+vec3 julia(vec2 p){
+  float ins; float nu = iterate((p - u_joff) * u_jh, u_c, 360, ins);
+  return shade(nu * 0.9, ins);
+}
+vec3 colorAt(vec2 p){
+  if (u_mode < 0.5) return mandel(p);
+  float d = length(p), R = u_rev;
+  vec3 col;
+  if (d > R + 0.004) col = mandel(p);
+  else if (d < R - 0.004) col = julia(p);
+  else col = mix(julia(p), mandel(p), smoothstep(R - 0.004, R + 0.004, d));
+  return col + vec3(1.0, 0.85, 0.55) * 0.55 * exp(-pow((d - R) / 0.006, 2.0)) * step(0.001, R) * (1.0 - smoothstep(0.9, 1.1, R));
+}
+void main(){
+  vec2 p = (v_uv - 0.5) * vec2(u_res.x / u_res.y, 1.0);    // centred, height 1
+  // 2 x 2 supersampling: the boundary is infinitely fine, so one sample per pixel shimmers
+  float px = 1.0 / u_res.y;
+  vec3 col = colorAt(p + vec2(-0.25, -0.25) * px) + colorAt(p + vec2(0.25, -0.25) * px)
+           + colorAt(p + vec2(-0.25, 0.25) * px) + colorAt(p + vec2(0.25, 0.25) * px);
+  col *= 0.25;
+  vec2 dv = v_uv - 0.5; dv.x *= u_res.x / u_res.y;
+  col *= 1.0 - 0.32 * smoothstep(0.35, 1.0, length(dv));
+  o = vec4(col * u_fade, 1.0);
+}`;
+function makeFrac(w, h) {
+  const gcv = document.createElement('canvas'); gcv.width = w; gcv.height = h;
+  const gl = gcv.getContext('webgl2', { preserveDrawingBuffer: true, antialias: false, alpha: false, premultipliedAlpha: false });
+  if (!gl) return null;
+  const sh = (type, src) => { const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s)); return s; };
+  const p = gl.createProgram(); gl.attachShader(p, sh(gl.VERTEX_SHADER, VS)); gl.attachShader(p, sh(gl.FRAGMENT_SHADER, FS));
+  gl.bindAttribLocation(p, 0, 'a'); gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  const u = {}; for (const nm of ['u_res', 'u_cen', 'u_h', 'u_iter', 'u_c', 'u_joff', 'u_jh', 'u_rev', 'u_fade', 'u_mode']) u[nm] = gl.getUniformLocation(p, nm);
+  const vb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, vb);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+  return {
+    canvas: gcv,
+    /** s = { cx, cy, h, iter, c: [x, y], jh, rev, mode, fade } */
+    render(s) {
+      gl.viewport(0, 0, w, h); gl.useProgram(p);
+      gl.uniform2f(u.u_res, w, h); gl.uniform2f(u.u_cen, s.cx, s.cy); gl.uniform1f(u.u_h, s.h); gl.uniform1i(u.u_iter, s.iter);
+      gl.uniform2f(u.u_c, s.c[0], s.c[1]); gl.uniform2f(u.u_joff, s.jx || 0, 0); gl.uniform1f(u.u_jh, s.jh); gl.uniform1f(u.u_rev, s.rev);
+      gl.uniform1f(u.u_mode, s.mode); gl.uniform1f(u.u_fade, s.fade ?? 1);
+      gl.drawArrays(gl.TRIANGLES, 0, 3); gl.finish();
+    },
+  };
+}
+/** Everything the shader needs at frame f. */
+function stateAt(f, st = START) {
+  const cam = camAt(f, st);
+  const rev = E.inOutCubic(prog(f, T.dive, T.dive1)) * 1.3;
+  return { ...cam, c: f >= T.dive ? juliaC(f) : C0, jh: 3.3, jx: 0.27 * E.inOutCubic(prog(f, T.dive + 10, T.julia + 20)), rev, mode: f >= T.dive ? 1 : 0 };
+}
+function lazyFrac(slot, w, h) {                               // created on first use; null when WebGL2 is missing
+  if (!slot.tried) { slot.tried = true; try { slot.r = makeFrac(w, h); } catch (e) { slot.r = null; } }
+  return slot.r;
+}
+const FR_L = {}, FR_MAP = {};
+/** The small "map" inset: the whole set with a dot at c. */
+function drawMap(g, f, x, y, w, h, alpha) {
+  if (alpha <= 0.002) return;
+  const r = lazyFrac(FR_MAP, 360, 240);
+  g.save(); g.globalAlpha = alpha;
+  g.fillStyle = `rgba(${C.inkRGB},0.8)`; g.beginPath(); g.roundRect(x - 14, y - 58, w + 28, h + 76, 16); g.fill();
+  text(g, 'the map: where c is', x, y - 20, { size: 28, weight: 700, color: C.paper });
+  if (r) { r.render({ cx: -0.62, cy: 0, h: 2.5, iter: 90, jx: 0, c: C0, jh: 1, rev: 0, mode: 0, fade: 0.9 }); g.drawImage(r.canvas, x, y, w, h); }
+  // c, in map coordinates
+  const toX = cx => x + w / 2 + (cx + 0.62) / 2.5 * h, toY = cy => y + h / 2 - cy / 2.5 * h;
+  g.strokeStyle = 'rgba(243,238,230,0.7)'; g.lineWidth = 2; g.beginPath();
+  for (let q = T.julia; q <= f; q += 2) { const c = juliaC(q); q === T.julia ? g.moveTo(toX(c[0]), toY(c[1])) : g.lineTo(toX(c[0]), toY(c[1])); }
+  g.stroke();
+  const c = juliaC(f);
+  g.fillStyle = C.amber; g.beginPath(); g.arc(toX(c[0]), toY(c[1]), 7, 0, Math.PI * 2); g.fill();
+  g.strokeStyle = C.ink; g.lineWidth = 2.5; g.stroke();
+  g.restore();
+}
+const fmtC = c => `${c[0].toFixed(4)} ${c[1] < 0 ? '−' : '+'} ${Math.abs(c[1]).toFixed(4)}i`.replace(/^-/, '−');
+const fmtZ = Z => Z < 10 ? Z.toFixed(1) : Math.round(Z).toLocaleString('en-US');
+
+// ---- landscape picture ---------------------------------------------------------------
+function draw(f) {
+  const R = lazyFrac(FR_L, W, H);
+  if (ctx.reset) ctx.reset();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; ctx.filter = 'none'; ctx.shadowBlur = 0;
+  ctx.fillStyle = C.ink; ctx.fillRect(0, 0, W, H);
+  const s = stateAt(f);
+  if (R) { R.render(s); ctx.drawImage(R.canvas, 0, 0); }
+  const endK = E.inOutCubic(prog(f, T.end, T.end + 22)), a = 1 - endK;
+  // scrims for the type
+  let g = ctx.createLinearGradient(0, 0, 900, 0);
+  g.addColorStop(0, `rgba(${C.inkRGB},0.82)`); g.addColorStop(0.55, `rgba(${C.inkRGB},0.5)`); g.addColorStop(1, `rgba(${C.inkRGB},0)`);
+  ctx.fillStyle = g; ctx.fillRect(0, 0, 900, H);
+  g = ctx.createLinearGradient(0, 0, 0, 170); g.addColorStop(0, `rgba(${C.inkRGB},0.7)`); g.addColorStop(1, `rgba(${C.inkRGB},0)`);
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, 170);
+  if (endK > 0) { ctx.fillStyle = `rgba(${C.inkRGB},${0.72 * endK})`; ctx.fillRect(0, 0, W, H); }
+  text(ctx, 'FRACTALS  ·  ONE SHADER', 120, 104, { size: 26, weight: 600, color: C.dim, spacing: 5, alpha: a });
+  text(ctx, 'BYTEPATTERNS', 1800, 104, { size: 26, weight: 600, color: C.dim, spacing: 5, align: 'right', alpha: a });
+  // hook
+  {
+    const k = E.outExpo(prog(f, -6, 14)), k2 = E.outExpo(prog(f, 8, 26)), o = 1 - E.inCubic(prog(f, T.hook - 14, T.hook));
+    text(ctx, 'z → z² + c', 112, 430 + (1 - k) * 30, { size: 150, weight: 850, color: C.paper, spacing: -3, alpha: Math.min(k, o) });
+    text(ctx, 'One line of math.', 120, 540 + (1 - k2) * 24, { size: 60, weight: 800, color: C.amber, alpha: Math.min(k2, o) });
+    text(ctx, 'Repeat it for every pixel; count how fast it escapes.', 122, 610 + (1 - k2) * 24, { size: 36, weight: 500, color: C.dim, alpha: Math.min(k2, o) });
+  }
+  // the zoom
+  {
+    const [al, dy] = env(f, T.hook - 4, T.dive + 20, 14, 14);
+    text(ctx, 'zoom', 122, 760 + dy, { size: 30, weight: 600, color: C.dim, spacing: 3, alpha: al * a });
+    text(ctx, '×' + fmtZ(s.Z), 114, 880 + dy, { size: 128, weight: 800, fam: MONO, color: C.amber, spacing: -4, alpha: al * a });
+    text(ctx, `up to ${s.iter} steps per pixel`, 122, 944 + dy, { size: 34, weight: 600, fam: MONO, color: C.paper, alpha: al * a });
+    const [a2, d2] = env(f, T.hook + 20, T.dive + 20, 14, 14);
+    text(ctx, 'toward', 122, 300 + d2, { size: 30, weight: 600, color: C.dim, spacing: 3, alpha: a2 * a });
+    text(ctx, 'c = ' + fmtC(C0), 120, 356 + d2, { size: 42, weight: 700, fam: MONO, color: C.paper, alpha: a2 * a });
+    text(ctx, '“seahorse valley”', 122, 410 + d2, { size: 34, weight: 500, color: C.dim, alpha: a2 * a });
+    // a thin crosshair on the target
+    const ck = a2 * a * (1 - prog(f, T.zoom1 - 40, T.zoom1)) * 0.8;
+    if (ck > 0.01) {
+      const px = W / 2 + (C0[0] - s.cx) / s.h * H, py = H / 2 - (C0[1] - s.cy) / s.h * H;
+      ctx.save(); ctx.globalAlpha = ck; ctx.strokeStyle = C.paper; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(px, py, 26, 0, Math.PI * 2); ctx.moveTo(px - 44, py); ctx.lineTo(px - 32, py); ctx.moveTo(px + 32, py); ctx.lineTo(px + 44, py);
+      ctx.moveTo(px, py - 44); ctx.lineTo(px, py - 32); ctx.moveTo(px, py + 32); ctx.lineTo(px, py + 44); ctx.stroke(); ctx.restore();
+    }
+  }
+  // the Julia set
+  {
+    const [al, dy] = env(f, T.dive + 4, T.end + 4, 14, 12);
+    text(ctx, 'Now fix c', 116, 330 + dy, { size: 96, weight: 850, color: C.paper, spacing: -2, alpha: al * a });
+    text(ctx, 'and start z at the pixel.', 116, 428 + dy, { size: 60, weight: 800, color: C.amber, spacing: -1, alpha: al * a });
+    const [a2, d2] = env(f, T.julia + 16, T.end + 4, 14, 12);
+    text(ctx, 'Every point on the map', 122, 540 + d2, { size: 40, weight: 600, color: C.paper, alpha: a2 * a });
+    text(ctx, 'is a whole Julia set of its own.', 122, 592 + d2, { size: 40, weight: 600, color: C.paper, alpha: a2 * a });
+    text(ctx, 'c = ' + fmtC(s.c), 120, 690 + d2, { size: 40, weight: 700, fam: MONO, color: C.teal, alpha: a2 * a });
+    drawMap(ctx, f, 122, 790, 330, 220, E.outCubic(prog(f, T.julia + 24, T.julia + 40)) * a);
+  }
+  if (endK > 0) {
+    const k1 = E.outCubic(prog(f, T.end + 6, T.end + 30)), k2 = E.outCubic(prog(f, T.end + 18, T.end + 42)), k3 = E.outCubic(prog(f, T.end + 30, T.end + 54));
+    text(ctx, 'The Mandelbrot Map', W / 2, 500 + (1 - k1) * 30, { size: 136, weight: 850, color: C.paper, spacing: -3, align: 'center', alpha: k1 });
+    text(ctx, 'z → z² + c  ·  zoom ×1,000  ·  one fragment shader', W / 2, 580 + (1 - k2) * 20, { size: 42, weight: 500, color: C.amber, align: 'center', alpha: k2 });
+    text(ctx, 'bytepatterns · motion lab', W / 2, 1000, { size: 32, weight: 600, color: C.paper, spacing: 3, align: 'center', alpha: k3 * 0.8 });
+  }
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.letterSpacing = '0px';
+}
+
+// ---- sound: a drone that opens with the zoom, a bell per power of ten, a pad for the Julia set ----
+async function renderAudio() {
+  const SR = 48000, dur = FRAMES / FPS, LEN = Math.round(SR * dur);
+  const ac = new OfflineAudioContext(2, LEN, SR);
+  const comp = ac.createDynamicsCompressor();
+  comp.threshold.value = -16; comp.ratio.value = 3; comp.attack.value = 0.01; comp.release.value = 0.25;
+  const master = ac.createGain(); master.gain.value = 0.95; master.connect(comp).connect(ac.destination);
+  master.gain.setValueAtTime(0.95, dur - 0.8); master.gain.linearRampToValueAtTime(0.0001, dur - 0.02);
+  const rnd = mulberry32(0x17F2AC);
+  const ir = ac.createBuffer(2, SR * 3.2, SR);
+  for (let c = 0; c < 2; c++) { const d = ir.getChannelData(c); for (let k = 0; k < d.length; k++) d[k] = (rnd() * 2 - 1) * Math.pow(1 - k / d.length, 3.0); }
+  const verb = ac.createConvolver(); verb.buffer = ir; const vg = ac.createGain(); vg.gain.value = 0.45; verb.connect(vg).connect(master);
+  const hz = m => 440 * Math.pow(2, (m - 69) / 12);
+  const curve = fn => { const c = new Float32Array(FRAMES); for (let f = 0; f < FRAMES; f++) c[f] = fn(f); return c; };
+  // drone: a low fifth through a low-pass that opens as the zoom deepens
+  const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.Q.value = 2;
+  lp.frequency.setValueCurveAtTime(curve(f => 220 + 2600 * Math.pow(Math.log10(zoomAt(f)) / 3, 1.4) * (1 - 0.6 * prog(f, T.dive, T.dive1))), 0, dur);
+  const bus = ac.createGain(); bus.connect(lp); lp.connect(master); lp.connect(verb);
+  const chords = [[0, 480, [33, 40, 45, 52, 57]], [460, FRAMES, [36, 43, 48, 52, 55, 62]]];
+  for (const [fa, fb, notes] of chords) {
+    const a = fa / FPS, b = Math.min(dur, fb / FPS);
+    for (const m of notes) for (const det of [-7, 6]) {
+      const o = ac.createOscillator(); o.type = 'sawtooth'; o.frequency.value = hz(m); o.detune.value = det;
+      const g = ac.createGain(); g.gain.setValueAtTime(0, a); g.gain.linearRampToValueAtTime(0.03, a + (fa === 0 ? 0.08 : 1.2));
+      g.gain.setValueAtTime(0.03, Math.max(a + 1.2, b - 0.8)); g.gain.linearRampToValueAtTime(0, b);
+      o.connect(g).connect(bus); o.start(a); o.stop(b + 0.05);
+    }
+  }
+  const bell = (at, m, amp, pan) => { for (const [ratio, a2, dec] of [[1, 1, 2.6], [2.76, 0.35, 1.1], [5.4, 0.1, 0.5]]) {
+    const o = ac.createOscillator(); o.frequency.value = hz(m) * ratio; const g = ac.createGain(), p = ac.createStereoPanner();
+    g.gain.setValueAtTime(0.0001, at); g.gain.exponentialRampToValueAtTime(amp * a2, at + 0.006); g.gain.exponentialRampToValueAtTime(0.0001, at + dec);
+    p.pan.value = pan; o.connect(g).connect(p); p.connect(master); p.connect(verb); o.start(at); o.stop(at + dec + 0.05); } };
+  const swell = (at, m, len, amp = 0.3) => { const o = ac.createOscillator(), g = ac.createGain(); o.type = 'sine'; o.frequency.value = hz(m);
+    g.gain.setValueAtTime(0.0001, at); g.gain.exponentialRampToValueAtTime(amp, at + len * 0.6); g.gain.exponentialRampToValueAtTime(0.0001, at + len);
+    o.connect(g).connect(master); o.start(at); o.stop(at + len + 0.05); };
+  swell(0, 21, 2.4); bell(0.05, 69, 0.1, 0);
+  // a bell each time the zoom passes 10x, 100x, 1000x (found from the same curve the picture uses)
+  let dec = 1;
+  for (let f = 1; f < FRAMES; f++) { const Z = zoomAt(f); if (Z >= Math.pow(10, dec) - 1e-6 && dec <= 3) { bell(f / FPS, [76, 81, 86][dec - 1], 0.1, -0.4 + dec * 0.25); dec++; } }
+  // shimmer: sparse high sine grains, denser as it zooms
+  for (let f = 0; f < T.dive; f += 2) {
+    const d = Math.log10(zoomAt(f)) / 3;
+    if (rnd() < 0.1 + 0.5 * d) {
+      const at = f / FPS + rnd() * 0.06, o = ac.createOscillator(), g = ac.createGain(), p = ac.createStereoPanner();
+      o.frequency.value = hz(76 + [0, 3, 7, 10, 12, 15][Math.floor(rnd() * 6)]); p.pan.value = rnd() * 1.6 - 0.8;
+      g.gain.setValueAtTime(0.0001, at); g.gain.exponentialRampToValueAtTime(0.02 + 0.03 * d, at + 0.01); g.gain.exponentialRampToValueAtTime(0.0001, at + 0.35);
+      o.connect(g).connect(p); p.connect(verb); p.connect(master); o.start(at); o.stop(at + 0.4);
+    }
+  }
+  // the dive: a low swell and a rising chord
+  swell(T.dive / FPS, 24, 2.2, 0.34);
+  [67, 72, 76, 79].forEach((m, i) => bell(T.dive1 / FPS - 0.6 + i * 0.16, m, 0.08, -0.45 + i * 0.3));
+  // Julia: a slow arpeggio whose pitch follows c
+  for (let f = T.julia + 12, i = 0; f < T.end + 30; f += 15, i++) {
+    const c = juliaC(f), m = 64 + Math.round((c[1] - 0.08) * 120) + [0, 7, 12, 7][i % 4];
+    bell(f / FPS, m, 0.05, Math.sin(i) * 0.5);
+  }
+  [69, 72, 76, 81].forEach((m, i) => bell((T.end + 8 + i * 6) / FPS, m, 0.09, -0.45 + i * 0.3));
+
+  const buf = await ac.startRendering();
+  let peak = 0; for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let k = 0; k < d.length; k++) peak = Math.max(peak, Math.abs(d[k])); }
+  if (peak > 0.89) for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let k = 0; k < d.length; k++) d[k] *= 0.89 / peak; }
+  return buf;
+}
+
+/* ==========================================================================
+   VERTICAL CUT — shared block, identical in every piece.
+   1080x1920 for Reels, Shorts and TikTok (__motion.variants.vertical). The
+   piece's own scene code is re-used and recomposed for a phone: everything a
+   viewer must read stays inside the area no platform covers (x 60..900,
+   y 230..1400); outside it there is only dimmed texture.
+   ========================================================================== */
+const VW = 1080, VH = 1920, SAFE = { x: 60, y: 230, w: 840, h: 1170, r: 900, b: 1400 };
+const vcv = document.createElement('canvas'); vcv.width = VW; vcv.height = VH;
+const vx = vcv.getContext('2d', { willReadFrequently: true });   // CPU raster: identical pixels on every redraw
+const VL = 96, VR = 864;                                          // text column inside the safe area
+
+function vReset() {
+  vx.setTransform(1, 0, 0, 1, 0, 0); vx.globalAlpha = 1; vx.globalCompositeOperation = 'source-over';
+  vx.filter = 'none'; vx.shadowBlur = 0; vx.shadowColor = 'transparent'; vx.letterSpacing = '0px'; vx.setLineDash([]);
+  vx.textAlign = 'left'; vx.textBaseline = 'alphabetic'; vx.lineCap = 'butt'; vx.lineJoin = 'miter';
+}
+/** Canvas text on the vertical frame; `max` shrinks the size until the line fits. */
+function vText(str, x, y, { size = 40, weight = 700, color = '#FFFFFF', align = 'left', spacing = 0, alpha = 1, fam = FONT, max = 0 } = {}) {
+  if (alpha <= 0.002 || !str) return size;
+  vx.font = `${weight} ${size}px ${fam}`; vx.letterSpacing = spacing + 'px';
+  if (max) { const w = vx.measureText(str).width; if (w > max) { size = size * max / w; vx.font = `${weight} ${size}px ${fam}`; } }
+  vx.textAlign = align; vx.textBaseline = 'alphabetic';
+  const a0 = vx.globalAlpha; vx.globalAlpha = a0 * alpha; vx.fillStyle = color;
+  vx.fillText(str, x + (align === 'center' ? spacing / 2 : align === 'right' ? spacing : 0), y);   // tracking is added after the last glyph too
+  vx.globalAlpha = a0; vx.letterSpacing = '0px';
+  return size;
+}
+/** Word-wraps with the given font; returns the lines. */
+function vWrap(str, maxW, size, weight = 700, fam = FONT) {
+  vx.font = `${weight} ${size}px ${fam}`; vx.letterSpacing = '0px';
+  const words = str.split(' '), lines = []; let cur = '';
+  for (const w of words) { const t = cur ? cur + ' ' + w : w; if (vx.measureText(t).width > maxW && cur) { lines.push(cur); cur = w; } else cur = t; }
+  if (cur) lines.push(cur);
+  return lines;
+}
+/** Fade envelope with a small rise: [alpha, dy]. */
+function vEnv(v, a, b, fin = 8, fout = 8) {
+  const i = E.outCubic(prog(v, a, a + fin)), o = 1 - E.inCubic(prog(v, b - fout, b));
+  return [Math.min(i, o), (1 - i) * 22 - (1 - o) * 10];
+}
+/** Which segment of a cut list a vertical frame is in: segs = [{ at, src, len }] in frames. */
+function vSeg(segs, v) {
+  let k = 0; while (k < segs.length - 1 && v >= segs[k + 1].at) k++;
+  const s = segs[k];
+  return { k, s, local: v - s.at, src: s.src + (v - s.at) };
+}
+/** Dims everything outside the safe area to a quiet texture (brightness x 0.2), with a soft inner edge. */
+function vShade(rgb, a = 0.8, feather = 40) {
+  vx.save(); vx.setTransform(1, 0, 0, 1, 0, 0); vx.globalAlpha = 1; vx.globalCompositeOperation = 'source-over';
+  vx.fillStyle = `rgba(${rgb},${a})`;
+  vx.beginPath(); vx.rect(0, 0, VW, VH); vx.rect(SAFE.x, SAFE.y, SAFE.w, SAFE.h); vx.fill('evenodd');
+  const strip = (x0, y0, x1, y1, rx, ry, rw, rh) => {
+    const g = vx.createLinearGradient(x0, y0, x1, y1);
+    g.addColorStop(0, `rgba(${rgb},${a})`); g.addColorStop(1, `rgba(${rgb},0)`);
+    vx.fillStyle = g; vx.fillRect(rx, ry, rw, rh);
+  };
+  strip(SAFE.x, 0, SAFE.x + feather, 0, SAFE.x, SAFE.y, feather, SAFE.h);
+  strip(SAFE.r, 0, SAFE.r - feather, 0, SAFE.r - feather, SAFE.y, feather, SAFE.h);
+  strip(0, SAFE.y, 0, SAFE.y + feather, SAFE.x, SAFE.y, SAFE.w, feather);
+  strip(0, SAFE.b, 0, SAFE.b - feather, SAFE.x, SAFE.b - feather, SAFE.w, feather);
+  vx.restore();
+}
+/** Series tag at the top of the safe area, e.g. MADE IN CODE · 04. */
+function vTag(label, color, alpha = 1) {
+  vText('MADE IN CODE', VL, 292, { size: 28, weight: 800, color, spacing: 5, alpha });
+  vx.font = `800 28px ${FONT}`; vx.letterSpacing = '5px';
+  const w = vx.measureText('MADE IN CODE').width; vx.letterSpacing = '0px';
+  vText('·  ' + label, VL + w + 14, 292, { size: 28, weight: 600, color: 'rgba(255,255,255,0.72)', spacing: 3, alpha, max: VR - VL - w - 14 });
+}
+/** Big hook lines, left-aligned from y0; visible from frame 0, settles in a few frames. */
+function vHook(v, lines, y0, { size = 84, lh = 1.08, color = '#FFFFFF', accent = null, weight = 800, spacing = -1.5, alpha = 1 } = {}) {
+  const k = E.outExpo(prog(v, -6, 12));
+  lines.forEach((ln, i) => {
+    const kk = E.outExpo(prog(v, -12 + i * 2, 8 + i * 2));
+    vText(ln, VL, y0 + i * size * lh + (1 - kk) * 30, { size, weight, spacing, color: accent && i === lines.length - 1 ? accent : color, alpha: alpha * Math.max(0.25, kk), max: VR - VL });
+  });
+  return k;
+}
+/** Closing card, the last 60 frames: piece title, "drawn in code · bytepatterns.com". l = frames into the card. */
+function vEndCard(l, { title, line = '', ink = '#FFFFFF', dim = 'rgba(255,255,255,0.66)', accent = '#FFFFFF', scrim = '0,0,0', a = 0.84 }) {
+  const k = E.outCubic(prog(l, 0, 12));
+  vx.save(); vx.setTransform(1, 0, 0, 1, 0, 0);
+  vx.fillStyle = `rgba(${scrim},${a * k})`; vx.fillRect(0, 0, VW, VH);
+  vx.restore();
+  const t1 = E.outExpo(prog(l, 3, 19)), t2 = E.outExpo(prog(l, 11, 27)), t3 = E.outExpo(prog(l, 19, 35));
+  vx.fillStyle = accent; vx.globalAlpha = t1; vx.fillRect(VL, 742, 88 * t1, 7); vx.globalAlpha = 1;
+  const size = vText(title, VL, 850 + (1 - t1) * 40, { size: 92, weight: 800, color: ink, spacing: -2, alpha: t1, max: VR - VL });
+  const y2 = 850 + Math.max(size, 60) * 0.25 + 70;
+  vx.font = `600 44px ${FONT}`;
+  const lead = 'drawn in code  ·  ', lw = vx.measureText(lead).width;
+  vText(lead, VL, y2 + (1 - t2) * 24, { size: 44, weight: 600, color: dim, alpha: t2 });
+  vText('bytepatterns.com', VL + lw, y2 + (1 - t2) * 24, { size: 44, weight: 800, color: accent, alpha: t2 });
+  if (line) vText(line, VL, y2 + 72 + (1 - t3) * 18, { size: 32, weight: 500, color: dim, alpha: t3, max: VR - VL });
+}
+/** Seeks a cut. The first frame a page draws is drawn twice: the very first read of a
+ *  GPU-backed source canvas can come out a shade different from every later one. */
+let vWarm = false;
+function vSeek(draw, i, frames) {
+  const f = Math.max(0, Math.min(frames - 1, Math.floor(i)));
+  if (!vWarm) { vWarm = true; draw(f); }
+  draw(f);
+}
+/** The soundtrack of a cut: the piece's own audio() spliced to the same segments as the picture. */
+async function vAudio(segs, frames, { xf = 0.025, fadeOut = 0.6, extra = null } = {}) {
+  const src = await renderAudio();
+  const SR = 48000, dur = frames / FPS, ac = new OfflineAudioContext(2, Math.round(SR * dur), SR);
+  const out = ac.createGain(); out.connect(ac.destination);
+  out.gain.setValueAtTime(1, 0); out.gain.setValueAtTime(1, dur - fadeOut); out.gain.linearRampToValueAtTime(0, dur - 0.01);
+  segs.forEach((s, k) => {
+    const at = s.at / FPS, off = s.src / FPS, d = s.len / FPS;
+    const pre = k === 0 ? 0 : Math.min(xf, off), post = k === segs.length - 1 ? 0 : xf;
+    const b = ac.createBufferSource(), g = ac.createGain(); b.buffer = src;
+    g.gain.setValueAtTime(pre ? 0 : 1, at - pre);
+    if (pre) g.gain.linearRampToValueAtTime(1, at + pre);
+    if (post) { g.gain.setValueAtTime(1, at + d - post); g.gain.linearRampToValueAtTime(0, at + d + post); }
+    b.connect(g).connect(out); b.start(at - pre, off - pre, d + pre + post);
+  });
+  if (extra) extra(ac, out);
+  const buf = await ac.startRendering();
+  let peak = 0; for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) peak = Math.max(peak, Math.abs(d[i])); }
+  if (peak > 0.9) for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) d[i] *= 0.9 / peak; }
+  return buf;
+}
+/** A soft three-partial bell, for the closing card. */
+function vChime(ac, dest, at, freq, vol = 0.08) {
+  for (const [mul, v, dec] of [[1, 1, 1.8], [2.01, 0.35, 0.8], [3.02, 0.12, 0.4]]) {
+    const o = ac.createOscillator(), g = ac.createGain(); o.type = 'sine'; o.frequency.value = freq * mul;
+    g.gain.setValueAtTime(0.0001, at); g.gain.exponentialRampToValueAtTime(vol * v, at + 0.006); g.gain.exponentialRampToValueAtTime(0.0001, at + dec);
+    o.connect(g).connect(dest); o.start(at); o.stop(at + dec + 0.05);
+  }
+}
+
+/* VERTICAL CUT — this piece */
+// The shader renders straight into a portrait window the size of the safe
+// area, so nothing is cropped from a bitmap; the zoom is cut in two.
+const VSEG = [
+  { at: 0, src: 0, len: 60 },                                // hook
+  { at: 60, src: 100, len: 130 },                            // zoom to ~x10
+  { at: 190, src: 330, len: 130 },                           // zoom to x1000
+  { at: 320, src: T.dive - 6, len: 160 },                    // the Julia set
+  { at: 480, src: T.end, len: 60 },                          // closing card
+];
+const VFR = 540, VEND = VFR - 60;
+const VWIN = { x: SAFE.x, y: SAFE.y, w: SAFE.w, h: SAFE.h };
+const FR_V = {};
+function vDraw(v) {
+  const { k: seg, src } = vSeg(VSEG, v), f = Math.min(FRAMES - 1, src);
+  const R = lazyFrac(FR_V, VWIN.w, VWIN.h);
+  vReset();
+  vx.fillStyle = C.ink; vx.fillRect(0, 0, VW, VH);
+  const s = stateAt(f, [-0.7, 0]);
+  vx.save(); vx.beginPath(); vx.roundRect(VWIN.x, VWIN.y, VWIN.w, VWIN.h, 26); vx.clip();
+  if (R) { R.render({ ...s, h: s.h * 1.2, jh: 4.0, jx: 0 }); vx.drawImage(R.canvas, VWIN.x, VWIN.y); }
+  vx.restore();
+  let g = vx.createLinearGradient(0, SAFE.y, 0, 760);
+  g.addColorStop(0, `rgba(${C.inkRGB},0.9)`); g.addColorStop(0.7, `rgba(${C.inkRGB},0.6)`); g.addColorStop(1, `rgba(${C.inkRGB},0)`);
+  vx.fillStyle = g; vx.fillRect(SAFE.x, SAFE.y, SAFE.w, 760 - SAFE.y);
+  g = vx.createLinearGradient(0, 1080, 0, SAFE.b);
+  g.addColorStop(0, `rgba(${C.inkRGB},0)`); g.addColorStop(1, `rgba(${C.inkRGB},0.9)`);
+  vx.fillStyle = g; vx.fillRect(SAFE.x, 1080, SAFE.w, SAFE.b - 1080);
+  vShade(C.inkRGB);
+  vTag('ONE SHADER', C.amber);
+  if (seg === 0) {
+    const o = 1 - E.inCubic(prog(v, 50, 60));
+    vHook(v, ['z → z² + c'], 440, { size: 120, color: C.paper, weight: 850, alpha: o });
+    vText('One line of math.', VL, 540, { size: 60, weight: 800, color: C.amber, alpha: o });
+    vText('Every pixel, repeated.', VL, 604, { size: 40, weight: 500, color: C.dim, alpha: o * E.outCubic(prog(v, 10, 24)) });
+  } else if (seg <= 2) {
+    const [al, dy] = vEnv(v, 60, 320, 10, 8);
+    vText('toward c = ' + fmtC(C0), VL, 400 + dy, { size: 34, weight: 700, fam: MONO, color: C.paper, alpha: al, max: VR - VL });
+    vText('zoom', VL, 1236 + dy, { size: 30, weight: 600, color: C.dim, spacing: 3, alpha: al });
+    vText('×' + fmtZ(s.Z), VL - 6, 1350 + dy, { size: 116, weight: 800, fam: MONO, color: C.amber, spacing: -3, alpha: al });
+  } else {
+    const [al, dy] = vEnv(v, 322, VEND + 4, 10, 8);
+    vText('Now fix c.', VL, 420 + dy, { size: 84, weight: 850, color: C.paper, spacing: -2, alpha: al });
+    vText('Every point is its own fractal.', VL, 490 + dy, { size: 40, weight: 600, color: C.amber, alpha: al, max: VR - VL });
+    vText('c = ' + fmtC(s.c), VL, 1350 + dy, { size: 40, weight: 700, fam: MONO, color: C.teal, alpha: al, max: VR - VL });
+  }
+  if (v >= VEND) vEndCard(v - VEND, { title: 'The Mandelbrot Map', line: 'z → z² + c · zoom ×1,000 · one shader',
+    ink: C.paper, dim: 'rgba(243,238,230,0.72)', accent: C.amber, scrim: C.inkRGB, a: 0.8 });
+  vReset();
+}
+
+window.__motion = {
+  title: 'The Mandelbrot Map',
+  description: 'A WebGL shader zooms a thousand times into the Mandelbrot set, then opens the Julia set that lives at the point it zoomed into.',
+  fps: FPS, width: W, height: H, frames: FRAMES,
+  poster: 400,
+  gifStart: 17,
+  seek(i) { draw(Math.max(0, Math.min(FRAMES - 1, Math.floor(i)))); },
+  audio: renderAudio,
+  variants: {
+    vertical: {
+      width: VW, height: VH, frames: VFR, canvas: vcv,
+      poster: 280, gifStart: 8,
+      seek(i) { vSeek(vDraw, i, VFR); },
+      audio: () => vAudio(VSEG, VFR),
+    },
+  },
+};
+
+/* ==========================================================================
+   PLAYER — identical in every piece; keep as is.
+   Autoplays and loops, starts sound on the first click, ?frame=N pauses on a
+   frame, ?variant=vertical plays the vertical cut (if the piece has one).
+   When the renderer sets window.__MOTION_RENDER__ it stays out of the way.
+   ========================================================================== */
+(function player() {
+  const btn = document.getElementById('sound'), q = new URLSearchParams(location.search);
+  let M = window.__motion;
+  const V = !window.__MOTION_RENDER__ && M.variants && M.variants[q.get('variant')];
+  if (V) {                                                // show the variant's own canvas instead
+    M = Object.assign({}, M, V);
+    V.canvas.style.cssText = `width:min(100vw,calc(100vh*${V.width}/${V.height}));height:auto;aspect-ratio:${V.width}/${V.height}`;
+    document.querySelector('canvas').replaceWith(V.canvas);
+  }
+  const dur = M.frames / M.fps;
+  if (window.__MOTION_RENDER__) { btn.hidden = true; M.seek(0); return; }
+  if (q.has('frame')) { btn.hidden = true; M.seek(+q.get('frame') || 0); return; }
+  let t0 = performance.now(), ac = null, src = null, buf = null, paused = false, pausedAt = 0;
+  const clock = () => ac && src ? (ac.currentTime - t0) : (performance.now() - t0) / 1000;
+  function loop() {
+    if (!paused) M.seek(Math.floor(((clock() % dur) + dur) % dur * M.fps));
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+  btn.addEventListener('click', async () => {
+    if (src) { src.stop(); src = null; btn.textContent = 'Click for sound'; t0 = performance.now(); return; }
+    btn.textContent = 'Loading sound…';
+    ac = ac || new AudioContext({ sampleRate: 48000 });
+    buf = buf || await M.audio();
+    await ac.resume();
+    src = ac.createBufferSource(); src.buffer = buf; src.loop = true; src.connect(ac.destination);
+    t0 = ac.currentTime + 0.05; src.start(t0);        // picture restarts from frame 0 in sync with the sound
+    btn.textContent = 'Sound on — click to mute';
+  });
+  addEventListener('keydown', e => {
+    if (e.code !== 'Space') return;
+    e.preventDefault(); paused = !paused;
+    if (ac) paused ? ac.suspend() : ac.resume();
+    if (!ac) { if (paused) pausedAt = performance.now(); else t0 += performance.now() - pausedAt; }
+  });
+})();
+</script>
+</body>
+</html>

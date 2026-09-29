@@ -206,6 +206,71 @@ Click a preview to open the piece live in your browser (click once more there fo
 <br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/15-verlet-flag/?variant=vertical">open</a> · <a href="out/15-verlet-flag.vertical.png">still</a></sub>
 </td>
 </tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/16-hash-table/"><img src="out/16-hash-table.gif" width="100%" alt="Where Keys Go — animated preview"></a>
+<br><b>16 · Where Keys Go</b> <sub>24 s</sub>
+<br>Twelve keys run through a real FNV-1a hash into eight buckets; 5 collisions grow chains, the table doubles to sixteen and every key rehashes by one more bit.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/16-hash-table/">open in browser</a> · <a href="out/16-hash-table.png">still</a> · <a href="projects/16-hash-table/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/16-hash-table/?variant=vertical"><img src="out/16-hash-table.vertical.gif" width="100%" alt="Where Keys Go — vertical cut, animated preview"></a>
+<br><sub>9:16 · 18 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/16-hash-table/?variant=vertical">open</a> · <a href="out/16-hash-table.vertical.png">still</a></sub>
+</td>
+</tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/17-mandelbrot-map/"><img src="out/17-mandelbrot-map.gif" width="100%" alt="The Mandelbrot Map — animated preview"></a>
+<br><b>17 · The Mandelbrot Map</b> <sub>24 s</sub>
+<br>A WebGL shader zooms a thousand times into the Mandelbrot set, then opens the Julia set that lives at the point it zoomed into.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/17-mandelbrot-map/">open in browser</a> · <a href="out/17-mandelbrot-map.png">still</a> · <a href="projects/17-mandelbrot-map/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/17-mandelbrot-map/?variant=vertical"><img src="out/17-mandelbrot-map.vertical.gif" width="100%" alt="The Mandelbrot Map — vertical cut, animated preview"></a>
+<br><sub>9:16 · 18 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/17-mandelbrot-map/?variant=vertical">open</a> · <a href="out/17-mandelbrot-map.vertical.png">still</a></sub>
+</td>
+</tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/18-big-o/"><img src="out/18-big-o.gif" width="100%" alt="Big-O in 20 Seconds — animated preview"></a>
+<br><b>18 · Big-O in 20 Seconds</b> <sub>23 s</sub>
+<br>Kinetic type against a twenty-second clock: O(1), O(log n), O(n), O(n log n) and O(n²) each count their own steps, then n grows to a million.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/18-big-o/">open in browser</a> · <a href="out/18-big-o.png">still</a> · <a href="projects/18-big-o/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/18-big-o/?variant=vertical"><img src="out/18-big-o.vertical.gif" width="100%" alt="Big-O in 20 Seconds — vertical cut, animated preview"></a>
+<br><sub>9:16 · 18 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/18-big-o/?variant=vertical">open</a> · <a href="out/18-big-o.vertical.png">still</a></sub>
+</td>
+</tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/19-312-lessons/"><img src="out/19-312-lessons.gif" width="100%" alt="312 Lessons — animated preview"></a>
+<br><b>19 · 312 Lessons</b> <sub>20 s</sub>
+<br>Exactly 312 dots, one for every BytePatterns lesson, fly in and settle into the number 312, then sort themselves into the 30 modules they belong to.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/19-312-lessons/">open in browser</a> · <a href="out/19-312-lessons.png">still</a> · <a href="projects/19-312-lessons/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/19-312-lessons/?variant=vertical"><img src="out/19-312-lessons.vertical.gif" width="100%" alt="312 Lessons — vertical cut, animated preview"></a>
+<br><sub>9:16 · 18 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/19-312-lessons/?variant=vertical">open</a> · <a href="out/19-312-lessons.vertical.png">still</a></sub>
+</td>
+</tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/20-domino-chain/"><img src="out/20-domino-chain.gif" width="100%" alt="Chain Reaction — animated preview"></a>
+<br><b>20 · Chain Reaction</b> <sub>24 s</sub>
+<br>One hundred dominoes, each 3% taller than the one before, topple in a chain until the last one is 18.7 times the height of the first.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/20-domino-chain/">open in browser</a> · <a href="out/20-domino-chain.png">still</a> · <a href="projects/20-domino-chain/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/20-domino-chain/?variant=vertical"><img src="out/20-domino-chain.vertical.gif" width="100%" alt="Chain Reaction — vertical cut, animated preview"></a>
+<br><sub>9:16 · 18 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/20-domino-chain/?variant=vertical">open</a> · <a href="out/20-domino-chain.vertical.png">still</a></sub>
+</td>
+</tr>
 </table>
 <!-- gallery:end -->
 
