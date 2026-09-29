@@ -28,7 +28,7 @@ Click a preview to open the piece live in your browser (click once more there fo
 <td width="72%" valign="top">
 <a href="https://bytepatterns.github.io/motion-lab/projects/02-product-launch/"><img src="out/02-product-launch.gif" width="100%" alt="BytePatterns Launch Film — animated preview"></a>
 <br><b>02 · BytePatterns Launch Film</b> <sub>24 s</sub>
-<br>A 24-second launch film: a paragraph turns into sorted bars, product cards play their own lessons, and 300 tiles light up.
+<br>A 24-second launch film: a paragraph turns into sorted bars, product cards play their own lessons, and 312 tiles light up.
 <br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/02-product-launch/">open in browser</a> · <a href="out/02-product-launch.png">still</a> · <a href="projects/02-product-launch/index.html">source</a></sub>
 </td>
 <td width="28%" valign="top">
