@@ -15,7 +15,7 @@
 </style>
 </head>
 <body>
-<canvas id="stage" width="1920" height="1080" aria-label="A 24-second launch film for BytePatterns, 312 free animated lessons"></canvas>
+<canvas id="stage" width="1920" height="1080" aria-label="A 24-second launch film for BytePatterns, 324 free animated lessons"></canvas>
 <button id="sound" type="button">Click for sound</button>
 <script>
 'use strict';
@@ -24,9 +24,9 @@
    0    "Stop reading."  a paragraph turns into bars, the bars sort themselves
    108  wordmark         the sorted bars become the underline of "BytePatterns"
    216  product          lesson card, animation card, quiz card slide in and play
-   468  proof            312 tiles light up as the counter reaches 312
+   468  proof            324 tiles light up as the counter reaches 324
    612  end card         tagline + bytepatterns.com
-   Every claim is true of the live site: 312 lessons, 30 modules, free, no account.
+   Every claim is true of the live site: 324 lessons, 31 modules, free, no account.
    ========================================================================== */
 const W = 1920, H = 1080, FPS = 30, FRAMES = 720, BEAT = 18, BAR = 72;
 const cv = document.getElementById('stage');
@@ -399,9 +399,9 @@ function sceneProduct(f) {
   cardShell(2, f, quizCard);
 }
 
-// ---- 468  proof: 312 ----------------------------------------------------
-const LESSONS = 312, MODULES = 30;                               // the live site's numbers
-const COLS = 24, ROWS = 13, TILE = 24, TGAP = 6;                 // COLS * ROWS === LESSONS
+// ---- 468  proof: 324 ----------------------------------------------------
+const LESSONS = 324, MODULES = 31;                               // the live site's numbers
+const COLS = 27, ROWS = 12, TILE = 22, TGAP = 5;                 // COLS * ROWS === LESSONS
 function sceneProof(f) {
   header(f, 1);
   const l = f - 468;
@@ -423,14 +423,14 @@ function sceneProof(f) {
   ctx.fillText(MODULES + ' modules  ·  no account needed', 150 + (1 - t3) * 40, 740);
   ctx.globalAlpha = 1 - leave;
   // tiles
-  const gx = 1058, gy = 349;                                     // same right edge and centre line as the old 20x15 grid
+  const gx = 1048, gy = 381;                                     // right edge 1772, centre line 541, as the earlier grids
   for (let i = 0; i < LESSONS; i++) {
     const c = i % COLS, r = Math.floor(i / COLS);
     const x = gx + c * (TILE + TGAP), y = gy + r * (TILE + TGAP);
     const appear = E.outCubic(prog(l, 2 + (c + r) * 0.5, 14 + (c + r) * 0.5));
     if (appear <= 0) continue;
     const lit = i < count;
-    const fresh = lit && i >= count - 24 && l < 78;
+    const fresh = lit && i >= count - COLS && l < 78;
     const s = TILE * (0.6 + 0.4 * appear);
     ctx.globalAlpha = (1 - leave) * appear;
     if (lit) { ctx.fillStyle = fresh ? BP.primary : BP.secondary; rr(x + (TILE - s) / 2, y + (TILE - s) / 2, s, s, 6); ctx.fill(); }
@@ -599,7 +599,7 @@ async function renderAudio() {
   tick(T(282 + QUIZ_CLICK), 3000, 1.2);
   blip(T(282 + QUIZ_CLICK + 2), 698.46, 1, 0.5); blip(T(282 + QUIZ_CLICK + 6), 1046.5, 1, 0.5, 0.4);
   whoosh(T(436), T(26), 3000, 300, 0.9);
-  // 468: the count to 312
+  // 468: the count to 324
   for (let fr = 478; fr < 544; fr += 2) {
     const c = E.inOutCubic(prog(fr, 478, 544));
     tick(T(fr), 1800 + c * 2400, 0.35 + 0.3 * c);
@@ -747,14 +747,14 @@ function vChime(ac, dest, at, freq, vol = 0.08) {
 
 /* VERTICAL CUT — this piece */
 // "Stop reading." -> the three product cards one at a time, full width, like a
-// phone carousel -> 312 tiles -> closing card. The cards are the landscape card
+// phone carousel -> 324 tiles -> closing card. The cards are the landscape card
 // code drawn through a scale, so every lesson still plays for real.
 const VSEG = [
   { at: 0, src: 0, len: 100 },                          // paragraph -> bars -> sorted
   { at: 100, src: 262, len: 95 },                       // lesson card, bubble sort running (card time 40..135)
   { at: 195, src: 292, len: 95 },                       // animation card, binary search (40..135)
   { at: 290, src: 352, len: 95 },                       // quiz card, answered (70..165)
-  { at: 385, src: 468, len: 92 },                       // 312 lessons
+  { at: 385, src: 468, len: 92 },                       // 324 lessons
   { at: 477, src: 612, len: 60 },                       // closing card
 ];
 const VFR = 537, VEND = VFR - 60;
@@ -795,12 +795,12 @@ function vProof(l) {
   const t2 = E.outExpo(prog(l, 8, 28)), t3 = E.outExpo(prog(l, 30, 50));
   vText('free animated lessons', VL + (1 - t2) * 40, 800, { size: 68, weight: 800, color: BP.text1, spacing: -1.5, alpha: t2 });
   vText(MODULES + ' modules  ·  no account needed', VL + (1 - t3) * 40, 866, { size: 38, weight: 600, color: BP.text2, alpha: t3 });
-  const T = 26, G = 6, gx = VL + (VR - VL - (COLS * (T + G) - G)) / 2, gy = 900;
+  const T = 23, G = 5, gx = VL + (VR - VL - (COLS * (T + G) - G)) / 2, gy = 900;
   for (let i = 0; i < LESSONS; i++) {
     const c = i % COLS, r = Math.floor(i / COLS), x = gx + c * (T + G), y = gy + r * (T + G);
     const appear = E.outCubic(prog(l, 2 + (c + r) * 0.5, 14 + (c + r) * 0.5));
     if (appear <= 0) continue;
-    const lit = i < count, fresh = lit && i >= count - 24 && l < 78, s = T * (0.6 + 0.4 * appear);
+    const lit = i < count, fresh = lit && i >= count - COLS && l < 78, s = T * (0.6 + 0.4 * appear);
     vx.globalAlpha = appear;
     if (lit) { vx.fillStyle = fresh ? BP.primary : BP.secondary; vx.beginPath(); vx.roundRect(x + (T - s) / 2, y + (T - s) / 2, s, s, 6); vx.fill(); }
     else { vx.strokeStyle = BP.border; vx.lineWidth = 2; vx.beginPath(); vx.roundRect(x + 1 + (T - s) / 2, y + 1 + (T - s) / 2, s - 2, s - 2, 6); vx.stroke(); }
@@ -825,14 +825,14 @@ function vDraw(v) {
   vReset();
   vShade('11,13,16');
   vTag('LAUNCH FILM', BP.primary);
-  if (v >= VEND) vEndCard(v - VEND, { title: 'BytePatterns Launch Film', line: 'Stop reading. Start seeing. 312 free animated lessons.',
+  if (v >= VEND) vEndCard(v - VEND, { title: 'BytePatterns Launch Film', line: 'Stop reading. Start seeing. ' + LESSONS + ' free animated lessons.',
     ink: BP.text1, dim: BP.text3, accent: BP.primary, scrim: '11,13,16', a: 0.9 });
   vReset();
 }
 
 window.__motion = {
   title: 'BytePatterns Launch Film',
-  description: 'A 24-second launch film: a paragraph turns into sorted bars, product cards play their own lessons, and 312 tiles light up.',
+  description: 'A 24-second launch film: a paragraph turns into sorted bars, product cards play their own lessons, and 324 tiles light up.',
   fps: FPS, width: W, height: H, frames: FRAMES,
   poster: 425,
   gifStart: 0,
