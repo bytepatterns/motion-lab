@@ -247,13 +247,13 @@ Click a preview to open the piece live in your browser (click once more there fo
 </tr>
 <tr>
 <td width="72%" valign="top">
-<a href="https://bytepatterns.github.io/motion-lab/projects/19-312-lessons/"><img src="out/19-312-lessons.gif" width="100%" alt="312 Lessons — animated preview"></a>
-<br><b>19 · 312 Lessons</b> <sub>20 s</sub>
-<br>Exactly 312 dots, one for every BytePatterns lesson, fly in and settle into the number 312, then sort themselves into the 30 modules they belong to.
+<a href="https://bytepatterns.github.io/motion-lab/projects/19-312-lessons/"><img src="out/19-312-lessons.gif" width="100%" alt="324 Lessons — animated preview"></a>
+<br><b>19 · 324 Lessons</b> <sub>20 s</sub>
+<br>Exactly 324 dots, one for every BytePatterns lesson, fly in and settle into the number 324, then sort themselves into the 31 modules they belong to.
 <br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/19-312-lessons/">open in browser</a> · <a href="out/19-312-lessons.png">still</a> · <a href="projects/19-312-lessons/index.html">source</a></sub>
 </td>
 <td width="28%" valign="top">
-<a href="https://bytepatterns.github.io/motion-lab/projects/19-312-lessons/?variant=vertical"><img src="out/19-312-lessons.vertical.gif" width="100%" alt="312 Lessons — vertical cut, animated preview"></a>
+<a href="https://bytepatterns.github.io/motion-lab/projects/19-312-lessons/?variant=vertical"><img src="out/19-312-lessons.vertical.gif" width="100%" alt="324 Lessons — vertical cut, animated preview"></a>
 <br><sub>9:16 · 18 s</sub>
 <br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/19-312-lessons/?variant=vertical">open</a> · <a href="out/19-312-lessons.vertical.png">still</a></sub>
 </td>

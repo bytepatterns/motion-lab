@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="author" content="teambytepatterns">
-<meta name="description" content="Exactly 312 dots, one for every BytePatterns lesson, fly in and settle into the number 312, then sort themselves into the 30 modules they belong to.">
-<title>312 Lessons — motion-lab</title>
+<meta name="description" content="Exactly 324 dots, one for every BytePatterns lesson, fly in and settle into the number 324, then sort themselves into the 31 modules they belong to.">
+<title>324 Lessons — motion-lab</title>
 <style>
   /* Player chrome. The piece itself lives entirely in the canvas. */
   html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
@@ -17,16 +17,16 @@
 </style>
 </head>
 <body>
-<canvas id="stage" width="1920" height="1080" aria-label="Particles gather into the number 312, then re-sort into thirty columns, one per module"></canvas>
+<canvas id="stage" width="1920" height="1080" aria-label="Particles gather into the number 324, then re-sort into thirty-one columns, one per module"></canvas>
 <button id="sound" type="button">Click for sound</button>
 <script>
 'use strict';
 /* ==========================================================================
-   PIECE — 312 Lessons.
-   There are exactly 312 bright dots: one per lesson in the BytePatterns
-   course, grouped by the 30 modules they belong to (the counts below come
+   PIECE — 324 Lessons.
+   There are exactly 324 bright dots: one per lesson in the BytePatterns
+   course, grouped by the 31 modules they belong to (the counts below come
    from the lesson manifest). They drift in a flow, then land on points
-   sampled inside the glyphs "312" — module by module, so the number writes
+   sampled inside the glyphs "324" — module by module, so the number writes
    itself left to right. Then each dot flies to its module's column: the
    columns are the real module sizes, from 4 lessons to 25. A few thousand
    faint specks fill the glyphs around them; they are texture, not lessons.
@@ -84,11 +84,11 @@ const MODULES = [
   ['hash tables', 8], ['recursion', 8], ['backtracking', 5], ['greedy', 5], ['trees', 14], ['tries', 4], ['heaps', 7],
   ['two heaps & k-way', 4], ['graphs', 16], ['matrix & grid', 5], ['union-find', 4], ['intervals', 4], ['bit manipulation', 5],
   ['math & number theory', 5], ['dynamic programming', 20], ['system design', 17], ['system design cases', 20], ['ai & ml', 25],
-  ['low-level design', 15], ['concurrency', 15], ['sql', 15], ['behavioral', 12], ['aws', 12],
+  ['low-level design', 15], ['concurrency', 15], ['sql', 15], ['behavioral', 12], ['aws', 12], ['kubernetes', 12],
 ];
 const LESSONS = [];                                          // { m, j }: module index, index within the module
 MODULES.forEach(([, n], m) => { for (let j = 0; j < n; j++) LESSONS.push({ m, j }); });
-const NL = LESSONS.length, NM = MODULES.length;              // 312, 30
+const NL = LESSONS.length, NM = MODULES.length;              // 324, 31
 const MINM = Math.min(...MODULES.map(x => x[1])), MAXM = Math.max(...MODULES.map(x => x[1]));
 const COL = MODULES.map((_, m) => rampAt(m / (NM - 1)));
 const ND = 1500;                                             // faint specks (texture)
@@ -97,7 +97,7 @@ const ND = 1500;                                             // faint specks (te
 const T = { gather: 36, word: 214, sort0: 336, sort1: 410, back0: 468, back1: 516, end: 528 };
 
 // ---- sampling the glyphs, once per layout -----------------------------------------------
-/** L = { w, h, size, x, y }: draws "312" into a mask and returns NL lesson targets and ND speck targets. */
+/** L = { w, h, size, x, y }: draws "324" into a mask and returns NL lesson targets and ND speck targets. */
 function sampleGlyphs(L) {
   const m = document.createElement('canvas'); m.width = L.w; m.height = L.h;
   const g = m.getContext('2d', { willReadFrequently: true });
@@ -136,7 +136,7 @@ function makeScene(L) {
   // columns: module m at x, lesson j stacked upward
   S.K = LESSONS.map(({ m, j }) => [L.cx0 + m * L.cpitch, L.cy1 - j * L.dpitch]);
   // timings: lessons land in course order (rank), specks at seeded times
-  S.arr = LESSONS.map((_, i) => T.gather + 10 + i * 0.44);
+  S.arr = LESSONS.map((_, i) => T.gather + 10 + i * 0.424);   // 324 lessons land in the same span as before
   S.srt = LESSONS.map(({ m, j }) => T.sort0 + m * 1.4 + j * 0.5);
   S.bak = LESSONS.map((_, i) => T.back0 + (NL - 1 - i) * 0.05 + S.seeds[i].q * 8);
   return S;
@@ -207,7 +207,7 @@ function backdrop(g, w, h) {
 
 // ---- landscape picture ------------------------------------------------------------------
 const LAY_L = { w: W, h: H, size: 640, x: 150, y: 790, track: -18, r: 8.5, sp: 2.4, arc: 90,
-  cx0: 150, cpitch: 56, cy1: 900, dpitch: 22 };
+  cx0: 150, cpitch: 54, cy1: 900, dpitch: 22 };
 let SL = null;
 function draw(f) {
   if (!SL) SL = makeScene(LAY_L);
@@ -239,14 +239,14 @@ function draw(f) {
   {
     const [al, dy] = env(f, T.sort1 - 20, T.back0 + 6, 14, 10);
     text(ctx, `${NM} modules`, 116, 290 + dy, { size: 110, weight: 850, color: C.paper, spacing: -3, alpha: al * a });
-    text(ctx, `${MINM} to ${MAXM} lessons each, from Big-O to system design`, 122, 360 + dy, { size: 40, weight: 500, color: C.dim, alpha: al * a });
+    text(ctx, `${MINM} to ${MAXM} lessons each, from Big-O to Kubernetes`, 122, 360 + dy, { size: 40, weight: 500, color: C.dim, alpha: al * a });
     MODULES.forEach(([, cnt], m) => {
       const k = E.outCubic(prog(f, SL.srt[LESSONS.findIndex(q => q.m === m)] + 30, SL.srt[LESSONS.findIndex(q => q.m === m)] + 44)) * (1 - E.inCubic(prog(f, T.back0 - 4, T.back0 + 6)));
       text(ctx, String(cnt), LAY_L.cx0 + m * LAY_L.cpitch, LAY_L.cy1 - (cnt - 1) * LAY_L.dpitch - 26, { size: 28, weight: 800, fam: MONO, color: `rgb(${COL[m].join(',')})`, align: 'center', alpha: k * a });
     });
     const k = E.outCubic(prog(f, T.sort1 - 10, T.sort1 + 8)) * (1 - E.inCubic(prog(f, T.back0 - 4, T.back0 + 6))) * a;
     text(ctx, 'big-o', LAY_L.cx0 - 12, 950, { size: 28, weight: 600, color: C.dim, alpha: k });
-    text(ctx, 'aws', LAY_L.cx0 + (NM - 1) * LAY_L.cpitch + 12, 950, { size: 28, weight: 600, color: C.dim, align: 'right', alpha: k });
+    text(ctx, 'kubernetes', LAY_L.cx0 + (NM - 1) * LAY_L.cpitch + 12, 950, { size: 28, weight: 600, color: C.dim, align: 'right', alpha: k });
     text(ctx, 'ai & ml: 25', LAY_L.cx0 + 24 * LAY_L.cpitch, 990, { size: 28, weight: 600, color: C.dim, align: 'center', alpha: k });
   }
   if (endK > 0) {
@@ -443,7 +443,7 @@ function vChime(ac, dest, at, freq, vol = 0.08) {
 }
 
 /* VERTICAL CUT — this piece */
-// The same particles on a portrait stage: "312" across the safe area, the 30
+// The same particles on a portrait stage: "324" across the safe area, the 31
 // module columns narrower and shorter under the type.
 const VSEG = [
   { at: 0, src: 20, len: 190 },                              // hook, the lessons land
@@ -453,7 +453,7 @@ const VSEG = [
 ];
 const VFR = 540, VEND = VFR - 60;
 const LAY_V = { w: VW, h: VH, size: 400, x: 96, y: 1050, track: -12, r: 6.2, sp: 2.2, arc: 60,
-  cx0: 110, cpitch: 25.5, cy1: 1180, dpitch: 13.5 };
+  cx0: 110, cpitch: 25, cy1: 1180, dpitch: 13.5 };
 let SV = null;
 function vDraw(v) {
   if (!SV) SV = makeScene(LAY_V);
@@ -475,7 +475,7 @@ function vDraw(v) {
     const [al, dy] = vEnv(v, 330, VEND + 2, 10, 8);
     vText(`${NM} modules`, VL, 440 + dy, { size: 104, weight: 850, color: C.paper, spacing: -3, alpha: al });
     vText(`${MINM} to ${MAXM} lessons each`, VL, 510 + dy, { size: 40, weight: 500, color: C.dim, alpha: al });
-    vText('from Big-O to system design', VL, 1300 + dy, { size: 36, weight: 600, color: C.amber, alpha: al * (1 - prog(f, T.back0, T.back0 + 10)), max: VR - VL });
+    vText('from Big-O to Kubernetes', VL, 1300 + dy, { size: 36, weight: 600, color: C.amber, alpha: al * (1 - prog(f, T.back0, T.back0 + 10)), max: VR - VL });
   }
   if (v >= VEND) vEndCard(v - VEND, { title: `${NL} Lessons`, line: `${NM} modules · one dot per lesson`,
     ink: C.paper, dim: 'rgba(242,238,230,0.72)', accent: C.amber, scrim: C.bgRGB, a: 0.84 });
@@ -483,7 +483,7 @@ function vDraw(v) {
 }
 
 window.__motion = {
-  title: '312 Lessons',
+  title: `${NL} Lessons`,
   description: `Exactly ${NL} dots, one for every BytePatterns lesson, fly in and settle into the number ${NL}, then sort themselves into the ${NM} modules they belong to.`,
   fps: FPS, width: W, height: H, frames: FRAMES,
   poster: 300,
