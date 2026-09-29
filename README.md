@@ -466,6 +466,71 @@ Click a preview to open the piece live in your browser (click once more there fo
 <br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/35-bead-sort/?variant=vertical">open</a> · <a href="out/35-bead-sort.vertical.png">still</a></sub>
 </td>
 </tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/39-lloyd-relaxation/"><img src="out/39-lloyd-relaxation.gif" width="100%" alt="Lloyd's Relaxation — animated preview"></a>
+<br><b>39 · Lloyd's Relaxation</b> <sub>26 s</sub>
+<br>Generative geometry: 150 clumped random dots own the Voronoi cells around them; 100 times over, every dot moves to the centroid of its own cell and the cells are rebuilt, until the cell sizes, which varied by ±137%, vary by only ±11%. Each cell is clipped exactly from the frame by its neighbours' bisectors.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/39-lloyd-relaxation/">open in browser</a> · <a href="out/39-lloyd-relaxation.png">still</a> · <a href="projects/39-lloyd-relaxation/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/39-lloyd-relaxation/?variant=vertical"><img src="out/39-lloyd-relaxation.vertical.gif" width="100%" alt="Lloyd's Relaxation — vertical cut, animated preview"></a>
+<br><sub>9:16 · 19 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/39-lloyd-relaxation/?variant=vertical">open</a> · <a href="out/39-lloyd-relaxation.vertical.png">still</a></sub>
+</td>
+</tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/40-ripple-tank/"><img src="out/40-ripple-tank.gif" width="100%" alt="Ripple Tank — animated preview"></a>
+<br><b>40 · Ripple Tank</b> <sub>26 s</sub>
+<br>Wave interference computed pixel by pixel: one source makes circles, a second makes an interference pattern, and the lines where crest always meets trough stay still. Pulling the sources from 3λ to 6λ apart takes them from 6 to 12 still lines (2·⌊d/λ + ½⌋), drawn exactly as hyperbolas; the two source tones beat 1.5 times a second.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/40-ripple-tank/">open in browser</a> · <a href="out/40-ripple-tank.png">still</a> · <a href="projects/40-ripple-tank/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/40-ripple-tank/?variant=vertical"><img src="out/40-ripple-tank.vertical.gif" width="100%" alt="Ripple Tank — vertical cut, animated preview"></a>
+<br><sub>9:16 · 19 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/40-ripple-tank/?variant=vertical">open</a> · <a href="out/40-ripple-tank.vertical.png">still</a></sub>
+</td>
+</tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/41-l-system-plant/"><img src="out/41-l-system-plant.gif" width="100%" alt="Grown from a Rule — animated preview"></a>
+<br><b>41 · Grown from a Rule</b> <sub>26 s</sub>
+<br>An L-system, grown for real: the letter X is rewritten six times by X → F+[[X]−X]−F[−FX]+X and F → FF into 25,159 symbols, and a turtle reads them as 6,048 pen strokes, 25° turns and bracketed branches, generation by generation, until the plant sways and 4,096 buds open.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/41-l-system-plant/">open in browser</a> · <a href="out/41-l-system-plant.png">still</a> · <a href="projects/41-l-system-plant/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/41-l-system-plant/?variant=vertical"><img src="out/41-l-system-plant.vertical.gif" width="100%" alt="Grown from a Rule — vertical cut, animated preview"></a>
+<br><sub>9:16 · 19 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/41-l-system-plant/?variant=vertical">open</a> · <a href="out/41-l-system-plant.vertical.png">still</a></sub>
+</td>
+</tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/42-langtons-ant/"><img src="out/42-langtons-ant.gif" width="100%" alt="Langton's Ant — animated preview"></a>
+<br><b>42 · Langton's Ant</b> <sub>27 s</sub>
+<br>Langton's ant, run for real on a grid: turn right on an unlit square, left on a lit one, flip it, step. 9,977 steps of chaos, then a highway that repeats every 104 steps and moves 2 squares diagonally, found in the log rather than typed in; one tick per step, one beat per cycle.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/42-langtons-ant/">open in browser</a> · <a href="out/42-langtons-ant.png">still</a> · <a href="projects/42-langtons-ant/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/42-langtons-ant/?variant=vertical"><img src="out/42-langtons-ant.vertical.gif" width="100%" alt="Langton's Ant — vertical cut, animated preview"></a>
+<br><sub>9:16 · 19 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/42-langtons-ant/?variant=vertical">open</a> · <a href="out/42-langtons-ant.vertical.png">still</a></sub>
+</td>
+</tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/43-hilbert-curve/"><img src="out/43-hilbert-curve.gif" width="100%" alt="One Line Fills the Square — animated preview"></a>
+<br><b>43 · One Line Fills the Square</b> <sub>26 s</sub>
+<br>The Hilbert curve from order 1 to order 7: a U becomes four turned copies of itself, again and again, each new point growing out of its parent, until one line of 16,384 points and length 127.99 fills the square without crossing itself; a window of 819 points in a row slides along it and always lights a compact patch.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/43-hilbert-curve/">open in browser</a> · <a href="out/43-hilbert-curve.png">still</a> · <a href="projects/43-hilbert-curve/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/43-hilbert-curve/?variant=vertical"><img src="out/43-hilbert-curve.vertical.gif" width="100%" alt="One Line Fills the Square — vertical cut, animated preview"></a>
+<br><sub>9:16 · 19 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/43-hilbert-curve/?variant=vertical">open</a> · <a href="out/43-hilbert-curve.vertical.png">still</a></sub>
+</td>
+</tr>
 </table>
 <!-- gallery:end -->
 
