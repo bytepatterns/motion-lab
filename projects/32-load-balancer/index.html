@@ -1,0 +1,603 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="author" content="teambytepatterns">
+<meta name="description" content="The same stream of requests sent through two load balancers, round robin and least connections, to four servers each; every queue on screen comes from the simulation.">
+<title>Round Robin vs Least Connections — motion-lab</title>
+<style>
+  /* Player chrome. The piece itself lives entirely in the canvas. */
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  body { display: grid; place-items: center; font: 500 15px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #fff; }
+  canvas { display: block; width: min(100vw, calc(100vh * 16 / 9)); height: auto; aspect-ratio: 16 / 9; }
+  #sound { position: fixed; left: 16px; bottom: 16px; padding: 8px 14px; border: 1px solid rgba(255,255,255,.35); border-radius: 999px;
+           background: rgba(0,0,0,.55); color: #fff; font: inherit; cursor: pointer; }
+  #sound[hidden] { display: none; }
+</style>
+</head>
+<body>
+<canvas id="stage" width="1920" height="1080" aria-label="Two panels side by side, each a load balancer over four servers; the same requests drop into both, stacking as blocks whose height is their remaining work; round robin piles up behind long requests while least connections spreads them out"></canvas>
+<button id="sound" type="button">Click for sound</button>
+<script>
+'use strict';
+/* ==========================================================================
+   PIECE — Round Robin vs Least Connections.
+   One seeded stream of requests (random arrivals, about 4.6 a second;
+   most take 0.2-0.55 s, about one in seven takes 2.2-3.4 s) goes to two
+   load balancers, each in front of four servers. A server works on one
+   request at a time and queues the rest.
+   - Round robin sends request n to server n mod 4, busy or not.
+   - Least connections sends it to the server with the fewest open
+     requests (in service + queued); ties go round robin.
+   Each request is a block whose height is its remaining work, so a column
+   is exactly the backlog of its server: the bottom block shrinks while it
+   is served, and waiting blocks redden with the time they have waited.
+   Both balancers are simulated ONCE at load on the same arrivals; every
+   block, counter and wait on screen is read from those runs. The same
+   comparison is also run on 200 other seeded streams, and the piece says
+   how often each policy had the lower 95th-percentile wait.
+   ========================================================================== */
+const W = 1920, H = 1080, FPS = 30;
+const cv = document.getElementById('stage');
+const ctx = cv.getContext('2d', { willReadFrequently: true });   // CPU raster: identical pixels on every redraw
+const FONT = 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
+const MONO = 'ui-monospace, "Cascadia Code", Consolas, Menlo, monospace';
+
+// ---- helpers -------------------------------------------------------------
+// ---- helpers -------------------------------------------------------------
+function mulberry32(a) { return function () { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a);
+  t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const lerp = (a, b, t) => a + (b - a) * t;
+const prog = (f, a, b) => clamp((f - a) / (b - a));
+const smooth = t => t * t * (3 - 2 * t);
+const E = {
+  inCubic: t => t * t * t,
+  outCubic: t => 1 - Math.pow(1 - t, 3),
+  inOutCubic: t => t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2,
+  outExpo: t => t === 1 ? 1 : 1 - Math.pow(2, -10 * t),
+  inExpo: t => t === 0 ? 0 : Math.pow(2, 10 * t - 10),
+  inOutExpo: t => t === 0 ? 0 : t === 1 ? 1 : t < .5 ? Math.pow(2, 20 * t - 10) / 2 : (2 - Math.pow(2, -20 * t + 10)) / 2,
+  outBack: t => 1 + 2.70158 * Math.pow(t - 1, 3) + 1.70158 * Math.pow(t - 1, 2),
+};
+/** Canvas text; `max` shrinks the size until the line fits. Returns the width drawn. */
+function text(g, str, x, y, { size = 40, weight = 600, color = '#fff', alpha = 1, spacing = 0, align = 'left', fam = FONT, base = 'alphabetic', max = 0 } = {}) {
+  if (alpha <= 0.002 || !str) return 0;
+  g.font = `${weight} ${size}px ${fam}`; g.letterSpacing = spacing + 'px';
+  if (max) { const w0 = g.measureText(str).width; if (w0 > max) { size *= max / w0; g.font = `${weight} ${size}px ${fam}`; } }
+  g.textAlign = align; g.textBaseline = base;
+  const a0 = g.globalAlpha; g.globalAlpha = a0 * alpha; g.fillStyle = color;
+  g.fillText(str, x, y);
+  const w = g.measureText(str).width;
+  g.globalAlpha = a0; g.letterSpacing = '0px';
+  return w;
+}
+const measure = (g, str, size, weight = 800, fam = FONT, spacing = 0) => { g.font = `${weight} ${size}px ${fam}`; g.letterSpacing = spacing + 'px'; const w = g.measureText(str).width; g.letterSpacing = '0px'; return w; };
+const env = (f, a, b, fin = 12, fout = 10) => {
+  const i = E.outCubic(prog(f, a, a + fin)), o = 1 - E.inCubic(prog(f, b - fout, b));
+  return [Math.min(i, o), (1 - i) * 24 - (1 - o) * 10];
+};
+
+// ---- palette -------------------------------------------------------------
+const C = {
+  bg: '#0B0D16', bgRGB: '11,13,22', paper: '#ECEEF6', dim: 'rgba(236,238,246,0.62)', faint: 'rgba(236,238,246,0.16)',
+  slab: '#1A1E2E', rr: '#FF9A5C', lc: '#5CD2FF', long: '#B48CFF', longRGB: [180, 140, 255], shortRGB: [214, 220, 236], hotRGB: [255, 84, 84],
+};
+
+// ---- the model: one stream of requests, two balancers, simulated once at load -------------------------
+const S = 4, SIM_T = 16, ARRIVE_T = 14;                     // 4 servers; 14 s of arrivals, 16 s shown
+function traffic(seed) {
+  const r = mulberry32(seed), out = []; let t = 0.3;
+  for (;;) {
+    t += -Math.log(1 - r()) / 4.6; if (t > ARRIVE_T) break; // Poisson arrivals, 4.6 per second
+    const long = r() < 0.14, d = long ? 2.2 + r() * 1.2 : 0.2 + r() * 0.35;
+    out.push({ t, d, long });
+  }
+  return out;
+}
+function simulate(reqs, policy) {
+  const free = new Array(S).fill(0), jobs = Array.from({ length: S }, () => []);
+  let rr = 0, last = S - 1;
+  return reqs.map((q, n) => {
+    let s;
+    if (policy === 'rr') { s = rr; rr = (rr + 1) % S; }
+    else {
+      const open = jobs.map(js => js.filter(j => j.end > q.t).length);
+      let best = Infinity;
+      for (let k = 1; k <= S; k++) { const c = (last + k) % S; if (open[c] < best) { best = open[c]; s = c; } }
+      last = s;
+    }
+    const start = Math.max(q.t, free[s]), end = start + q.d; free[s] = end;
+    const j = Object.assign({ n, s, start, end, wait: start - q.t }, q); jobs[s].push(j); return j;
+  });
+}
+const pct = (a, p) => { const b = a.slice().sort((x, y) => x - y); return b[Math.min(b.length - 1, Math.ceil(p * b.length) - 1)]; };
+const stats = r => { const w = r.map(j => j.wait); return { mean: w.reduce((a, b) => a + b, 0) / w.length, p95: pct(w, 0.95), max: Math.max(...w) }; };
+const REQ = traffic(0x32C3);
+const RUN = { rr: simulate(REQ, 'rr'), lc: simulate(REQ, 'lc') };
+const ST = { rr: stats(RUN.rr), lc: stats(RUN.lc) };
+const LONGS = REQ.filter(q => q.long).length;
+const OTHER = 200, LC_WINS = (() => {                        // the same comparison on 200 other streams
+  let w = 0; for (let k = 0; k < OTHER; k++) { const tr = traffic(0x5000 + k); if (stats(simulate(tr, 'lc')).p95 < stats(simulate(tr, 'rr')).p95) w++; }
+  return w;
+})();
+const fmt = x => x.toFixed(2) + ' s';
+
+// ---- timeline -----------------------------------------------------------------------------
+/** o.sim0: frame where sim time 0 is shown; o.speed: sim seconds per video second. */
+function buildTL(o) {
+  const TL = { o, sim0: o.sim0, speed: o.speed };
+  TL.simEnd = o.sim0 + Math.round(SIM_T / o.speed * FPS);
+  TL.sum = TL.simEnd;                                         // summary
+  TL.end = TL.sum + o.sumLen;
+  const fr = s => Math.round(o.sim0 + s / o.speed * FPS);
+  TL.fr = fr;
+  TL.caps = o.caps.map(([a, b, str]) => [fr(a), fr(b), str]);
+  return TL;
+}
+const simT = (TL, f) => (f - TL.sim0) / FPS * TL.speed;
+const TLL = buildTL({ sim0: 60, speed: 1, sumLen: 120, caps: [
+  [-1.2, 3, 'Same traffic,|two load balancers.'],
+  [3, 6.5, 'Round robin: the next server in line,|busy or not.'],
+  [6.5, 10, 'Least connections: the server|with the fewest open requests.'],
+  [10, 13.2, 'Violet is a long request.|Everything behind it waits.'],
+  [13.2, 16.4, 'The longer a request waits,|the redder it gets.'],
+] });
+const FRAMES = TLL.end + 72;
+
+// ---- drawing ------------------------------------------------------------------------------
+const FLY = 0.32;                                            // seconds a request flies from the balancer to its queue
+/** Everything a panel shows at sim time t: per server, the blocks bottom-up with their heights (seconds of work). */
+function panelState(run, t) {
+  const cols = Array.from({ length: S }, () => []), flying = [];
+  for (const j of run) {
+    if (j.t - FLY > t || j.end <= t) continue;
+    if (j.t > t) { flying.push(j); continue; }
+    const work = j.start > t ? j.d : j.end - t;
+    cols[j.s].push({ j, work, waiting: j.start > t, waited: j.start > t ? t - j.t : j.wait });
+  }
+  for (const c of cols) c.sort((a, b) => a.j.start - b.j.start);
+  return { cols, flying };
+}
+function blockColor(b, a = 1) {
+  const heat = clamp(b.waited / 2.5), base = b.j.long ? C.longRGB : C.shortRGB;
+  const k = b.j.long ? heat * 0.5 : heat;
+  const c = base.map((v, i) => Math.round(lerp(v, C.hotRGB[i], k)));
+  return `rgba(${c[0]},${c[1]},${c[2]},${a})`;
+}
+function panel(g, G, P, f, alpha) {
+  if (alpha <= 0.01) return;
+  const TL = G.TL, t = simT(TL, f), run = RUN[P.key], accent = C[P.key];
+  const { cols, flying } = panelState(run, Math.max(0, t));
+  const colX = k => P.cx + (k - (S - 1) / 2) * G.pitch;
+  g.save(); g.globalAlpha = alpha;
+  // title and balancer
+  text(g, P.name, P.cx, G.titleY, { size: G.title, weight: 850, color: accent, spacing: 2, align: 'center', max: G.pitch * S });
+  g.fillStyle = accent; g.beginPath(); g.arc(P.cx, G.lbY, G.lbR, 0, Math.PI * 2); g.fill();
+  g.fillStyle = C.bg; g.beginPath(); g.arc(P.cx, G.lbY, G.lbR * 0.45, 0, Math.PI * 2); g.fill();
+  // fan-out lines
+  g.strokeStyle = C.faint; g.lineWidth = 2;
+  for (let k = 0; k < S; k++) { g.beginPath(); g.moveTo(P.cx, G.lbY + G.lbR); g.lineTo(colX(k), G.topY); g.stroke(); }
+  // columns
+  for (let k = 0; k < S; k++) {
+    const x = colX(k), c = cols[k];
+    g.fillStyle = 'rgba(236,238,246,0.035)'; g.fillRect(x - G.cw / 2, G.topY, G.cw, G.baseY - G.topY);
+    let y = G.baseY, total = 0;
+    for (const b of c) {
+      let h = b.work * G.px; total += b.work;
+      const y1 = y - h, clipTop = Math.max(y1, G.topY);
+      if (y > G.topY) {
+        g.fillStyle = blockColor(b, b.waiting ? 0.9 : 1);
+        g.beginPath(); g.roundRect(x - G.cw / 2, clipTop + G.gap / 2, G.cw, Math.max(1, y - clipTop - G.gap), 5); g.fill();
+        if (!b.waiting) { g.strokeStyle = accent; g.lineWidth = 3; g.stroke(); }
+      }
+      y = y1;
+    }
+    if (y < G.topY) {                                      // backlog taller than the column
+      text(g, '+' + ((G.topY - y) / G.px).toFixed(1) + ' s', x, G.topY - 10, { size: 28, weight: 800, color: C.paper, align: 'center' });
+    }
+    // server slab with the open-request count
+    g.fillStyle = C.slab; g.beginPath(); g.roundRect(x - G.cw / 2 - 6, G.baseY + 4, G.cw + 12, G.slabH, 8); g.fill();
+    g.strokeStyle = c.length ? accent : 'rgba(236,238,246,0.25)'; g.lineWidth = 2; g.stroke();
+    const open = c.length;
+    text(g, String(open), x, G.baseY + 4 + G.slabH * 0.72, { size: G.slabH * 0.62, weight: 900, color: open >= 4 ? C.paper : open ? accent : C.dim, align: 'center' });
+  }
+  // requests in flight from the balancer
+  for (const j of flying) {
+    const u = E.inOutCubic(clamp((t - (j.t - FLY)) / FLY));
+    const st = cols[j.s].reduce((a, b) => a + b.work, 0);
+    const tx = colX(j.s), ty = Math.max(G.topY, G.baseY - st * G.px) - j.d * G.px / 2;
+    const x = lerp(P.cx, tx, u), y = lerp(G.lbY, ty, u), sc = lerp(0.35, 1, u);
+    const w = G.cw * sc, h = lerp(8, j.d * G.px, u * u);
+    g.fillStyle = j.long ? C.long : `rgb(${C.shortRGB.join(',')})`; g.beginPath(); g.roundRect(x - w / 2, y - h / 2, w, h, 5); g.fill();
+  }
+  // live: the longest wait so far
+  let worst = 0; for (const j of run) if (j.start <= t) worst = Math.max(worst, j.wait);
+  const lbl = 'longest wait so far', lw = measure(g, lbl + '  ', G.stat * 0.8, 600);
+  const sx = P.cx - (lw + measure(g, fmt(worst), G.stat, 900)) / 2;
+  text(g, lbl, sx, G.statY, { size: G.stat * 0.8, weight: 600, color: C.dim });
+  text(g, fmt(worst), sx + lw, G.statY, { size: G.stat, weight: 900, color: worst > 2 ? `rgb(${C.hotRGB.join(',')})` : C.paper });
+  g.restore();
+}
+function caption(g, G, f) {
+  for (const [t0, t1, str] of G.TL.caps) {
+    const [a, dy] = env(f, t0, t1, 10, 8); if (a <= 0) continue;
+    const [p1, p2] = str.split('|');
+    if (G.capTwo) {
+      text(g, p1, G.capX, G.capY + dy, { size: G.cap, weight: 850, color: C.paper, spacing: -1, alpha: a, max: G.capMax });
+      text(g, p2, G.capX, G.capY + G.cap * 1.14 + dy, { size: G.cap, weight: 850, color: C.long, spacing: -1, alpha: a, max: G.capMax });
+    } else {
+      const w1 = text(g, p1 + ' ', G.capX, G.capY + dy, { size: G.cap, weight: 850, color: C.paper, spacing: -1, alpha: a });
+      text(g, p2, G.capX + w1, G.capY + dy, { size: G.cap, weight: 850, color: C.long, spacing: -1, alpha: a, max: G.capMax - w1 });
+    }
+  }
+}
+function clock(g, G, f) {
+  const TL = G.TL, t = simT(TL, f), [a] = env(f, TL.sim0 - 10, TL.sum + 6, 10, 10);
+  if (a <= 0) return;
+  const n = REQ.filter(q => q.t <= t).length;
+  text(g, `t = ${clamp(t, 0, SIM_T).toFixed(1)} s`, G.clkX, G.clkY, { size: G.clk, weight: 700, color: C.dim, fam: MONO, align: G.clkAlign, alpha: a });
+  text(g, `${n} requests`, G.clkX, G.clkY + G.clk * 1.3, { size: G.clk, weight: 700, color: C.paper, fam: MONO, align: G.clkAlign, alpha: a });
+}
+const PANELS = [{ key: 'rr', name: 'ROUND ROBIN' }, { key: 'lc', name: 'LEAST CONNECTIONS' }];
+function summary(g, G, f) {
+  const TL = G.TL, out = 1 - E.inCubic(prog(f, TL.end - 4, TL.end + 12)), k = E.outCubic(prog(f, TL.sum, TL.sum + 16)) * out;
+  if (k <= 0) return;
+  g.save(); g.fillStyle = `rgba(${C.bgRGB},${0.93 * k})`; g.fillRect(0, 0, g.canvas.width, g.canvas.height); g.restore();
+  const rows = [['rr', 'Round robin'], ['lc', 'Least connections']];
+  const k1 = E.outCubic(prog(f, TL.sum + 6, TL.sum + 24)) * out, k2 = E.outCubic(prog(f, TL.sum + 14, TL.sum + 32)) * out, k3 = E.outCubic(prog(f, TL.sum + 30, TL.sum + 50)) * out;
+  if (G.sumStack) {
+    text(g, `Same ${REQ.length} requests.`, G.sumX, G.sumY - G.sumH * 1.2, { size: G.sumH, weight: 800, color: C.paper, alpha: k1, max: G.sumMax, spacing: -1 });
+    text(g, 'Time spent waiting in line:', G.sumX, G.sumY, { size: G.sumH, weight: 800, color: C.paper, alpha: k1, max: G.sumMax, spacing: -1 });
+  } else text(g, `Same ${REQ.length} requests. Time spent waiting in line:`, G.sumX, G.sumY, { size: G.sumH, weight: 800, color: C.paper, align: G.sumAlign, alpha: k1, max: G.sumMax, spacing: -1 });
+  rows.forEach(([key, name], i) => {
+    const kk = i ? k2 : k1, y = G.sumY + G.sumGap * (i + 1) + (1 - kk) * 20;
+    if (G.sumStack) {
+      text(g, name, G.sumX, y, { size: G.sumN, weight: 850, color: C[key], alpha: kk });
+      text(g, `mean ${fmt(ST[key].mean)}   ·   p95 ${fmt(ST[key].p95)}`, G.sumX, y + G.sumN * 1.1, { size: G.sumV, weight: 700, color: C.paper, fam: MONO, alpha: kk, max: G.sumMax });
+    } else {
+      text(g, name, G.sumX - 40, y, { size: G.sumN, weight: 850, color: C[key], align: 'right', alpha: kk });
+      text(g, `mean ${fmt(ST[key].mean)}   ·   p95 ${fmt(ST[key].p95)}`, G.sumX + 40, y, { size: G.sumV, weight: 700, color: C.paper, fam: MONO, alpha: kk });
+    }
+  });
+  const yl = G.sumY + G.sumGap * 3 + (G.sumStack ? G.sumN : 0);
+  const line = `On ${OTHER} other seeded streams, least connections had the lower p95 wait ${LC_WINS} times.`;
+  if (G.sumStack) {
+    const ls = vWrap(line, G.sumMax, G.sumL, 600);
+    ls.forEach((s, i) => text(g, s, G.sumX, yl + i * G.sumL * 1.25, { size: G.sumL, weight: 600, color: C.dim, alpha: k3 }));
+  } else text(g, line, G.sumX, yl, { size: G.sumL, weight: 600, color: C.dim, align: 'center', alpha: k3, max: G.sumMax });
+}
+function backdrop(g, w, h) { g.fillStyle = C.bg; g.fillRect(0, 0, w, h); }
+function scene(g, G, f) {
+  const TL = G.TL, a = E.outCubic(prog(f, TL.sim0 - 30, TL.sim0 - 6));
+  G.panels.forEach((P, i) => panel(g, G, P, f, a));
+  caption(g, G, f); clock(g, G, f); summary(g, G, f);
+}
+
+// ---- landscape picture ------------------------------------------------------------------
+const GL = { TL: TLL, panels: [Object.assign({ cx: 530 }, PANELS[0]), Object.assign({ cx: 1390 }, PANELS[1])],
+  pitch: 180, cw: 124, gap: 3, px: 56, titleY: 318, title: 34, lbY: 362, lbR: 16, topY: 430, baseY: 862, slabH: 64, statY: 998, stat: 36,
+  capX: 120, capY: 216, cap: 50, capTwo: false, capMax: 1680,
+  clkX: 1800, clkY: 206, clk: 28, clkAlign: 'right',
+  sumX: 960, sumY: 380, sumH: 56, sumGap: 110, sumN: 54, sumV: 46, sumL: 36, sumAlign: 'center', sumMax: 1680, sumStack: false };
+function hookL(f) {
+  const o = 1 - E.inCubic(prog(f, TLL.sim0 - 22, TLL.sim0 - 6));
+  if (o <= 0) return;
+  const k = E.outExpo(prog(f, -8, 10)), k2 = E.outBack(prog(f, -6, 12));
+  text(ctx, 'Round robin is fair.', W / 2, 560 + (1 - k) * 30, { size: 116, weight: 900, color: C.paper, spacing: -3, align: 'center', alpha: o * Math.max(0.3, k) });
+  text(ctx, 'That is the problem.', W / 2, 700 + (1 - clamp(k2)) * 30, { size: 116, weight: 900, color: C.rr, spacing: -3, align: 'center', alpha: o * Math.max(0.3, clamp(k2)) });
+}
+function draw(f) {
+  if (ctx.reset) ctx.reset();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; ctx.filter = 'none'; ctx.shadowBlur = 0;
+  backdrop(ctx, W, H);
+  const T = TLL, endK = E.inOutCubic(prog(f, T.end, T.end + 20)), a = 1 - endK;
+  text(ctx, 'SYSTEMS  ·  LOAD BALANCING', 120, 104, { size: 26, weight: 600, color: C.dim, spacing: 5, alpha: a });
+  text(ctx, 'BYTEPATTERNS', 1800, 104, { size: 26, weight: 600, color: C.dim, spacing: 5, align: 'right', alpha: a });
+  scene(ctx, GL, f);
+  hookL(f);
+  if (endK > 0) {
+    ctx.fillStyle = `rgba(${C.bgRGB},${0.9 * endK})`; ctx.fillRect(0, 0, W, H);
+    const k1 = E.outCubic(prog(f, T.end + 6, T.end + 28)), k2 = E.outCubic(prog(f, T.end + 16, T.end + 38)), k3 = E.outCubic(prog(f, T.end + 26, T.end + 48));
+    text(ctx, 'Round Robin vs Least Connections', W / 2, 500 + (1 - k1) * 30, { size: 104, weight: 850, color: C.paper, spacing: -3, align: 'center', alpha: k1, max: 1680 });
+    text(ctx, `${REQ.length} requests  ·  4 servers  ·  p95 wait ${fmt(ST.rr.p95)} vs ${fmt(ST.lc.p95)}`, W / 2, 580 + (1 - k2) * 20, { size: 42, weight: 500, color: C.lc, align: 'center', alpha: k2 });
+    text(ctx, 'drawn in code  ·  bytepatterns.com', W / 2, 1000, { size: 32, weight: 600, color: C.paper, spacing: 3, align: 'center', alpha: k3 * 0.8 });
+  }
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.letterSpacing = '0px';
+}
+
+// ---- sound: a 120 BPM pulse; every request arrives as a tick, every service start is a note ---------
+const BEAT = 15;
+async function renderAudio(TL = TLL, frames = FRAMES) {
+  const SR = 48000, dur = frames / FPS, LEN = Math.round(SR * dur);
+  const ac = new OfflineAudioContext(2, LEN, SR);
+  const at = fr => fr / FPS, atS = s => at(TL.sim0) + s / TL.speed;
+  const comp = ac.createDynamicsCompressor();
+  comp.threshold.value = -16; comp.ratio.value = 3.5; comp.attack.value = 0.003; comp.release.value = 0.2;
+  const master = ac.createGain(); master.gain.value = 0.9; master.connect(comp).connect(ac.destination);
+  master.gain.setValueAtTime(0.9, dur - 0.8); master.gain.linearRampToValueAtTime(0.0001, dur - 0.02);
+  const rnd = mulberry32(0x32B7);
+  const ir = ac.createBuffer(2, SR * 1.4, SR);
+  for (let c = 0; c < 2; c++) { const d = ir.getChannelData(c); for (let k = 0; k < d.length; k++) d[k] = (rnd() * 2 - 1) * Math.pow(1 - k / d.length, 3.4); }
+  const verb = ac.createConvolver(); verb.buffer = ir; const vg = ac.createGain(); vg.gain.value = 0.18; verb.connect(vg).connect(master);
+  const noise = ac.createBuffer(1, SR, SR); { const d = noise.getChannelData(0); for (let k = 0; k < d.length; k++) d[k] = rnd() * 2 - 1; }
+  const hz = m => 440 * Math.pow(2, (m - 69) / 12);
+  const kick = (t0, amp = 0.4) => { const o = ac.createOscillator(), g = ac.createGain();
+    o.frequency.setValueAtTime(120, t0); o.frequency.exponentialRampToValueAtTime(42, t0 + 0.14);
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(amp, t0 + 0.004); g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.3);
+    o.connect(g).connect(master); o.start(t0); o.stop(t0 + 0.32); };
+  const tick = (t0, amp, f0, pan = 0) => { const s = ac.createBufferSource(); s.buffer = noise; const bp = ac.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = f0; bp.Q.value = 5;
+    const g = ac.createGain(), p = ac.createStereoPanner(); p.pan.value = pan; g.gain.setValueAtTime(amp, t0); g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.045);
+    s.connect(bp).connect(g).connect(p).connect(master); s.start(t0, (t0 * 5.3) % 0.9, 0.06); };
+  const note = (t0, m, pan, amp, dec = 0.22, type = 'sine') => { const o = ac.createOscillator(), g = ac.createGain(), p = ac.createStereoPanner();
+    o.type = type; o.frequency.value = hz(m); p.pan.value = pan;
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(amp, t0 + 0.004); g.gain.exponentialRampToValueAtTime(0.0001, t0 + dec);
+    o.connect(g).connect(p); p.connect(master); p.connect(verb); o.start(t0); o.stop(t0 + dec + 0.03); };
+  const bell = (t0, m, amp, pn = 0) => { for (const [r2, a2, d2] of [[1, 1, 1.4], [2.76, 0.3, 0.6], [5.4, 0.1, 0.25]]) note(t0, m + 12 * Math.log2(r2), pn, amp * a2, d2); };
+  // pad: one chord per 2 bars
+  const PAD = [[45, 52, 57], [41, 48, 53], [48, 55, 60], [43, 50, 55]];
+  for (let bar = 0; bar * BEAT * 8 < TL.end + 40; bar++) {
+    const t0 = at(bar * BEAT * 8), len = BEAT * 8 / FPS;
+    for (const m of PAD[bar % PAD.length]) { const o = ac.createOscillator(), g = ac.createGain(), lp = ac.createBiquadFilter();
+      o.type = 'sawtooth'; o.frequency.value = hz(m); lp.type = 'lowpass'; lp.frequency.value = 520;
+      g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(0.022, t0 + 0.4); g.gain.exponentialRampToValueAtTime(0.0001, t0 + len);
+      o.connect(lp).connect(g).connect(master); o.start(t0); o.stop(t0 + len + 0.05); }
+  }
+  for (let b = 0; b * BEAT < TL.end; b++) { const t0 = at(b * BEAT); if (b % 2 === 0) kick(t0, 0.34); tick(t0 + BEAT / 2 / FPS, 0.02, 8000); }
+  // requests: one tick as each arrives; long ones add a low pluck
+  for (const q of REQ) { const t0 = atS(q.t); if (t0 >= dur - 0.1) continue; tick(t0, 0.05, 3000); if (q.long) note(t0, 40, 0, 0.12, 0.5, 'triangle'); }
+  // service starts: one note per start; round robin on the left, least connections on the right;
+  // a request that waited longer than a second starts a semitone flat and dull
+  const SCALE = [69, 72, 76, 79];
+  for (const [key, pan] of [['rr', -0.6], ['lc', 0.6]]) for (const j of RUN[key]) {
+    const t0 = atS(j.start); if (t0 >= at(TL.sum) || t0 >= dur - 0.1) continue;
+    if (j.wait > 1) note(t0, SCALE[j.s] - 13, pan, 0.07, 0.3, 'square'); else note(t0, SCALE[j.s], pan, 0.07);
+  }
+  [60, 64, 67, 72].forEach((m, i) => bell(at(TL.sum) + i * 0.06, m, 0.06, -0.3 + i * 0.2));
+  [72, 76, 79, 84].forEach((m, i) => bell(at(TL.end + 8 + i * 6), m, 0.07, -0.45 + i * 0.3));
+  const buf = await ac.startRendering();
+  let peak = 0; for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let k = 0; k < d.length; k++) peak = Math.max(peak, Math.abs(d[k])); }
+  if (peak > 0.89) for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let k = 0; k < d.length; k++) d[k] *= 0.89 / peak; }
+  return buf;
+}
+
+/* ==========================================================================
+   VERTICAL CUT — shared block, identical in every piece.
+   1080x1920 for Reels, Shorts and TikTok (__motion.variants.vertical). The
+   piece's own scene code is re-used and recomposed for a phone: everything a
+   viewer must read stays inside the area no platform covers (x 60..900,
+   y 230..1400); outside it there is only dimmed texture.
+   ========================================================================== */
+const VW = 1080, VH = 1920, SAFE = { x: 60, y: 230, w: 840, h: 1170, r: 900, b: 1400 };
+const vcv = document.createElement('canvas'); vcv.width = VW; vcv.height = VH;
+const vx = vcv.getContext('2d', { willReadFrequently: true });   // CPU raster: identical pixels on every redraw
+const VL = 96, VR = 864;                                          // text column inside the safe area
+
+function vReset() {
+  vx.setTransform(1, 0, 0, 1, 0, 0); vx.globalAlpha = 1; vx.globalCompositeOperation = 'source-over';
+  vx.filter = 'none'; vx.shadowBlur = 0; vx.shadowColor = 'transparent'; vx.letterSpacing = '0px'; vx.setLineDash([]);
+  vx.textAlign = 'left'; vx.textBaseline = 'alphabetic'; vx.lineCap = 'butt'; vx.lineJoin = 'miter';
+}
+/** Canvas text on the vertical frame; `max` shrinks the size until the line fits. */
+function vText(str, x, y, { size = 40, weight = 700, color = '#FFFFFF', align = 'left', spacing = 0, alpha = 1, fam = FONT, max = 0 } = {}) {
+  if (alpha <= 0.002 || !str) return size;
+  vx.font = `${weight} ${size}px ${fam}`; vx.letterSpacing = spacing + 'px';
+  if (max) { const w = vx.measureText(str).width; if (w > max) { size = size * max / w; vx.font = `${weight} ${size}px ${fam}`; } }
+  vx.textAlign = align; vx.textBaseline = 'alphabetic';
+  const a0 = vx.globalAlpha; vx.globalAlpha = a0 * alpha; vx.fillStyle = color;
+  vx.fillText(str, x + (align === 'center' ? spacing / 2 : align === 'right' ? spacing : 0), y);   // tracking is added after the last glyph too
+  vx.globalAlpha = a0; vx.letterSpacing = '0px';
+  return size;
+}
+/** Word-wraps with the given font; returns the lines. */
+function vWrap(str, maxW, size, weight = 700, fam = FONT) {
+  vx.font = `${weight} ${size}px ${fam}`; vx.letterSpacing = '0px';
+  const words = str.split(' '), lines = []; let cur = '';
+  for (const w of words) { const t = cur ? cur + ' ' + w : w; if (vx.measureText(t).width > maxW && cur) { lines.push(cur); cur = w; } else cur = t; }
+  if (cur) lines.push(cur);
+  return lines;
+}
+/** Fade envelope with a small rise: [alpha, dy]. */
+function vEnv(v, a, b, fin = 8, fout = 8) {
+  const i = E.outCubic(prog(v, a, a + fin)), o = 1 - E.inCubic(prog(v, b - fout, b));
+  return [Math.min(i, o), (1 - i) * 22 - (1 - o) * 10];
+}
+/** Which segment of a cut list a vertical frame is in: segs = [{ at, src, len }] in frames. */
+function vSeg(segs, v) {
+  let k = 0; while (k < segs.length - 1 && v >= segs[k + 1].at) k++;
+  const s = segs[k];
+  return { k, s, local: v - s.at, src: s.src + (v - s.at) };
+}
+/** Dims everything outside the safe area to a quiet texture (brightness x 0.2), with a soft inner edge. */
+function vShade(rgb, a = 0.8, feather = 40) {
+  vx.save(); vx.setTransform(1, 0, 0, 1, 0, 0); vx.globalAlpha = 1; vx.globalCompositeOperation = 'source-over';
+  vx.fillStyle = `rgba(${rgb},${a})`;
+  vx.beginPath(); vx.rect(0, 0, VW, VH); vx.rect(SAFE.x, SAFE.y, SAFE.w, SAFE.h); vx.fill('evenodd');
+  const strip = (x0, y0, x1, y1, rx, ry, rw, rh) => {
+    const g = vx.createLinearGradient(x0, y0, x1, y1);
+    g.addColorStop(0, `rgba(${rgb},${a})`); g.addColorStop(1, `rgba(${rgb},0)`);
+    vx.fillStyle = g; vx.fillRect(rx, ry, rw, rh);
+  };
+  strip(SAFE.x, 0, SAFE.x + feather, 0, SAFE.x, SAFE.y, feather, SAFE.h);
+  strip(SAFE.r, 0, SAFE.r - feather, 0, SAFE.r - feather, SAFE.y, feather, SAFE.h);
+  strip(0, SAFE.y, 0, SAFE.y + feather, SAFE.x, SAFE.y, SAFE.w, feather);
+  strip(0, SAFE.b, 0, SAFE.b - feather, SAFE.x, SAFE.b - feather, SAFE.w, feather);
+  vx.restore();
+}
+/** Series tag at the top of the safe area, e.g. MADE IN CODE · 04. */
+function vTag(label, color, alpha = 1) {
+  vText('MADE IN CODE', VL, 292, { size: 28, weight: 800, color, spacing: 5, alpha });
+  vx.font = `800 28px ${FONT}`; vx.letterSpacing = '5px';
+  const w = vx.measureText('MADE IN CODE').width; vx.letterSpacing = '0px';
+  vText('·  ' + label, VL + w + 14, 292, { size: 28, weight: 600, color: 'rgba(255,255,255,0.72)', spacing: 3, alpha, max: VR - VL - w - 14 });
+}
+/** Big hook lines, left-aligned from y0; visible from frame 0, settles in a few frames. */
+function vHook(v, lines, y0, { size = 84, lh = 1.08, color = '#FFFFFF', accent = null, weight = 800, spacing = -1.5, alpha = 1 } = {}) {
+  const k = E.outExpo(prog(v, -6, 12));
+  lines.forEach((ln, i) => {
+    const kk = E.outExpo(prog(v, -12 + i * 2, 8 + i * 2));
+    vText(ln, VL, y0 + i * size * lh + (1 - kk) * 30, { size, weight, spacing, color: accent && i === lines.length - 1 ? accent : color, alpha: alpha * Math.max(0.25, kk), max: VR - VL });
+  });
+  return k;
+}
+/** Closing card, the last 60 frames: piece title, "drawn in code · bytepatterns.com". l = frames into the card. */
+function vEndCard(l, { title, line = '', ink = '#FFFFFF', dim = 'rgba(255,255,255,0.66)', accent = '#FFFFFF', scrim = '0,0,0', a = 0.84 }) {
+  const k = E.outCubic(prog(l, 0, 12));
+  vx.save(); vx.setTransform(1, 0, 0, 1, 0, 0);
+  vx.fillStyle = `rgba(${scrim},${a * k})`; vx.fillRect(0, 0, VW, VH);
+  vx.restore();
+  const t1 = E.outExpo(prog(l, 3, 19)), t2 = E.outExpo(prog(l, 11, 27)), t3 = E.outExpo(prog(l, 19, 35));
+  vx.fillStyle = accent; vx.globalAlpha = t1; vx.fillRect(VL, 742, 88 * t1, 7); vx.globalAlpha = 1;
+  const size = vText(title, VL, 850 + (1 - t1) * 40, { size: 92, weight: 800, color: ink, spacing: -2, alpha: t1, max: VR - VL });
+  const y2 = 850 + Math.max(size, 60) * 0.25 + 70;
+  vx.font = `600 44px ${FONT}`;
+  const lead = 'drawn in code  ·  ', lw = vx.measureText(lead).width;
+  vText(lead, VL, y2 + (1 - t2) * 24, { size: 44, weight: 600, color: dim, alpha: t2 });
+  vText('bytepatterns.com', VL + lw, y2 + (1 - t2) * 24, { size: 44, weight: 800, color: accent, alpha: t2 });
+  if (line) vText(line, VL, y2 + 72 + (1 - t3) * 18, { size: 32, weight: 500, color: dim, alpha: t3, max: VR - VL });
+}
+/** Seeks a cut. The first frame a page draws is drawn twice: the very first read of a
+ *  GPU-backed source canvas can come out a shade different from every later one. */
+let vWarm = false;
+function vSeek(draw, i, frames) {
+  const f = Math.max(0, Math.min(frames - 1, Math.floor(i)));
+  if (!vWarm) { vWarm = true; draw(f); }
+  draw(f);
+}
+/** The soundtrack of a cut: the piece's own audio() spliced to the same segments as the picture. */
+async function vAudio(segs, frames, { xf = 0.025, fadeOut = 0.6, extra = null } = {}) {
+  const src = await renderAudio();
+  const SR = 48000, dur = frames / FPS, ac = new OfflineAudioContext(2, Math.round(SR * dur), SR);
+  const out = ac.createGain(); out.connect(ac.destination);
+  out.gain.setValueAtTime(1, 0); out.gain.setValueAtTime(1, dur - fadeOut); out.gain.linearRampToValueAtTime(0, dur - 0.01);
+  segs.forEach((s, k) => {
+    const at = s.at / FPS, off = s.src / FPS, d = s.len / FPS;
+    const pre = k === 0 ? 0 : Math.min(xf, off), post = k === segs.length - 1 ? 0 : xf;
+    const b = ac.createBufferSource(), g = ac.createGain(); b.buffer = src;
+    g.gain.setValueAtTime(pre ? 0 : 1, at - pre);
+    if (pre) g.gain.linearRampToValueAtTime(1, at + pre);
+    if (post) { g.gain.setValueAtTime(1, at + d - post); g.gain.linearRampToValueAtTime(0, at + d + post); }
+    b.connect(g).connect(out); b.start(at - pre, off - pre, d + pre + post);
+  });
+  if (extra) extra(ac, out);
+  const buf = await ac.startRendering();
+  let peak = 0; for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) peak = Math.max(peak, Math.abs(d[i])); }
+  if (peak > 0.9) for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) d[i] *= 0.9 / peak; }
+  return buf;
+}
+/** A soft three-partial bell, for the closing card. */
+function vChime(ac, dest, at, freq, vol = 0.08) {
+  for (const [mul, v, dec] of [[1, 1, 1.8], [2.01, 0.35, 0.8], [3.02, 0.12, 0.4]]) {
+    const o = ac.createOscillator(), g = ac.createGain(); o.type = 'sine'; o.frequency.value = freq * mul;
+    g.gain.setValueAtTime(0.0001, at); g.gain.exponentialRampToValueAtTime(vol * v, at + 0.006); g.gain.exponentialRampToValueAtTime(0.0001, at + dec);
+    o.connect(g).connect(dest); o.start(at); o.stop(at + dec + 0.05);
+  }
+}
+
+/* VERTICAL CUT — this piece */
+// The two panels stacked, round robin above least connections, with a
+// smaller scale for work (38 px a second). The same 16 s of traffic plays
+// 1.25x faster; the soundtrack is rendered from that clock.
+const TLV = buildTL({ sim0: 36, speed: 1.25, sumLen: 84, caps: [
+  [-1, 4, 'Same traffic,|two balancers.'],
+  [4, 8.5, 'Round robin: next in line,|busy or not.'],
+  [8.5, 12.5, 'Least connections:|fewest open requests.'],
+  [12.5, 16.5, 'Violet: a long request.|Red: waiting.'],
+] });
+const VFR = TLV.end + 60, VEND = VFR - 60;
+const GV = { TL: TLV, panels: [Object.assign({ cx: 480 }, PANELS[0]), Object.assign({ cx: 480 }, PANELS[1])],
+  pitch: 200, cw: 150, gap: 2, px: 38, title: 32, lbR: 13, slabH: 50, stat: 32,
+  capX: VL, capY: 360, cap: 44, capTwo: true, capMax: VR - VL,
+  sumX: VL, sumY: 600, sumH: 52, sumGap: 170, sumN: 50, sumV: 34, sumL: 34, sumAlign: 'left', sumMax: VR - VL, sumStack: true };
+const GVP = [                                                 // per-panel vertical geometry
+  { titleY: 488, lbY: 522, topY: 560, baseY: 800, statY: 902 },
+  { titleY: 976, lbY: 1010, topY: 1048, baseY: 1288, statY: 1378 },
+];
+function hookV(v) {
+  const o = 1 - E.inCubic(prog(v, TLV.sim0 - 14, TLV.sim0 - 2));
+  if (o <= 0) return;
+  vHook(v, ['Round robin', 'is fair.', 'That is', 'the problem.'], 470, { size: 108, accent: C.rr, color: C.paper, weight: 900, spacing: -2, alpha: o });
+}
+function sceneV(v) {
+  const TL = TLV, a = E.outCubic(prog(v, TL.sim0 - 16, TL.sim0 - 2));
+  PANELS.forEach((P, i) => panel(vx, Object.assign({}, GV, GVP[i]), Object.assign({ cx: 480 }, P), v, a));
+  caption(vx, GV, v); summary(vx, GV, v);
+}
+function vDraw(v) {
+  vReset();
+  backdrop(vx, VW, VH);
+  sceneV(v);
+  hookV(v);
+  vReset();
+  vShade(C.bgRGB, 0.84);
+  vTag('LOAD BALANCING', C.lc);
+  if (v >= VEND) vEndCard(v - VEND, { title: 'Round Robin vs Least Connections', line: `p95 wait ${fmt(ST.rr.p95)} vs ${fmt(ST.lc.p95)}  ·  ${REQ.length} requests`,
+    ink: C.paper, dim: 'rgba(236,238,246,0.72)', accent: C.lc, scrim: C.bgRGB, a: 0.9 });
+  vReset();
+}
+
+window.__motion = {
+  title: 'Round Robin vs Least Connections',
+  description: `The same ${REQ.length} seeded requests (${LONGS} of them long) go through two load balancers to four servers each, stacked as blocks of remaining work: round robin waits ${fmt(ST.rr.mean)} on average (p95 ${fmt(ST.rr.p95)}), least connections ${fmt(ST.lc.mean)} (p95 ${fmt(ST.lc.p95)}); on ${OTHER} other seeded streams least connections had the lower p95 wait ${LC_WINS} times.`,
+  fps: FPS, width: W, height: H, frames: FRAMES,
+  poster: TLL.fr(11.5),
+  gifStart: Math.floor(TLL.fr(7) / FPS),
+  seek(i) { draw(Math.max(0, Math.min(FRAMES - 1, Math.floor(i)))); },
+  audio: () => renderAudio(TLL, FRAMES),
+  variants: {
+    vertical: {
+      width: VW, height: VH, frames: VFR, canvas: vcv,
+      poster: TLV.fr(11.5), gifStart: Math.floor(TLV.fr(6) / FPS),
+      seek(i) { vSeek(vDraw, i, VFR); },
+      audio: () => renderAudio(TLV, VFR),
+    },
+  },
+};
+
+/* ==========================================================================
+   PLAYER — identical in every piece; keep as is.
+   Autoplays and loops, starts sound on the first click, ?frame=N pauses on a
+   frame, ?variant=vertical plays the vertical cut (if the piece has one).
+   When the renderer sets window.__MOTION_RENDER__ it stays out of the way.
+   ========================================================================== */
+(function player() {
+  const btn = document.getElementById('sound'), q = new URLSearchParams(location.search);
+  let M = window.__motion;
+  const V = !window.__MOTION_RENDER__ && M.variants && M.variants[q.get('variant')];
+  if (V) {                                                // show the variant's own canvas instead
+    M = Object.assign({}, M, V);
+    V.canvas.style.cssText = `width:min(100vw,calc(100vh*${V.width}/${V.height}));height:auto;aspect-ratio:${V.width}/${V.height}`;
+    document.querySelector('canvas').replaceWith(V.canvas);
+  }
+  const dur = M.frames / M.fps;
+  if (window.__MOTION_RENDER__) { btn.hidden = true; M.seek(0); return; }
+  if (q.has('frame')) { btn.hidden = true; M.seek(+q.get('frame') || 0); return; }
+  let t0 = performance.now(), ac = null, src = null, buf = null, paused = false, pausedAt = 0;
+  const clock = () => ac && src ? (ac.currentTime - t0) : (performance.now() - t0) / 1000;
+  function loop() {
+    if (!paused) M.seek(Math.floor(((clock() % dur) + dur) % dur * M.fps));
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+  btn.addEventListener('click', async () => {
+    if (src) { src.stop(); src = null; btn.textContent = 'Click for sound'; t0 = performance.now(); return; }
+    btn.textContent = 'Loading sound…';
+    ac = ac || new AudioContext({ sampleRate: 48000 });
+    buf = buf || await M.audio();
+    await ac.resume();
+    src = ac.createBufferSource(); src.buffer = buf; src.loop = true; src.connect(ac.destination);
+    t0 = ac.currentTime + 0.05; src.start(t0);        // picture restarts from frame 0 in sync with the sound
+    btn.textContent = 'Sound on — click to mute';
+  });
+  addEventListener('keydown', e => {
+    if (e.code !== 'Space') return;
+    e.preventDefault(); paused = !paused;
+    if (ac) paused ? ac.suspend() : ac.resume();
+    if (!ac) { if (paused) pausedAt = performance.now(); else t0 += performance.now() - pausedAt; }
+  });
+})();
+</script>
+</body>
+</html>

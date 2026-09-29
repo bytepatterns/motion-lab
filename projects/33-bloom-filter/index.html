@@ -1,0 +1,667 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="author" content="teambytepatterns">
+<meta name="description" content="Kinetic type: seven words hashed three times each into a 32-bit Bloom filter with real FNV-1a, then three lookups: one maybe, one definitely not, one false positive.">
+<title>Bloom Filter: No, or Maybe — motion-lab</title>
+<style>
+  /* Player chrome. The piece itself lives entirely in the canvas. */
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  body { display: grid; place-items: center; font: 500 15px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #fff; }
+  canvas { display: block; width: min(100vw, calc(100vh * 16 / 9)); height: auto; aspect-ratio: 16 / 9; }
+  #sound { position: fixed; left: 16px; bottom: 16px; padding: 8px 14px; border: 1px solid rgba(255,255,255,.35); border-radius: 999px;
+           background: rgba(0,0,0,.55); color: #fff; font: inherit; cursor: pointer; }
+  #sound[hidden] { display: none; }
+</style>
+</head>
+<body>
+<canvas id="stage" width="1920" height="1080" aria-label="Big words drop in one at a time; three coloured hash lines run from each word to a row of 32 bits and flip them to 1; then three words are looked up and answered maybe, definitely not, and a false maybe"></canvas>
+<button id="sound" type="button">Click for sound</button>
+<script>
+'use strict';
+/* ==========================================================================
+   PIECE — Bloom Filter: No, or Maybe.
+   A Bloom filter is a row of m bits and k hash functions. To ADD a word,
+   set the k bits its hashes point to. To LOOK UP a word, check those k
+   bits: if any is 0 the word was DEFINITELY NOT added; if all are 1 it
+   MAYBE was: other words may have set the same bits (a false positive).
+   Here m = 32 and k = 3, and hash i of a word is 32-bit FNV-1a of the
+   string "i:word", modulo 32 (FNV-1a: h = 2166136261; for each byte,
+   h ^= byte, h *= 16777619).
+   The words, the bits, the lookups and the numbers at the end are all
+   computed at load: the lookups are the fourth added word, the first word
+   of a fixed list of others whose bits are not all set, and the
+   first one whose bits all are. The measured false-positive rate is
+   counted over 1,000 strings that were never added.
+   ========================================================================== */
+const W = 1920, H = 1080, FPS = 30;
+const cv = document.getElementById('stage');
+const ctx = cv.getContext('2d', { willReadFrequently: true });   // CPU raster: identical pixels on every redraw
+const FONT = 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
+const MONO = 'ui-monospace, "Cascadia Code", Consolas, Menlo, monospace';
+
+// ---- helpers -------------------------------------------------------------
+// ---- helpers -------------------------------------------------------------
+function mulberry32(a) { return function () { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a);
+  t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const lerp = (a, b, t) => a + (b - a) * t;
+const prog = (f, a, b) => clamp((f - a) / (b - a));
+const smooth = t => t * t * (3 - 2 * t);
+const E = {
+  inCubic: t => t * t * t,
+  outCubic: t => 1 - Math.pow(1 - t, 3),
+  inOutCubic: t => t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2,
+  outExpo: t => t === 1 ? 1 : 1 - Math.pow(2, -10 * t),
+  inExpo: t => t === 0 ? 0 : Math.pow(2, 10 * t - 10),
+  inOutExpo: t => t === 0 ? 0 : t === 1 ? 1 : t < .5 ? Math.pow(2, 20 * t - 10) / 2 : (2 - Math.pow(2, -20 * t + 10)) / 2,
+  outBack: t => 1 + 2.70158 * Math.pow(t - 1, 3) + 1.70158 * Math.pow(t - 1, 2),
+};
+/** Canvas text; `max` shrinks the size until the line fits. Returns the width drawn. */
+function text(g, str, x, y, { size = 40, weight = 600, color = '#fff', alpha = 1, spacing = 0, align = 'left', fam = FONT, base = 'alphabetic', max = 0 } = {}) {
+  if (alpha <= 0.002 || !str) return 0;
+  g.font = `${weight} ${size}px ${fam}`; g.letterSpacing = spacing + 'px';
+  if (max) { const w0 = g.measureText(str).width; if (w0 > max) { size *= max / w0; g.font = `${weight} ${size}px ${fam}`; } }
+  g.textAlign = align; g.textBaseline = base;
+  const a0 = g.globalAlpha; g.globalAlpha = a0 * alpha; g.fillStyle = color;
+  g.fillText(str, x, y);
+  const w = g.measureText(str).width;
+  g.globalAlpha = a0; g.letterSpacing = '0px';
+  return w;
+}
+const measure = (g, str, size, weight = 800, fam = FONT, spacing = 0) => { g.font = `${weight} ${size}px ${fam}`; g.letterSpacing = spacing + 'px'; const w = g.measureText(str).width; g.letterSpacing = '0px'; return w; };
+const env = (f, a, b, fin = 12, fout = 10) => {
+  const i = E.outCubic(prog(f, a, a + fin)), o = 1 - E.inCubic(prog(f, b - fout, b));
+  return [Math.min(i, o), (1 - i) * 24 - (1 - o) * 10];
+};
+
+// ---- palette -------------------------------------------------------------
+const C = {
+  bg: '#120E14', bgRGB: '18,14,20', paper: '#F5EEF2', dim: 'rgba(245,238,242,0.62)', faint: 'rgba(245,238,242,0.16)',
+  cell: '#1E1822', on: '#FFD166', onRGB: '255,209,102',
+  h: ['#FF6FA1', '#6FD3FF', '#B5F07A'],
+  maybe: '#FFD166', no: '#5EE0C0', fp: '#FF6B5E',
+};
+
+// ---- the model: FNV-1a, a 32-bit Bloom filter, computed once at load ------------------------
+function fnv1a(s) {                                          // 32-bit FNV-1a over the UTF-16 code units (ASCII here)
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619) >>> 0; }
+  return h >>> 0;
+}
+const M = 32, K = 3;
+const hashes = w => [1, 2, 3].map(i => fnv1a(i + ':' + w) % M);
+const SET = ['cat', 'dog', 'owl', 'fox', 'bee', 'elk', 'ant'];
+const BITS = new Array(M).fill(0);
+for (const w of SET) for (const b of hashes(w)) BITS[b] = 1;
+const ONES = BITS.reduce((a, b) => a + b, 0);
+const maybe = w => hashes(w).every(b => BITS[b]);
+const OTHERS = ['yak', 'emu', 'pig', 'cow', 'bat', 'rat', 'hen', 'ram', 'eel', 'gnu', 'ape', 'koi', 'jay', 'cod'];
+const QUERIES = [
+  { w: SET[3], kind: 'in' },
+  { w: OTHERS.find(w => !maybe(w)), kind: 'no' },
+  { w: OTHERS.find(w => maybe(w)), kind: 'fp' },
+];
+const PROBE = 1000;
+const FP = (() => { let n = 0; for (let i = 0; i < PROBE; i++) if (maybe('probe' + i)) n++; return n; })();
+const EST = Math.pow(1 - Math.exp(-K * SET.length / M), K);
+const pctS = x => (x * 100).toFixed(1) + '%';
+
+// ---- timeline (frames) ---------------------------------------------------------------------
+function buildTL(o) {
+  const TL = { o, ins: [], q: [] };
+  let t = o.start;
+  SET.forEach((w, n) => {
+    const s = n < o.slowN ? o.slow : 1;
+    const e = { w, n, h: hashes(w), t0: t };
+    const L = o.letters * s, gap = o.gap * s, arr = o.arrow * s, hold = o.hold * s, ex = o.exit * s;
+    e.th = [0, 1, 2].map(i => Math.round(t + L + i * gap));
+    e.ta = e.th.map(x => Math.round(x + arr));
+    e.t1 = Math.round(e.ta[2] + hold); e.t2 = Math.round(e.t1 + ex);
+    TL.ins.push(e);
+    t = e.t1 + Math.round(ex * o.overlap);
+  });
+  TL.insEnd = TL.ins[SET.length - 1].t2;
+  t = TL.insEnd + o.pause;
+  TL.qStart = t;
+  QUERIES.forEach((q, k) => {
+    const e = { w: q.w, kind: q.kind, k, h: hashes(q.w), t0: t };
+    e.th = [0, 1, 2].map(i => Math.round(t + o.qLetters + i * o.qGap));
+    e.ta = e.th.map(x => Math.round(x + o.qArrow));
+    e.tv = e.ta[2] + 4;
+    e.t1 = e.tv + o.qHold + (q.kind === 'fp' ? o.fpExtra : 0); e.t2 = e.t1 + o.exit;
+    TL.q.push(e);
+    t = e.t2 + 2;
+  });
+  TL.stats = t + 4;
+  TL.end = TL.stats + o.statLen;
+  TL.caps = [
+    [o.start - 6, TL.ins[1].t1, 'Add a word:|set the 3 bits its hashes pick.'],
+    [TL.ins[1].t1 - 2, TL.insEnd + 6, 'Seven words.|Some bits get picked twice.'],
+    [TL.qStart - 4, TL.q[1].t0 + 2, 'Look one up:|check the same 3 bits.'],
+    [TL.q[1].t0 - 2, TL.q[2].t0 + 2, 'One bit is 0?|Definitely not.'],
+    [TL.q[2].t0 - 2, TL.stats + 4, 'All 3 are 1?|Maybe. Only maybe.'],
+  ];
+  TL.hits = [];                                             // every bit write, for the flashes and the sound
+  for (const e of TL.ins) e.h.forEach((b, i) => TL.hits.push({ t: e.ta[i], b, i, n: e.n }));
+  return TL;
+}
+const TLL = buildTL({ start: 58, slowN: 2, slow: 1.7, letters: 7, gap: 5, arrow: 8, hold: 5, exit: 9, overlap: 0.55,
+  pause: 18, qLetters: 10, qGap: 7, qArrow: 9, qHold: 30, fpExtra: 26, statLen: 110 });
+const FRAMES = TLL.end + 72;
+
+// ---- drawing ------------------------------------------------------------------------------
+function cellXY(G, b) {
+  const per = M / G.rows, r = Math.floor(b / per), c = b % per;
+  return [G.cx + (c - (per - 1) / 2) * G.pitch, G.bitY + r * G.rowGap];
+}
+/** A point on the cubic from the word to the top of cell b, at u in 0..1. */
+/** Centre x of part i of a word's hash readout. */
+function roX(G, e, i) {
+  const gw = measure(ctx, '     ', G.ro, 700, MONO), ws = e.h.map((b, k) => measure(ctx, `h${'₁₂₃'[k]} = ${b}`, G.ro, 700, MONO));
+  let x = G.wx - (ws.reduce((a, b) => a + b, 0) + gw * 2) / 2;
+  for (let k = 0; k < i; k++) x += ws[k] + gw;
+  return x + ws[i] / 2;
+}
+function arrowPt(G, i, b, u, x0) {
+  const y0 = G.roY + G.a0;
+  const [x3, cy] = cellXY(G, b), y3 = cy - G.cs / 2 - 8;
+  const x1 = x0, y1 = y0 + (y3 - y0) * 0.55, x2 = x3, y2 = y3 - (y3 - y0) * 0.45;
+  const m = 1 - u;
+  return [m * m * m * x0 + 3 * m * m * u * x1 + 3 * m * u * u * x2 + u * u * u * x3, m * m * m * y0 + 3 * m * m * u * y1 + 3 * m * u * u * y2 + u * u * u * y3];
+}
+function arrow(g, G, i, b, u, alpha, lw, x0) {
+  if (u <= 0 || alpha <= 0.01) return;
+  g.save(); g.globalAlpha = alpha; g.strokeStyle = C.h[i]; g.lineWidth = lw; g.lineCap = 'round';
+  g.beginPath();
+  const n = 28; for (let k = 0; k <= n; k++) { const [x, y] = arrowPt(G, i, b, u * k / n, x0); k ? g.lineTo(x, y) : g.moveTo(x, y); }
+  g.stroke();
+  const [hx, hy] = arrowPt(G, i, b, u, x0);
+  g.fillStyle = C.h[i]; g.beginPath(); g.arc(hx, hy, lw * 1.9, 0, Math.PI * 2); g.fill();
+  g.restore();
+}
+/** A big word whose letters drop in one by one from t0; `scale`/`dx`/`dy` move it as a whole. */
+function bigWord(g, G, w, f, t0, { color = C.paper, alpha = 1, scale = 1, x = G.wx, y = G.wy, size = G.word, stag = 2.5, outline = false } = {}) {
+  if (alpha <= 0.01) return;
+  g.save(); g.translate(x, y); g.scale(scale, scale);
+  const sp = -size * 0.02, tot = measure(g, w, size, 900, FONT, sp);
+  let cx = -tot / 2;
+  for (let k = 0; k < w.length; k++) {
+    const ch = w[k], cw = measure(g, ch, size, 900, FONT, sp);
+    const p = prog(f, t0 + k * stag, t0 + k * stag + 10), e = E.outBack(p);
+    if (p > 0) {
+      const dy = (1 - e) * -size * 0.5;
+      if (outline) { g.font = `900 ${size}px ${FONT}`; g.letterSpacing = sp + 'px'; g.textAlign = 'left'; g.textBaseline = 'alphabetic';
+        g.globalAlpha = alpha * clamp(p * 2); g.strokeStyle = color; g.lineWidth = size * 0.035; g.strokeText(ch, cx, size * 0.34 + dy); g.letterSpacing = '0px'; g.globalAlpha = 1; }
+      else text(g, ch, cx, size * 0.34 + dy, { size, weight: 900, color, alpha: alpha * clamp(p * 2), spacing: sp });
+    }
+    cx += cw;
+  }
+  g.restore();
+}
+/** The hash readout under the word: h1 22   h2 15   h3 12, each part appearing with its arrow. */
+function readout(g, G, e, f, alpha) {
+  if (alpha <= 0.01) return;
+  const parts = e.h.map((b, i) => [`h${'₁₂₃'[i]} = ${b}`, i]);
+  const gapS = '     ', gw = measure(g, gapS, G.ro, 700, MONO);
+  const ws = parts.map(([s]) => measure(g, s, G.ro, 700, MONO));
+  let x = G.wx - (ws.reduce((a, b) => a + b, 0) + gw * 2) / 2;
+  parts.forEach(([s, i], k) => {
+    const a = E.outCubic(prog(f, e.th[i] - 2, e.th[i] + 5));
+    text(g, s, x, G.roY + (1 - a) * 12, { size: G.ro, weight: 700, color: C.h[i], fam: MONO, alpha: alpha * a });
+    x += ws[k] + gw;
+  });
+}
+function bitsRow(g, G, f) {
+  const TL = G.TL;
+  const qNow = TL.q.find(q => f >= q.t0 && f < q.t2);
+  for (let b = 0; b < M; b++) {
+    const [x, y] = cellXY(G, b);
+    let on = 0, flash = 0;
+    for (const h of TL.hits) if (h.b === b && f >= h.t) { on = 1; flash = Math.max(flash, Math.exp(-(f - h.t) / 7)); }
+    const pop = 1 + 0.25 * flash;
+    g.save(); g.translate(x, y); g.scale(pop, pop);
+    g.fillStyle = on ? C.on : C.cell; g.beginPath(); g.roundRect(-G.cs / 2, -G.cs / 2, G.cs, G.cs, 7); g.fill();
+    if (!on) { g.strokeStyle = C.faint; g.lineWidth = 1.5; g.stroke(); }
+    if (flash > 0.02) { g.globalAlpha = flash; g.strokeStyle = C.paper; g.lineWidth = 3; g.beginPath(); g.roundRect(-G.cs / 2 - 5, -G.cs / 2 - 5, G.cs + 10, G.cs + 10, 10); g.stroke(); g.globalAlpha = 1; }
+    // a lookup checks this bit: a ring, green-ish when it is 1, red when it is 0
+    if (qNow) qNow.h.forEach((qb, i) => {
+      if (qb !== b || f < qNow.ta[i]) return;
+      const a = 1 - E.inCubic(prog(f, qNow.t1, qNow.t2)), k = E.outBack(prog(f, qNow.ta[i], qNow.ta[i] + 8));
+      g.globalAlpha = a; g.strokeStyle = BITS[b] ? C.h[i] : C.fp; g.lineWidth = 4;
+      const r = G.cs / 2 + 4 + 6 * k; g.beginPath(); g.roundRect(-r, -r, 2 * r, 2 * r, 10); g.stroke(); g.globalAlpha = 1;
+    });
+    text(g, on ? '1' : '0', 0, G.bitNum * 0.36, { size: G.bitNum, weight: 800, color: on ? C.bg : 'rgba(245,238,242,0.34)', fam: MONO, align: 'center' });
+    g.restore();
+    // the index of a bit that is being hit, under it (landscape only)
+    if (G.idx) {
+      let ia = 0, col = C.dim;
+      for (const e of [...TL.ins, ...TL.q]) e.h.forEach((hb, i) => {
+        if (hb !== b) return; const a = Math.min(E.outCubic(prog(f, e.ta[i] - 2, e.ta[i] + 4)), 1 - E.inCubic(prog(f, e.t1, e.t2)));
+        if (a > ia) { ia = a; col = C.h[i]; }
+      });
+      if (ia > 0.01) text(g, String(b), x, y + G.cs / 2 + G.idx + 10, { size: G.idx, weight: 800, color: col, fam: MONO, align: 'center', alpha: ia });
+    }
+  }
+}
+function words(g, G, f) {
+  const TL = G.TL;
+  for (const e of TL.ins) {
+    if (f < e.t0 - 2 || f > e.t2 + 400) continue;
+    const u = E.inOutCubic(prog(f, e.t1, e.t2));
+    const [lx, ly] = listXY(G, e.n);
+    if (u < 1) {
+      const sc = lerp(1, G.listSize / G.word, u);
+      bigWord(g, G, e.w, f, e.t0, { x: lerp(G.wx, lx, u), y: lerp(G.wy, ly - G.listSize * 0.34 + G.listSize * 0.02, u), scale: sc, alpha: 1 });
+      readout(g, G, e, f, 1 - E.inCubic(prog(f, e.t1, e.t1 + 6)));
+      e.h.forEach((b, i) => arrow(g, G, i, b, E.outCubic(prog(f, e.th[i], e.ta[i])), 1 - E.inCubic(prog(f, e.t1, e.t1 + 7)), G.alw, roX(G, e, i)));
+    }
+  }
+  for (const e of TL.q) {
+    if (f < e.t0 - 2 || f > e.t2) continue;
+    const out = E.inCubic(prog(f, e.t1, e.t2));
+    const col = f >= e.tv ? (e.kind === 'no' ? C.no : e.kind === 'fp' && f >= e.tv + TL.o.fpExtra * 0.6 ? C.fp : C.maybe) : C.paper;
+    bigWord(g, G, e.w, f, e.t0, { alpha: 1 - out, y: G.wy - out * 40, color: col, stag: 3.5, outline: f < e.tv });
+    readout(g, G, e, f, 1 - out);
+    e.h.forEach((b, i) => arrow(g, G, i, b, E.outCubic(prog(f, e.th[i], e.ta[i])), (1 - out) * (BITS[b] ? 1 : 0.9), G.alw, roX(G, e, i)));
+    verdict(g, G, e, f, 1 - out);
+  }
+}
+function verdict(g, G, e, f, alpha) {
+  const k = E.outBack(prog(f, e.tv, e.tv + 10)), a = alpha * clamp(prog(f, e.tv, e.tv + 5));
+  if (a <= 0.01) return;
+  const zero = e.h.find(b => !BITS[b]);
+  const [big, col, small] = e.kind === 'in' ? ['MAYBE', C.maybe, `all 3 bits are 1, and “${e.w}” was added`]
+    : e.kind === 'no' ? ['DEFINITELY NOT', C.no, `bit ${zero} is 0, so “${e.w}” was never added`]
+    : ['MAYBE', C.maybe, `all 3 bits are 1, set by other words`];
+  g.save(); g.translate(G.vX, G.vY); g.scale(lerp(0.7, 1, k), lerp(0.7, 1, k));
+  text(g, big, 0, 0, { size: G.vS, weight: 900, color: col, spacing: 4, align: G.vAlign, alpha: a, max: G.vMax });
+  g.restore();
+  const r = e.kind === 'fp' ? E.outCubic(prog(f, e.tv + e.fpX, e.tv + e.fpX + 10)) : 0;
+  text(g, small, G.vX, G.vY + G.vS * 0.62 + 14, { size: G.vs, weight: 650, color: C.paper, align: G.vAlign, alpha: a * 0.9 * (1 - r), max: G.vMax });
+  if (e.kind === 'fp') {                                    // the reveal: it was never added
+    if (r > 0.01) {
+      const tw = measure(g, big, G.vS, 900, FONT, 4), x0 = G.vAlign === 'center' ? G.vX - tw / 2 : G.vX;
+      g.save(); g.globalAlpha = a * r; g.strokeStyle = C.fp; g.lineWidth = 8; g.lineCap = 'round';
+      g.beginPath(); g.moveTo(x0 - 10, G.vY - G.vS * 0.3); g.lineTo(x0 - 10 + (tw + 20) * r, G.vY - G.vS * 0.3); g.stroke(); g.restore();
+      text(g, `“${e.w}” was never added: a false positive`, G.vX, G.vY + G.vS * 0.62 + 14 + (1 - r) * 16, { size: G.vs, weight: 850, color: C.fp, align: G.vAlign, alpha: a * r, max: G.vMax });
+    }
+  }
+}
+function listXY(G, n) {
+  let x = G.listX + G.listLab;
+  for (let k = 0; k < n; k++) x += measure(ctx, SET[k], G.listSize, 900, FONT, -G.listSize * 0.02) + G.listGap;
+  const w = measure(ctx, SET[n], G.listSize, 900, FONT, -G.listSize * 0.02);
+  return [x + w / 2, G.listY];
+}
+function setList(g, G, f) {
+  const TL = G.TL, [a] = env(f, TL.o.start + 10, TL.stats + 10, 10, 10);
+  if (a <= 0) return;
+  text(g, 'added', G.listX, G.listY, { size: G.listSize * 0.8, weight: 700, color: C.dim, spacing: 2, alpha: a });
+  for (const e of TL.ins) if (f >= e.t2) { const [x] = listXY(G, e.n); text(g, e.w, x, G.listY, { size: G.listSize, weight: 900, color: C.paper, spacing: -G.listSize * 0.02, align: 'center', alpha: a }); }
+  let ones = 0; const seen = new Set(); for (const h of TL.hits) if (f >= h.t && !seen.has(h.b)) { seen.add(h.b); ones++; }
+  const s1 = `${ones}`, s2 = ` of ${M} bits set`;
+  const w2 = measure(g, s2, G.listSize * 0.8, 700);
+  text(g, s1, G.cntX - w2, G.cntY, { size: G.listSize, weight: 900, color: C.on, fam: MONO, align: 'right', alpha: a });
+  text(g, s2, G.cntX - w2, G.cntY, { size: G.listSize * 0.8, weight: 700, color: C.dim, alpha: a });
+}
+function stats(g, G, f) {
+  const TL = G.TL, out = 1 - E.inCubic(prog(f, TL.end - 4, TL.end + 12));
+  const k1 = E.outCubic(prog(f, TL.stats, TL.stats + 16)) * out, k2 = E.outCubic(prog(f, TL.stats + 12, TL.stats + 28)) * out, k3 = E.outCubic(prog(f, TL.stats + 26, TL.stats + 42)) * out;
+  if (k1 <= 0) return;
+  const lines = [
+    [`${SET.length} words  ·  ${M} bits  ·  ${K} hashes  ·  ${ONES} bits set`, C.paper, 850, G.st1, k1],
+    [`${PROBE.toLocaleString('en-US')} strings never added: ${FP} came back maybe (${pctS(FP / PROBE)})`, C.maybe, 700, G.st2, k2],
+    [`“No” is always right. “Maybe” can be wrong.`, C.no, 800, G.st2, k3],
+  ];
+  let y = G.stY;
+  for (const [s, c, wt, sz, k] of lines) {
+    const ls = G.stWrap ? vWrap(s, G.stMax, sz, wt) : [s];
+    ls.forEach(l => { text(g, l, G.stX, y + (1 - k) * 18, { size: sz, weight: wt, color: c, align: G.stAlign, alpha: k, max: G.stMax }); y += sz * 1.28; });
+    y += sz * 0.45;
+  }
+}
+function caption(g, G, f) {
+  for (const [t0, t1, str] of G.TL.caps) {
+    const [a, dy] = env(f, t0, t1, 10, 8); if (a <= 0) continue;
+    const [p1, p2] = str.split('|');
+    if (G.capTwo) {
+      text(g, p1, G.capX, G.capY + dy, { size: G.cap, weight: 850, color: C.paper, spacing: -1, alpha: a, max: G.capMax });
+      text(g, p2, G.capX, G.capY + G.cap * 1.14 + dy, { size: G.cap, weight: 850, color: C.h[0], spacing: -1, alpha: a, max: G.capMax });
+    } else {
+      const w1 = text(g, p1 + ' ', G.capX, G.capY + dy, { size: G.cap, weight: 850, color: C.paper, spacing: -1, alpha: a });
+      text(g, p2, G.capX + w1, G.capY + dy, { size: G.cap, weight: 850, color: C.h[0], spacing: -1, alpha: a });
+    }
+  }
+}
+function backdrop(g, w, h) { g.fillStyle = C.bg; g.fillRect(0, 0, w, h); }
+function scene(g, G, f) {
+  const TL = G.TL, a = E.outCubic(prog(f, TL.o.start - 20, TL.o.start - 2)), fin = 1 - E.inCubic(prog(f, TL.stats - 4, TL.stats + 14)) * 0.72;
+  g.save(); g.globalAlpha = a * fin; bitsRow(g, G, f); g.restore();
+  words(g, G, f); setList(g, G, f); caption(g, G, f); stats(g, G, f);
+}
+
+// ---- landscape picture ------------------------------------------------------------------
+const GL = { TL: TLL, cx: 960, rows: 1, pitch: 52, cs: 44, bitY: 790, rowGap: 0, bitNum: 28, idx: 30,
+  wx: 960, wy: 460, word: 156, alw: 4, ro: 40, roY: 580, a0: 20,
+  vX: 960, vY: 960, vS: 76, vs: 34, vAlign: 'center', vMax: 1500,
+  listX: 128, listY: 296, listLab: 120, listSize: 36, listGap: 34, cntX: 1792, cntY: 296,
+  capX: 120, capY: 216, cap: 52, capTwo: false, capMax: 1680,
+  stX: 960, stY: 380, st1: 56, st2: 44, stAlign: 'center', stMax: 1680, stWrap: false };
+function hookL(f) {
+  const o = 1 - E.inCubic(prog(f, TLL.o.start - 20, TLL.o.start - 4));
+  if (o <= 0) return;
+  const k = E.outExpo(prog(f, -8, 10)), k2 = E.outBack(prog(f, -6, 12));
+  text(ctx, 'Is it in the set?', W / 2, 520 + (1 - k) * 30, { size: 124, weight: 900, color: C.paper, spacing: -3, align: 'center', alpha: o * Math.max(0.3, k) });
+  const w1 = measure(ctx, 'No. ', 124, 900, FONT, -3), w2 = measure(ctx, 'Or maybe.', 124, 900, FONT, -3), x0 = W / 2 - (w1 + w2) / 2;
+  text(ctx, 'No. ', x0, 670 + (1 - clamp(k2)) * 30, { size: 124, weight: 900, color: C.no, spacing: -3, alpha: o * Math.max(0.3, clamp(k2)) });
+  text(ctx, 'Or maybe.', x0 + w1, 670 + (1 - clamp(k2)) * 30, { size: 124, weight: 900, color: C.maybe, spacing: -3, alpha: o * Math.max(0.3, clamp(k2)) });
+}
+function draw(f) {
+  if (ctx.reset) ctx.reset();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; ctx.filter = 'none'; ctx.shadowBlur = 0;
+  backdrop(ctx, W, H);
+  const T = TLL, endK = E.inOutCubic(prog(f, T.end, T.end + 20)), a = 1 - endK;
+  text(ctx, 'DATA STRUCTURES  ·  BLOOM FILTER', 120, 104, { size: 26, weight: 600, color: C.dim, spacing: 5, alpha: a });
+  text(ctx, 'BYTEPATTERNS', 1800, 104, { size: 26, weight: 600, color: C.dim, spacing: 5, align: 'right', alpha: a });
+  scene(ctx, GL, f);
+  hookL(f);
+  if (endK > 0) {
+    ctx.fillStyle = `rgba(${C.bgRGB},${0.9 * endK})`; ctx.fillRect(0, 0, W, H);
+    const k1 = E.outCubic(prog(f, T.end + 6, T.end + 28)), k2 = E.outCubic(prog(f, T.end + 16, T.end + 38)), k3 = E.outCubic(prog(f, T.end + 26, T.end + 48));
+    text(ctx, 'Bloom Filter', W / 2, 500 + (1 - k1) * 30, { size: 140, weight: 850, color: C.paper, spacing: -3, align: 'center', alpha: k1 });
+    text(ctx, `${M} bits  ·  ${K} FNV-1a hashes  ·  no, or maybe`, W / 2, 580 + (1 - k2) * 20, { size: 42, weight: 500, color: C.maybe, align: 'center', alpha: k2 });
+    text(ctx, 'drawn in code  ·  bytepatterns.com', W / 2, 1000, { size: 32, weight: 600, color: C.paper, spacing: 3, align: 'center', alpha: k3 * 0.8 });
+  }
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.letterSpacing = '0px';
+}
+
+// ---- sound: 112.5 BPM; letters click, every bit written is a marimba note, lookups answer --------
+const BEAT = 16;
+const PENTA = [0, 2, 4, 7, 9];
+const noteOfBit = b => { const i = Math.floor(b / M * 15); return 60 + 12 * Math.floor(i / 5) + PENTA[i % 5]; };
+async function renderAudio(TL = TLL, frames = FRAMES) {
+  const SR = 48000, dur = frames / FPS, LEN = Math.round(SR * dur);
+  const ac = new OfflineAudioContext(2, LEN, SR);
+  const at = fr => fr / FPS;
+  const comp = ac.createDynamicsCompressor();
+  comp.threshold.value = -14; comp.ratio.value = 3.5; comp.attack.value = 0.003; comp.release.value = 0.18;
+  const master = ac.createGain(); master.gain.value = 0.95; master.connect(comp).connect(ac.destination);
+  master.gain.setValueAtTime(0.95, dur - 0.8); master.gain.linearRampToValueAtTime(0.0001, dur - 0.02);
+  const rnd = mulberry32(0x33B7);
+  const ir = ac.createBuffer(2, SR * 1.6, SR);
+  for (let c = 0; c < 2; c++) { const d = ir.getChannelData(c); for (let k = 0; k < d.length; k++) d[k] = (rnd() * 2 - 1) * Math.pow(1 - k / d.length, 3.6); }
+  const verb = ac.createConvolver(); verb.buffer = ir; const vg = ac.createGain(); vg.gain.value = 0.22; verb.connect(vg).connect(master);
+  const noise = ac.createBuffer(1, SR, SR); { const d = noise.getChannelData(0); for (let k = 0; k < d.length; k++) d[k] = rnd() * 2 - 1; }
+  const hz = m => 440 * Math.pow(2, (m - 69) / 12);
+  const kick = (t0, amp = 0.4) => { const o = ac.createOscillator(), g = ac.createGain();
+    o.frequency.setValueAtTime(130, t0); o.frequency.exponentialRampToValueAtTime(44, t0 + 0.13);
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(amp, t0 + 0.004); g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.28);
+    o.connect(g).connect(master); o.start(t0); o.stop(t0 + 0.3); };
+  const click = (t0, amp, f0, pan = 0) => { const s = ac.createBufferSource(); s.buffer = noise; const bp = ac.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = f0; bp.Q.value = 6;
+    const g = ac.createGain(), p = ac.createStereoPanner(); p.pan.value = pan; g.gain.setValueAtTime(amp, t0); g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.035);
+    s.connect(bp).connect(g).connect(p).connect(master); s.start(t0, (t0 * 3.3) % 0.9, 0.05); };
+  const tone = (t0, m, pan, amp, dec, type = 'sine') => { if (hz(m) > 18000) return; const o = ac.createOscillator(), g = ac.createGain(), p = ac.createStereoPanner();
+    o.type = type; o.frequency.value = hz(m); p.pan.value = clamp(pan, -1, 1);
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(amp, t0 + 0.003); g.gain.exponentialRampToValueAtTime(0.0001, t0 + dec);
+    o.connect(g).connect(p); p.connect(master); p.connect(verb); o.start(t0); o.stop(t0 + dec + 0.03); };
+  const mar = (t0, m, pan, amp = 0.15) => { tone(t0, m, pan, amp, 0.26); tone(t0, m + 23.7, pan, amp * 0.28, 0.06); };
+  const bell = (t0, m, amp, pn = 0) => { for (const [r2, a2, d2] of [[1, 1, 1.4], [2.76, 0.3, 0.6], [5.4, 0.1, 0.25]]) tone(t0, m + 12 * Math.log2(r2), pn, amp * a2, d2); };
+  const BASS = [38, 34, 31, 33];
+  for (let bar = 0; bar * BEAT * 4 < TL.end; bar++) {
+    const t0 = at(bar * BEAT * 4), o = ac.createOscillator(), g = ac.createGain(), lp = ac.createBiquadFilter();
+    o.type = 'sawtooth'; o.frequency.value = hz(BASS[bar % BASS.length]); lp.type = 'lowpass'; lp.frequency.value = 300;
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(0.09, t0 + 0.03); g.gain.exponentialRampToValueAtTime(0.0001, t0 + BEAT * 4 / FPS);
+    o.connect(lp).connect(g).connect(master); o.start(t0); o.stop(t0 + BEAT * 4 / FPS + 0.05);
+  }
+  for (let b = 0; b * BEAT < TL.end; b++) { const t0 = at(b * BEAT); if (b % 2 === 0) kick(t0, 0.34); click(t0 + BEAT / 2 / FPS, 0.02, 8000); }
+  const panB = b => (b / (M - 1) - 0.5) * 1.4;
+  for (const e of TL.ins) { for (let k = 0; k < e.w.length; k++) click(at(e.t0 + k * 2.5 + 4), 0.05, 2600); }
+  for (const h of TL.hits) mar(at(h.t), noteOfBit(h.b) + 12, panB(h.b), 0.15);
+  for (const e of TL.q) {
+    for (let k = 0; k < e.w.length; k++) click(at(e.t0 + k * 3.5 + 4), 0.05, 2200);
+    e.h.forEach((b, i) => BITS[b] ? mar(at(e.ta[i]), noteOfBit(b) + 12, panB(b), 0.12) : tone(at(e.ta[i]), 45, panB(b), 0.22, 0.4, 'triangle'));
+    if (e.kind === 'no') { tone(at(e.tv), 57, 0, 0.12, 0.5, 'triangle'); tone(at(e.tv) + 0.12, 52, 0, 0.12, 0.6, 'triangle'); }
+    else [72, 76, 79].forEach((m, i) => bell(at(e.tv) + i * 0.05, m, 0.06, -0.3 + i * 0.3));
+    if (e.kind === 'fp') [71, 72, 78].forEach((m, i) => bell(at(e.tv + TL.o.fpExtra * 0.6) + i * 0.03, m - 12, 0.07, -0.3 + i * 0.3));
+  }
+  [60, 64, 67, 72].forEach((m, i) => bell(at(TL.stats) + i * 0.06, m, 0.06, -0.3 + i * 0.2));
+  [72, 76, 79, 84].forEach((m, i) => bell(at(TL.end + 8 + i * 6), m, 0.07, -0.45 + i * 0.3));
+  const buf = await ac.startRendering();
+  let peak = 0; for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let k = 0; k < d.length; k++) peak = Math.max(peak, Math.abs(d[k])); }
+  if (peak > 0.89) for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let k = 0; k < d.length; k++) d[k] *= 0.89 / peak; }
+  return buf;
+}
+TLL.q.forEach(e => { e.fpX = Math.round(TLL.o.fpExtra * 0.6); });
+
+/* ==========================================================================
+   VERTICAL CUT — shared block, identical in every piece.
+   1080x1920 for Reels, Shorts and TikTok (__motion.variants.vertical). The
+   piece's own scene code is re-used and recomposed for a phone: everything a
+   viewer must read stays inside the area no platform covers (x 60..900,
+   y 230..1400); outside it there is only dimmed texture.
+   ========================================================================== */
+const VW = 1080, VH = 1920, SAFE = { x: 60, y: 230, w: 840, h: 1170, r: 900, b: 1400 };
+const vcv = document.createElement('canvas'); vcv.width = VW; vcv.height = VH;
+const vx = vcv.getContext('2d', { willReadFrequently: true });   // CPU raster: identical pixels on every redraw
+const VL = 96, VR = 864;                                          // text column inside the safe area
+
+function vReset() {
+  vx.setTransform(1, 0, 0, 1, 0, 0); vx.globalAlpha = 1; vx.globalCompositeOperation = 'source-over';
+  vx.filter = 'none'; vx.shadowBlur = 0; vx.shadowColor = 'transparent'; vx.letterSpacing = '0px'; vx.setLineDash([]);
+  vx.textAlign = 'left'; vx.textBaseline = 'alphabetic'; vx.lineCap = 'butt'; vx.lineJoin = 'miter';
+}
+/** Canvas text on the vertical frame; `max` shrinks the size until the line fits. */
+function vText(str, x, y, { size = 40, weight = 700, color = '#FFFFFF', align = 'left', spacing = 0, alpha = 1, fam = FONT, max = 0 } = {}) {
+  if (alpha <= 0.002 || !str) return size;
+  vx.font = `${weight} ${size}px ${fam}`; vx.letterSpacing = spacing + 'px';
+  if (max) { const w = vx.measureText(str).width; if (w > max) { size = size * max / w; vx.font = `${weight} ${size}px ${fam}`; } }
+  vx.textAlign = align; vx.textBaseline = 'alphabetic';
+  const a0 = vx.globalAlpha; vx.globalAlpha = a0 * alpha; vx.fillStyle = color;
+  vx.fillText(str, x + (align === 'center' ? spacing / 2 : align === 'right' ? spacing : 0), y);   // tracking is added after the last glyph too
+  vx.globalAlpha = a0; vx.letterSpacing = '0px';
+  return size;
+}
+/** Word-wraps with the given font; returns the lines. */
+function vWrap(str, maxW, size, weight = 700, fam = FONT) {
+  vx.font = `${weight} ${size}px ${fam}`; vx.letterSpacing = '0px';
+  const words = str.split(' '), lines = []; let cur = '';
+  for (const w of words) { const t = cur ? cur + ' ' + w : w; if (vx.measureText(t).width > maxW && cur) { lines.push(cur); cur = w; } else cur = t; }
+  if (cur) lines.push(cur);
+  return lines;
+}
+/** Fade envelope with a small rise: [alpha, dy]. */
+function vEnv(v, a, b, fin = 8, fout = 8) {
+  const i = E.outCubic(prog(v, a, a + fin)), o = 1 - E.inCubic(prog(v, b - fout, b));
+  return [Math.min(i, o), (1 - i) * 22 - (1 - o) * 10];
+}
+/** Which segment of a cut list a vertical frame is in: segs = [{ at, src, len }] in frames. */
+function vSeg(segs, v) {
+  let k = 0; while (k < segs.length - 1 && v >= segs[k + 1].at) k++;
+  const s = segs[k];
+  return { k, s, local: v - s.at, src: s.src + (v - s.at) };
+}
+/** Dims everything outside the safe area to a quiet texture (brightness x 0.2), with a soft inner edge. */
+function vShade(rgb, a = 0.8, feather = 40) {
+  vx.save(); vx.setTransform(1, 0, 0, 1, 0, 0); vx.globalAlpha = 1; vx.globalCompositeOperation = 'source-over';
+  vx.fillStyle = `rgba(${rgb},${a})`;
+  vx.beginPath(); vx.rect(0, 0, VW, VH); vx.rect(SAFE.x, SAFE.y, SAFE.w, SAFE.h); vx.fill('evenodd');
+  const strip = (x0, y0, x1, y1, rx, ry, rw, rh) => {
+    const g = vx.createLinearGradient(x0, y0, x1, y1);
+    g.addColorStop(0, `rgba(${rgb},${a})`); g.addColorStop(1, `rgba(${rgb},0)`);
+    vx.fillStyle = g; vx.fillRect(rx, ry, rw, rh);
+  };
+  strip(SAFE.x, 0, SAFE.x + feather, 0, SAFE.x, SAFE.y, feather, SAFE.h);
+  strip(SAFE.r, 0, SAFE.r - feather, 0, SAFE.r - feather, SAFE.y, feather, SAFE.h);
+  strip(0, SAFE.y, 0, SAFE.y + feather, SAFE.x, SAFE.y, SAFE.w, feather);
+  strip(0, SAFE.b, 0, SAFE.b - feather, SAFE.x, SAFE.b - feather, SAFE.w, feather);
+  vx.restore();
+}
+/** Series tag at the top of the safe area, e.g. MADE IN CODE · 04. */
+function vTag(label, color, alpha = 1) {
+  vText('MADE IN CODE', VL, 292, { size: 28, weight: 800, color, spacing: 5, alpha });
+  vx.font = `800 28px ${FONT}`; vx.letterSpacing = '5px';
+  const w = vx.measureText('MADE IN CODE').width; vx.letterSpacing = '0px';
+  vText('·  ' + label, VL + w + 14, 292, { size: 28, weight: 600, color: 'rgba(255,255,255,0.72)', spacing: 3, alpha, max: VR - VL - w - 14 });
+}
+/** Big hook lines, left-aligned from y0; visible from frame 0, settles in a few frames. */
+function vHook(v, lines, y0, { size = 84, lh = 1.08, color = '#FFFFFF', accent = null, weight = 800, spacing = -1.5, alpha = 1 } = {}) {
+  const k = E.outExpo(prog(v, -6, 12));
+  lines.forEach((ln, i) => {
+    const kk = E.outExpo(prog(v, -12 + i * 2, 8 + i * 2));
+    vText(ln, VL, y0 + i * size * lh + (1 - kk) * 30, { size, weight, spacing, color: accent && i === lines.length - 1 ? accent : color, alpha: alpha * Math.max(0.25, kk), max: VR - VL });
+  });
+  return k;
+}
+/** Closing card, the last 60 frames: piece title, "drawn in code · bytepatterns.com". l = frames into the card. */
+function vEndCard(l, { title, line = '', ink = '#FFFFFF', dim = 'rgba(255,255,255,0.66)', accent = '#FFFFFF', scrim = '0,0,0', a = 0.84 }) {
+  const k = E.outCubic(prog(l, 0, 12));
+  vx.save(); vx.setTransform(1, 0, 0, 1, 0, 0);
+  vx.fillStyle = `rgba(${scrim},${a * k})`; vx.fillRect(0, 0, VW, VH);
+  vx.restore();
+  const t1 = E.outExpo(prog(l, 3, 19)), t2 = E.outExpo(prog(l, 11, 27)), t3 = E.outExpo(prog(l, 19, 35));
+  vx.fillStyle = accent; vx.globalAlpha = t1; vx.fillRect(VL, 742, 88 * t1, 7); vx.globalAlpha = 1;
+  const size = vText(title, VL, 850 + (1 - t1) * 40, { size: 92, weight: 800, color: ink, spacing: -2, alpha: t1, max: VR - VL });
+  const y2 = 850 + Math.max(size, 60) * 0.25 + 70;
+  vx.font = `600 44px ${FONT}`;
+  const lead = 'drawn in code  ·  ', lw = vx.measureText(lead).width;
+  vText(lead, VL, y2 + (1 - t2) * 24, { size: 44, weight: 600, color: dim, alpha: t2 });
+  vText('bytepatterns.com', VL + lw, y2 + (1 - t2) * 24, { size: 44, weight: 800, color: accent, alpha: t2 });
+  if (line) vText(line, VL, y2 + 72 + (1 - t3) * 18, { size: 32, weight: 500, color: dim, alpha: t3, max: VR - VL });
+}
+/** Seeks a cut. The first frame a page draws is drawn twice: the very first read of a
+ *  GPU-backed source canvas can come out a shade different from every later one. */
+let vWarm = false;
+function vSeek(draw, i, frames) {
+  const f = Math.max(0, Math.min(frames - 1, Math.floor(i)));
+  if (!vWarm) { vWarm = true; draw(f); }
+  draw(f);
+}
+/** The soundtrack of a cut: the piece's own audio() spliced to the same segments as the picture. */
+async function vAudio(segs, frames, { xf = 0.025, fadeOut = 0.6, extra = null } = {}) {
+  const src = await renderAudio();
+  const SR = 48000, dur = frames / FPS, ac = new OfflineAudioContext(2, Math.round(SR * dur), SR);
+  const out = ac.createGain(); out.connect(ac.destination);
+  out.gain.setValueAtTime(1, 0); out.gain.setValueAtTime(1, dur - fadeOut); out.gain.linearRampToValueAtTime(0, dur - 0.01);
+  segs.forEach((s, k) => {
+    const at = s.at / FPS, off = s.src / FPS, d = s.len / FPS;
+    const pre = k === 0 ? 0 : Math.min(xf, off), post = k === segs.length - 1 ? 0 : xf;
+    const b = ac.createBufferSource(), g = ac.createGain(); b.buffer = src;
+    g.gain.setValueAtTime(pre ? 0 : 1, at - pre);
+    if (pre) g.gain.linearRampToValueAtTime(1, at + pre);
+    if (post) { g.gain.setValueAtTime(1, at + d - post); g.gain.linearRampToValueAtTime(0, at + d + post); }
+    b.connect(g).connect(out); b.start(at - pre, off - pre, d + pre + post);
+  });
+  if (extra) extra(ac, out);
+  const buf = await ac.startRendering();
+  let peak = 0; for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) peak = Math.max(peak, Math.abs(d[i])); }
+  if (peak > 0.9) for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) d[i] *= 0.9 / peak; }
+  return buf;
+}
+/** A soft three-partial bell, for the closing card. */
+function vChime(ac, dest, at, freq, vol = 0.08) {
+  for (const [mul, v, dec] of [[1, 1, 1.8], [2.01, 0.35, 0.8], [3.02, 0.12, 0.4]]) {
+    const o = ac.createOscillator(), g = ac.createGain(); o.type = 'sine'; o.frequency.value = freq * mul;
+    g.gain.setValueAtTime(0.0001, at); g.gain.exponentialRampToValueAtTime(vol * v, at + 0.006); g.gain.exponentialRampToValueAtTime(0.0001, at + dec);
+    o.connect(g).connect(dest); o.start(at); o.stop(at + dec + 0.05);
+  }
+}
+
+/* VERTICAL CUT — this piece */
+// The same filter on a phone: the 32 bits in two rows of 16, the word and
+// its readout above them, the verdict between; its own faster clock, and
+// the soundtrack rendered from it.
+const TLV = buildTL({ start: 36, slowN: 1, slow: 1.6, letters: 5, gap: 3, arrow: 6, hold: 2, exit: 7, overlap: 0.55,
+  pause: 10, qLetters: 8, qGap: 5, qArrow: 7, qHold: 22, fpExtra: 20, statLen: 76 });
+TLV.q.forEach(e => { e.fpX = Math.round(TLV.o.fpExtra * 0.6); });
+const VFR = TLV.end + 60, VEND = VFR - 60;
+const GV = { TL: TLV, cx: 480, rows: 2, pitch: 47, cs: 40, bitY: 880, rowGap: 56, bitNum: 28, idx: 0,
+  wx: 480, wy: 590, word: 140, alw: 3.5, ro: 34, roY: 690, a0: 18,
+  vX: 480, vY: 1062, vS: 68, vs: 28, vAlign: 'center', vMax: VR - VL,
+  listX: VL, listY: 1224, listLab: 100, listSize: 32, listGap: 22, cntX: VR, cntY: 1290,
+  capX: VL, capY: 382, cap: 44, capTwo: true, capMax: VR - VL,
+  stX: VL, stY: 1050, st1: 40, st2: 32, stAlign: 'left', stMax: VR - VL, stWrap: true };
+function hookV(v) {
+  const o = 1 - E.inCubic(prog(v, TLV.o.start - 16, TLV.o.start - 2));
+  if (o <= 0) return;
+  vHook(v, ['Is it in', 'the set?', 'No. Or maybe.'], 480, { size: 112, accent: C.maybe, color: C.paper, weight: 900, spacing: -2, alpha: o });
+}
+function vDraw(v) {
+  vReset();
+  backdrop(vx, VW, VH);
+  scene(vx, GV, v);
+  hookV(v);
+  vReset();
+  vShade(C.bgRGB, 0.84);
+  vTag('BLOOM FILTER', C.maybe);
+  if (v >= VEND) vEndCard(v - VEND, { title: 'Bloom Filter', line: `${M} bits  ·  ${K} FNV-1a hashes  ·  no, or maybe`,
+    ink: C.paper, dim: 'rgba(245,238,242,0.72)', accent: C.maybe, scrim: C.bgRGB, a: 0.9 });
+  vReset();
+}
+
+window.__motion = {
+  title: 'Bloom Filter: No, or Maybe',
+  description: `Kinetic type: ${SET.length} words go into a ${M}-bit Bloom filter through ${K} hashes each (32-bit FNV-1a of "i:word" mod ${M}), setting ${ONES} bits; then "${QUERIES[0].w}" comes back maybe, "${QUERIES[1].w}" definitely not, and "${QUERIES[2].w}", never added, maybe: a false positive. Of ${PROBE.toLocaleString('en-US')} strings never added, ${FP} came back maybe.`,
+  fps: FPS, width: W, height: H, frames: FRAMES,
+  poster: TLL.q[2].tv + TLL.q[2].fpX + 14,
+  gifStart: Math.floor(TLL.ins[2].t0 / FPS),
+  seek(i) { draw(Math.max(0, Math.min(FRAMES - 1, Math.floor(i)))); },
+  audio: () => renderAudio(TLL, FRAMES),
+  variants: {
+    vertical: {
+      width: VW, height: VH, frames: VFR, canvas: vcv,
+      poster: TLV.q[2].tv + TLV.q[2].fpX + 12, gifStart: Math.floor(TLV.q[0].t0 / FPS) - 1,
+      seek(i) { vSeek(vDraw, i, VFR); },
+      audio: () => renderAudio(TLV, VFR),
+    },
+  },
+};
+
+/* ==========================================================================
+   PLAYER — identical in every piece; keep as is.
+   Autoplays and loops, starts sound on the first click, ?frame=N pauses on a
+   frame, ?variant=vertical plays the vertical cut (if the piece has one).
+   When the renderer sets window.__MOTION_RENDER__ it stays out of the way.
+   ========================================================================== */
+(function player() {
+  const btn = document.getElementById('sound'), q = new URLSearchParams(location.search);
+  let M = window.__motion;
+  const V = !window.__MOTION_RENDER__ && M.variants && M.variants[q.get('variant')];
+  if (V) {                                                // show the variant's own canvas instead
+    M = Object.assign({}, M, V);
+    V.canvas.style.cssText = `width:min(100vw,calc(100vh*${V.width}/${V.height}));height:auto;aspect-ratio:${V.width}/${V.height}`;
+    document.querySelector('canvas').replaceWith(V.canvas);
+  }
+  const dur = M.frames / M.fps;
+  if (window.__MOTION_RENDER__) { btn.hidden = true; M.seek(0); return; }
+  if (q.has('frame')) { btn.hidden = true; M.seek(+q.get('frame') || 0); return; }
+  let t0 = performance.now(), ac = null, src = null, buf = null, paused = false, pausedAt = 0;
+  const clock = () => ac && src ? (ac.currentTime - t0) : (performance.now() - t0) / 1000;
+  function loop() {
+    if (!paused) M.seek(Math.floor(((clock() % dur) + dur) % dur * M.fps));
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+  btn.addEventListener('click', async () => {
+    if (src) { src.stop(); src = null; btn.textContent = 'Click for sound'; t0 = performance.now(); return; }
+    btn.textContent = 'Loading sound…';
+    ac = ac || new AudioContext({ sampleRate: 48000 });
+    buf = buf || await M.audio();
+    await ac.resume();
+    src = ac.createBufferSource(); src.buffer = buf; src.loop = true; src.connect(ac.destination);
+    t0 = ac.currentTime + 0.05; src.start(t0);        // picture restarts from frame 0 in sync with the sound
+    btn.textContent = 'Sound on — click to mute';
+  });
+  addEventListener('keydown', e => {
+    if (e.code !== 'Space') return;
+    e.preventDefault(); paused = !paused;
+    if (ac) paused ? ac.suspend() : ac.resume();
+    if (!ac) { if (paused) pausedAt = performance.now(); else t0 += performance.now() - pausedAt; }
+  });
+})();
+</script>
+</body>
+</html>

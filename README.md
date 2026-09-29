@@ -401,6 +401,71 @@ Click a preview to open the piece live in your browser (click once more there fo
 <br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/30-rule-30/?variant=vertical">open</a> · <a href="out/30-rule-30.vertical.png">still</a></sub>
 </td>
 </tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/31-heap-sift/"><img src="out/31-heap-sift.gif" width="100%" alt="Heap: Sift Up, Sift Down — animated preview"></a>
+<br><b>31 · Heap: Sift Up, Sift Down</b> <sub>27 s</sub>
+<br>A real min-heap drawn as a tree over the array it lives in: 15 pushes sift up with 14 swaps (one climbs 3 levels to the root), then 3 pops sift down with 7 more and come out in order, 2, 4, 13; one tick per swap.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/31-heap-sift/">open in browser</a> · <a href="out/31-heap-sift.png">still</a> · <a href="projects/31-heap-sift/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/31-heap-sift/?variant=vertical"><img src="out/31-heap-sift.vertical.gif" width="100%" alt="Heap: Sift Up, Sift Down — vertical cut, animated preview"></a>
+<br><sub>9:16 · 19 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/31-heap-sift/?variant=vertical">open</a> · <a href="out/31-heap-sift.vertical.png">still</a></sub>
+</td>
+</tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/32-load-balancer/"><img src="out/32-load-balancer.gif" width="100%" alt="Round Robin vs Least Connections — animated preview"></a>
+<br><b>32 · Round Robin vs Least Connections</b> <sub>24 s</sub>
+<br>The same 65 seeded requests (10 of them long) go through two load balancers to four servers each, stacked as blocks of remaining work: round robin waits 1.14 s on average (p95 3.98 s), least connections 0.29 s (p95 1.76 s); on 200 other seeded streams least connections had the lower p95 wait 192 times.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/32-load-balancer/">open in browser</a> · <a href="out/32-load-balancer.png">still</a> · <a href="projects/32-load-balancer/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/32-load-balancer/?variant=vertical"><img src="out/32-load-balancer.vertical.gif" width="100%" alt="Round Robin vs Least Connections — vertical cut, animated preview"></a>
+<br><sub>9:16 · 19 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/32-load-balancer/?variant=vertical">open</a> · <a href="out/32-load-balancer.vertical.png">still</a></sub>
+</td>
+</tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/33-bloom-filter/"><img src="out/33-bloom-filter.gif" width="100%" alt="Bloom Filter: No, or Maybe — animated preview"></a>
+<br><b>33 · Bloom Filter: No, or Maybe</b> <sub>27 s</sub>
+<br>Kinetic type: 7 words go into a 32-bit Bloom filter through 3 hashes each (32-bit FNV-1a of &quot;i:word&quot; mod 32), setting 14 bits; then &quot;fox&quot; comes back maybe, &quot;yak&quot; definitely not, and &quot;emu&quot;, never added, maybe: a false positive. Of 1,000 strings never added, 80 came back maybe.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/33-bloom-filter/">open in browser</a> · <a href="out/33-bloom-filter.png">still</a> · <a href="projects/33-bloom-filter/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/33-bloom-filter/?variant=vertical"><img src="out/33-bloom-filter.vertical.gif" width="100%" alt="Bloom Filter: No, or Maybe — vertical cut, animated preview"></a>
+<br><sub>9:16 · 19 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/33-bloom-filter/?variant=vertical">open</a> · <a href="out/33-bloom-filter.vertical.png">still</a></sub>
+</td>
+</tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/34-flow-field/"><img src="out/34-flow-field.gif" width="100%" alt="Flow Field — animated preview"></a>
+<br><b>34 · Flow Field</b> <sub>26 s</sub>
+<br>Generative: 3D Perlin noise read as an angle, first as a field of arrows, then followed by 1,100 particles that bunch into rivers; the angle multiplier eases from 1 to 3 and the rivers curl into eddies. 849,200 particle steps, simulated once and drawn from the log.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/34-flow-field/">open in browser</a> · <a href="out/34-flow-field.png">still</a> · <a href="projects/34-flow-field/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/34-flow-field/?variant=vertical"><img src="out/34-flow-field.vertical.gif" width="100%" alt="Flow Field — vertical cut, animated preview"></a>
+<br><sub>9:16 · 18 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/34-flow-field/?variant=vertical">open</a> · <a href="out/34-flow-field.vertical.png">still</a></sub>
+</td>
+</tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/35-bead-sort/"><img src="out/35-bead-sort.gif" width="100%" alt="Gravity Sort — animated preview"></a>
+<br><b>35 · Gravity Sort</b> <sub>23 s</sub>
+<br>Bead sort: 8 numbers (9, 3, 4, 7, 2, 1, 3, 3) as rows of beads on an abacus fall down their rods under gravity and bounce, and the rows read 1, 2, 3, 3, 3, 4, 7, 9; then 14 numbers, 82 beads, in one drop. No comparisons: each bead only falls.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/35-bead-sort/">open in browser</a> · <a href="out/35-bead-sort.png">still</a> · <a href="projects/35-bead-sort/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/35-bead-sort/?variant=vertical"><img src="out/35-bead-sort.vertical.gif" width="100%" alt="Gravity Sort — vertical cut, animated preview"></a>
+<br><sub>9:16 · 15 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/35-bead-sort/?variant=vertical">open</a> · <a href="out/35-bead-sort.vertical.png">still</a></sub>
+</td>
+</tr>
 </table>
 <!-- gallery:end -->
 
