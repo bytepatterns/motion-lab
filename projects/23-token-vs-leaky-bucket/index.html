@@ -1,0 +1,648 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="author" content="teambytepatterns">
+<meta name="description" content="The same bursty traffic hits a token bucket and a leaky bucket side by side, both limited to 5 requests a second: one lets bursts through, the other smooths them into a steady stream.">
+<title>Token Bucket vs Leaky Bucket — motion-lab</title>
+<style>
+  /* Player chrome. The piece itself lives entirely in the canvas. */
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  body { display: grid; place-items: center; font: 500 15px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #fff; }
+  canvas { display: block; width: min(100vw, calc(100vh * 16 / 9)); height: auto; aspect-ratio: 16 / 9; }
+  #sound { position: fixed; left: 16px; bottom: 16px; padding: 8px 14px; border: 1px solid rgba(255,255,255,.35); border-radius: 999px;
+           background: rgba(0,0,0,.55); color: #fff; font: inherit; cursor: pointer; }
+  #sound[hidden] { display: none; }
+</style>
+</head>
+<body>
+<canvas id="stage" width="1920" height="1080" aria-label="Two rate limiters side by side receive the same requests: a token bucket spends tokens and lets bursts through, a leaky bucket queues requests and lets them out at a steady rate"></canvas>
+<button id="sound" type="button">Click for sound</button>
+<script>
+'use strict';
+/* ==========================================================================
+   PIECE — Token Bucket vs Leaky Bucket.
+   One stream of requests (steady traffic with three bursts, seeded) goes to
+   two rate limiters with the same numbers: size 8, rate 5 per second.
+   - Token bucket: holds up to 8 tokens and gains 5 a second. A request
+     that finds a token spends it and passes at once; with no token it is
+     rejected (429). A full bucket lets a burst of 8 through in one go.
+   - Leaky bucket (as a queue): holds up to 8 waiting requests and lets
+     one out every 0.2 s; a request that finds it full is rejected.
+   Both run once at load on the same arrival times; every counter, the
+   output rasters and the summary are read from those runs. seek(i) only
+   reads them.
+   ========================================================================== */
+const W = 1920, H = 1080, FPS = 30, FRAMES = 720;          // 24 s
+const cv = document.getElementById('stage');
+const ctx = cv.getContext('2d', { willReadFrequently: true });   // CPU raster: identical pixels on every redraw
+const FONT = 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
+const MONO = 'ui-monospace, "Cascadia Code", Consolas, Menlo, monospace';
+
+// ---- helpers -------------------------------------------------------------
+// ---- helpers -------------------------------------------------------------
+function mulberry32(a) { return function () { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a);
+  t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const lerp = (a, b, t) => a + (b - a) * t;
+const prog = (f, a, b) => clamp((f - a) / (b - a));
+const smooth = t => t * t * (3 - 2 * t);
+const E = {
+  inCubic: t => t * t * t,
+  outCubic: t => 1 - Math.pow(1 - t, 3),
+  inOutCubic: t => t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2,
+  outExpo: t => t === 1 ? 1 : 1 - Math.pow(2, -10 * t),
+  inExpo: t => t === 0 ? 0 : Math.pow(2, 10 * t - 10),
+  inOutExpo: t => t === 0 ? 0 : t === 1 ? 1 : t < .5 ? Math.pow(2, 20 * t - 10) / 2 : (2 - Math.pow(2, -20 * t + 10)) / 2,
+  outBack: t => 1 + 2.70158 * Math.pow(t - 1, 3) + 1.70158 * Math.pow(t - 1, 2),
+};
+function text(g, str, x, y, { size = 40, weight = 600, color = '#fff', alpha = 1, spacing = 0, align = 'left', fam = FONT, base = 'alphabetic' } = {}) {
+  if (alpha <= 0.002 || !str) return 0;
+  g.font = `${weight} ${size}px ${fam}`; g.letterSpacing = spacing + 'px';
+  g.textAlign = align; g.textBaseline = base;
+  const a0 = g.globalAlpha; g.globalAlpha = a0 * alpha; g.fillStyle = color;
+  g.fillText(str, x, y);
+  const w = g.measureText(str).width;
+  g.globalAlpha = a0; g.letterSpacing = '0px';
+  return w;
+}
+const env = (f, a, b, fin = 12, fout = 10) => {
+  const i = E.outCubic(prog(f, a, a + fin)), o = 1 - E.inCubic(prog(f, b - fout, b));
+  return [Math.min(i, o), (1 - i) * 24 - (1 - o) * 10];
+};
+
+// ---- palette -------------------------------------------------------------
+const C = {
+  bg: '#0E0D14', bgRGB: '14,13,20', paper: '#EFEAE2', dim: 'rgba(239,234,226,0.62)', faint: 'rgba(239,234,226,0.26)',
+  tok: '#58C4B8', coin: '#F5B83D', leak: '#8FA8FF', water: 'rgba(143,168,255,0.2)', no: '#FF6B57',
+};
+
+// ---- the traffic and the two limiters (seconds) -------------------------------------
+const SIZE = 8, RATE = 5, GAP = 1 / RATE;
+const SEGS = [[0, 3, 9], [3, 4, 18], [4, 8, 14], [8, 9.5, 24], [9.5, 13, 8], [13, 13.6, 12], [13.6, 16, 7]];   // from, to, requests
+const BURSTS = [[3, 4], [8, 9.5], [13, 13.6]];
+const ARR = (() => {
+  const r = mulberry32(0x23B0), a = [];
+  for (const [t0, t1, n] of SEGS) for (let k = 0; k < n; k++) a.push(t0 + (k + 0.15 + 0.7 * r()) / n * (t1 - t0));
+  return a.sort((x, y) => x - y);
+})();
+const NREQ = ARR.length;
+/** Token bucket: tokens refill continuously up to SIZE; a request spends one or is rejected. */
+const TB = (() => {
+  let tok = SIZE, last = 0;
+  return ARR.map(t => {
+    tok = Math.min(SIZE, tok + RATE * (t - last)); last = t;
+    if (tok >= 1) { tok -= 1; return { t, ok: true, out: t, left: tok }; }
+    return { t, ok: false, left: tok };
+  });
+})();
+/** Tokens in the bucket at time t (before the first request: full). */
+function tokensAt(t) {
+  let lo = 0, hi = TB.length; while (lo < hi) { const m = (lo + hi) >> 1; if (TB[m].t <= t) lo = m + 1; else hi = m; }
+  if (lo === 0) return SIZE;
+  const e = TB[lo - 1]; return Math.min(SIZE, e.left + RATE * (t - e.t));
+}
+/** Leaky bucket: a queue of up to SIZE; one request leaves every GAP seconds. */
+const LB = (() => {
+  const q = []; let prev = -1e9;
+  for (const t of ARR) {
+    const inside = q.filter(e => e.ok && e.t <= t && e.out > t).length;
+    if (inside >= SIZE) { q.push({ t, ok: false }); continue; }
+    const out = Math.max(t, prev + GAP); prev = out; q.push({ t, ok: true, out });
+  }
+  return q;
+})();
+const queueAt = t => LB.reduce((n, e) => n + (e.ok && e.t <= t && e.out > t ? 1 : 0), 0);
+const maxIn1s = outs => { let m = 0; for (const a of outs) m = Math.max(m, outs.filter(o => o >= a && o < a + 0.999).length); return m; };
+const STATS = {
+  tbOk: TB.filter(e => e.ok).length, lbOk: LB.filter(e => e.ok).length,
+  tbPeak: maxIn1s(TB.filter(e => e.ok).map(e => e.out)), lbPeak: maxIn1s(LB.filter(e => e.ok).map(e => e.out)),
+  lbWait: Math.max(...LB.filter(e => e.ok).map(e => e.out - e.t)),
+  tEnd: Math.max(...LB.filter(e => e.ok).map(e => e.out)),
+};
+const countUpTo = (arr, t, pick) => arr.reduce((n, e) => n + (pick(e) && e.t <= t ? 1 : 0), 0);
+const tEndAxis = Math.ceil(STATS.tEnd);
+
+// ---- timelines: frame <-> simulated seconds ---------------------------------------
+const TL = { roll: 72, spd: 30, sum: 72 + Math.ceil(STATS.tEnd * 30) + 6, end: 648 };
+const simT = (f, tl) => (f - tl.roll) / tl.spd;
+const frameOf = (t, tl) => tl.roll + t * tl.spd;
+
+// ---- drawing ------------------------------------------------------------------------
+const FLY = 0.55;                                            // seconds a request takes to reach the gate
+/** A bucket outline: open top, rounded bottom. */
+function bucketPath(g, x, y, w, h) {
+  g.beginPath(); g.moveTo(x - 10, y); g.lineTo(x + 8, y + h - 24); g.quadraticCurveTo(x + 12, y + h, x + 36, y + h);
+  g.lineTo(x + w - 36, y + h); g.quadraticCurveTo(x + w - 12, y + h, x + w - 8, y + h - 24); g.lineTo(x + w + 10, y);
+}
+/** Incoming requests flying to the gate, and the ones already rejected. P: { cx, gy (gate y), span, s } */
+function drawIncoming(g, t, P, runs, col) {
+  runs.forEach((e) => {
+    const u = (t - (e.t - FLY)) / FLY;
+    if (u < 0) return;
+    if (u < 1) {                                             // on the way in, from the left
+      const k = E.inOutCubic(u), x = lerp(P.cx - P.span, P.cx, k), y = P.gy - 60 * P.s * Math.sin(Math.PI * k) * 0.5;
+      g.fillStyle = C.paper; g.beginPath(); g.arc(x, y, 10 * P.s, 0, Math.PI * 2); g.fill();
+      return;
+    }
+    if (!e.ok) {                                             // rejected: falls away, red
+      const v = (t - e.t) / 0.8; if (v >= 1) return;
+      const x = P.cx - 40 * P.s * v, y = P.gy + 180 * P.s * v * v - 30 * P.s * v;
+      g.globalAlpha = 1 - v; g.fillStyle = C.no; g.beginPath(); g.arc(x, y, 10 * P.s, 0, Math.PI * 2); g.fill(); g.globalAlpha = 1;
+    }
+  });
+  // "429" flashes at the gate while rejections happen
+  let fl = 0; for (const e of runs) if (!e.ok && t >= e.t) fl = Math.max(fl, 1 - (t - e.t) / 0.6);
+  if (fl > 0) text(g, '429', P.cx - 118 * P.s, P.gy - 34 * P.s, { size: Math.max(28, 30 * P.s), weight: 800, fam: MONO, color: C.no, alpha: fl, align: 'right' });
+  // the gate
+  g.strokeStyle = col; g.lineWidth = 4; g.beginPath(); g.arc(P.cx, P.gy, 18 * P.s, 0, Math.PI * 2); g.stroke();
+}
+/** Requests that got through, leaving to the right from (x0, y0). */
+function drawOutgoing(g, t, outs, x0, y0, span, s, col) {
+  g.fillStyle = col;
+  for (const o of outs) {
+    const v = (t - o) / 0.7; if (v < 0 || v >= 1) continue;
+    const x = x0 + span * E.outCubic(v);
+    g.globalAlpha = v < 0.8 ? 1 : (1 - v) * 5; g.beginPath(); g.arc(x, y0, 10 * s, 0, Math.PI * 2); g.fill();
+  }
+  g.globalAlpha = 1;
+}
+/** Token bucket panel. P: { cx, by (bucket top), s } */
+function drawTokenPanel(g, t, P) {
+  const s = P.s, bw = 250 * s, bh = 190 * s, bx = P.cx - bw / 2, by = P.by, gy = by - 70 * s;
+  // refill drops from a tap at the top right while the bucket is not full
+  const tapX = bx + bw - 40 * s, tapY = by - 30 * s;
+  g.fillStyle = C.faint; g.fillRect(tapX - 18 * s, tapY - 14 * s, 60 * s, 10 * s); g.fillRect(tapX - 5 * s, tapY - 14 * s, 10 * s, 18 * s);
+  for (let k = Math.floor((t - 0.5) / GAP); k <= Math.floor(t / GAP); k++) {
+    const t0 = k * GAP, v = (t - t0) / 0.45; if (v < 0 || v >= 1 || tokensAt(t0) >= SIZE - 0.001) continue;
+    g.fillStyle = C.coin; g.globalAlpha = 1 - v * 0.6; g.beginPath(); g.arc(tapX, tapY + 8 * s + v * v * (bh - 40 * s), 5 * s, 0, Math.PI * 2); g.fill(); g.globalAlpha = 1;
+  }
+  // bucket
+  bucketPath(g, bx, by, bw, bh); g.strokeStyle = C.tok; g.lineWidth = 5 * Math.max(0.8, s); g.lineCap = 'round'; g.lineJoin = 'round'; g.stroke();
+  // coins, bottom up, four to a row; the one being refilled grows in
+  const tk = tokensAt(t), full = Math.floor(tk + 1e-9), frac = tk - full;
+  for (let k = 0; k < SIZE; k++) {
+    const cx = bx + bw / 2 + ((k % 4) - 1.5) * 52 * s, cy = by + bh - 34 * s - Math.floor(k / 4) * 52 * s;
+    const on = k < full ? 1 : k === full ? frac : 0;
+    g.strokeStyle = 'rgba(245,184,61,0.22)'; g.lineWidth = 2; g.beginPath(); g.arc(cx, cy, 21 * s, 0, Math.PI * 2); g.stroke();
+    if (on <= 0.01) continue;
+    const r = 21 * s * (k < full ? 1 : 0.35 + 0.65 * on);
+    g.globalAlpha = k < full ? 1 : 0.35 + 0.5 * on; g.fillStyle = C.coin; g.beginPath(); g.arc(cx, cy, r, 0, Math.PI * 2); g.fill();
+    g.fillStyle = 'rgba(14,13,20,0.35)'; g.beginPath(); g.arc(cx, cy, r * 0.55, 0, Math.PI * 2); g.fill(); g.globalAlpha = 1;
+  }
+  // a spent token flies up to the gate
+  for (const e of TB) {
+    if (!e.ok) continue; const v = (t - e.t) / 0.3; if (v < 0 || v >= 1) continue;
+    const x = lerp(bx + bw / 2, P.cx, v), y = lerp(by + bh * 0.4, gy, E.outCubic(v));
+    g.globalAlpha = 1 - v; g.fillStyle = C.coin; g.beginPath(); g.arc(x, y, 14 * s, 0, Math.PI * 2); g.fill(); g.globalAlpha = 1;
+  }
+  const PI = { cx: P.cx, gy, span: 330 * s, s };
+  drawIncoming(g, t, PI, TB, C.tok);
+  drawOutgoing(g, t, TB.filter(e => e.ok).map(e => e.out), P.cx + 22 * s, gy, 300 * s, s, C.tok);
+}
+/** Leaky bucket panel: the queue sits in the bucket and drips out of the bottom. */
+function drawLeakyPanel(g, t, P) {
+  const s = P.s, bw = 250 * s, bh = 190 * s, bx = P.cx - bw / 2, by = P.by, gy = by - 70 * s;
+  const q = queueAt(t);
+  // water level
+  const lvl = Math.min(1, q / SIZE), wy = by + bh - lvl * (bh - 8 * s);
+  if (lvl > 0) { g.save(); bucketPath(g, bx, by, bw, bh); g.closePath(); g.clip(); g.fillStyle = C.water; g.fillRect(bx - 20, wy, bw + 40, by + bh - wy + 4); g.restore(); }
+  bucketPath(g, bx, by, bw, bh); g.strokeStyle = C.leak; g.lineWidth = 5 * Math.max(0.8, s); g.lineCap = 'round'; g.lineJoin = 'round'; g.stroke();
+  g.fillStyle = C.bg; g.fillRect(P.cx - 12 * s, by + bh - 6 * s, 24 * s, 14 * s);            // the hole
+  // queued requests: slot by their place in line (averaged over a few moments so they slide down)
+  const slot = k => [bx + bw / 2 + ((k % 4) - 1.5) * 52 * s, by + bh - 34 * s - Math.floor(k / 4) * 52 * s];
+  const ahead = (i, tt) => { let n = 0; for (let j = 0; j < i; j++) { const e = LB[j]; if (e.ok && e.t <= tt && e.out > tt) n++; } return n; };
+  LB.forEach((e, i) => {
+    if (!e.ok || t < e.t || t >= e.out + 0.9) return;
+    if (t < e.out) {
+      const fall = E.inCubic(clamp((t - e.t) / 0.22));
+      let px = 0, py = 0; const K = 5;
+      for (let k = 0; k < K; k++) { const tt = Math.max(e.t, t - k * 0.035), p = slot(ahead(i, tt)); px += p[0] / K; py += p[1] / K; }
+      const x = lerp(P.cx, px, fall), y = lerp(gy, py, fall);
+      g.fillStyle = C.paper; g.beginPath(); g.arc(x, y, 12 * s, 0, Math.PI * 2); g.fill();
+    } else {                                               // out through the hole, then to the right
+      const v = (t - e.out) / 0.9, x0 = P.cx, y0 = by + bh + 26 * s;
+      const x = v < 0.15 ? x0 : x0 + (300 * s + 22 * s) * E.outCubic((v - 0.15) / 0.85), y = v < 0.15 ? lerp(by + bh - 20 * s, y0, v / 0.15) : y0;
+      g.globalAlpha = v < 0.85 ? 1 : (1 - v) / 0.15; g.fillStyle = C.leak; g.beginPath(); g.arc(x, y, 10 * s, 0, Math.PI * 2); g.fill(); g.globalAlpha = 1;
+    }
+  });
+  const PI = { cx: P.cx, gy, span: 330 * s, s };
+  drawIncoming(g, t, PI, LB, C.leak);
+}
+/** Output rasters on a time axis: one tick per request that got through, a red dot per rejection. */
+function drawRasters(g, t, R, alpha = 1) {
+  if (alpha <= 0.01) return;
+  g.save(); g.globalAlpha = alpha;
+  const X = s => R.x + clamp(s / tEndAxis) * R.w, tt = Math.max(0, t);
+  const rows = [
+    { label: 'requests in', col: C.paper, ticks: ARR, rej: [] },
+    { label: 'token bucket out', col: C.tok, ticks: TB.filter(e => e.ok).map(e => e.out), rej: TB.filter(e => !e.ok).map(e => e.t) },
+    { label: 'leaky bucket out', col: C.leak, ticks: LB.filter(e => e.ok).map(e => e.out), rej: LB.filter(e => !e.ok).map(e => e.t) },
+  ].filter((r, k) => R.rows.includes(k));
+  // bursts, shaded across the rows
+  g.fillStyle = 'rgba(239,234,226,0.06)';
+  for (const [a, b] of BURSTS) g.fillRect(X(a), R.y - R.dy * 0.6, X(b) - X(a), R.dy * rows.length);
+  rows.forEach((r, k) => {
+    const y = R.y + k * R.dy;
+    text(g, r.label, R.lx, y + 10, { size: 28, weight: 700, color: r.col, align: R.lalign || 'left' });
+    g.strokeStyle = 'rgba(239,234,226,0.14)'; g.lineWidth = 2; g.beginPath(); g.moveTo(R.x, y + 12); g.lineTo(R.x + R.w, y + 12); g.stroke();
+    g.strokeStyle = r.col; g.lineWidth = 3;
+    g.beginPath(); for (const s of r.ticks) { if (s > tt) break; g.moveTo(X(s), y + 10); g.lineTo(X(s), y - 18); } g.stroke();
+    g.fillStyle = C.no; for (const s of r.rej) { if (s > tt) continue; g.beginPath(); g.arc(X(s), y + 24, 4.5, 0, Math.PI * 2); g.fill(); }
+  });
+  // the playhead
+  if (t >= 0 && t <= tEndAxis) { g.strokeStyle = 'rgba(239,234,226,0.5)'; g.lineWidth = 2; g.beginPath(); g.moveTo(X(tt), R.y - R.dy * 0.6); g.lineTo(X(tt), R.y + R.dy * (rows.length - 0.4)); g.stroke(); }
+  for (let s = 0; s <= tEndAxis; s += 4) text(g, `${s} s`, X(s), R.y + R.dy * (rows.length - 0.3) + 24, { size: 28, weight: 500, fam: MONO, color: C.faint, align: 'center' });
+  g.restore();
+}
+function backdrop(g, w, h) { g.fillStyle = C.bg; g.fillRect(0, 0, w, h); }
+
+// ---- landscape picture ------------------------------------------------------------------
+const PT = { cx: 560, by: 372, s: 1 }, PL = { cx: 1360, by: 372, s: 1 };
+const RAST_L = { x: 470, w: 1350, y: 800, dy: 70, lx: 120, rows: [0, 1, 2] };
+function draw(f) {
+  if (ctx.reset) ctx.reset();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; ctx.filter = 'none'; ctx.shadowBlur = 0;
+  backdrop(ctx, W, H);
+  const t = simT(f, TL), tc = clamp(t, 0, STATS.tEnd);
+  const endK = E.inOutCubic(prog(f, TL.end, TL.end + 20)), a = 1 - endK;
+  const hookK = 1 - E.inCubic(prog(f, TL.roll - 20, TL.roll - 2));
+  // panel headers
+  for (const [P, name, sub, col] of [[PT, 'TOKEN BUCKET', `${SIZE} tokens, +${RATE} per second`, C.tok], [PL, 'LEAKY BUCKET', `queue of ${SIZE}, one out every ${GAP.toFixed(1)} s`, C.leak]]) {
+    text(ctx, name, P.cx, 196, { size: 34, weight: 800, color: col, spacing: 5, align: 'center' });
+    text(ctx, sub, P.cx, 240, { size: 28, weight: 500, color: C.dim, align: 'center' });
+  }
+  drawTokenPanel(ctx, t, PT);
+  drawLeakyPanel(ctx, t, PL);
+  ctx.fillStyle = 'rgba(239,234,226,0.1)'; ctx.fillRect(958, 170, 2, 520);
+  // live counters under each bucket
+  {
+    const [al] = env(f, TL.roll - 6, TL.end + 4, 14, 10);
+    const tp = countUpTo(TB, tc, e => e.ok), tr = countUpTo(TB, tc, e => !e.ok), lp = countUpTo(LB, tc, e => e.ok), lr = countUpTo(LB, tc, e => !e.ok);
+    text(ctx, `passed ${String(tp).padStart(2)}`, PT.cx - 20, 652, { size: 32, weight: 700, fam: MONO, color: C.tok, align: 'right', alpha: al });
+    text(ctx, `rejected ${String(tr).padStart(2)}`, PT.cx + 20, 652, { size: 32, weight: 700, fam: MONO, color: C.no, alpha: al });
+    text(ctx, `passed ${String(lp).padStart(2)}`, PL.cx - 20, 652, { size: 32, weight: 700, fam: MONO, color: C.leak, align: 'right', alpha: al });
+    text(ctx, `rejected ${String(lr).padStart(2)}`, PL.cx + 20, 652, { size: 32, weight: 700, fam: MONO, color: C.no, alpha: al });
+    text(ctx, `tokens ${tokensAt(tc).toFixed(1)} / ${SIZE}`, PT.cx, 700, { size: 28, weight: 600, fam: MONO, color: C.coin, align: 'center', alpha: al });
+    text(ctx, `waiting ${queueAt(tc)} / ${SIZE}`, PL.cx, 700, { size: 28, weight: 600, fam: MONO, color: C.dim, align: 'center', alpha: al });
+  }
+  drawRasters(ctx, t, RAST_L, E.outCubic(prog(f, TL.roll - 30, TL.roll)));
+  text(ctx, 'RATE LIMITING  ·  SAME TRAFFIC, TWO LIMITERS', 120, 104, { size: 26, weight: 600, color: C.dim, spacing: 5, alpha: a });
+  text(ctx, 'BYTEPATTERNS', 1800, 104, { size: 26, weight: 600, color: C.dim, spacing: 5, align: 'right', alpha: a });
+  // hook, over a dimmed stage
+  if (hookK > 0) {
+    ctx.fillStyle = `rgba(${C.bgRGB},${0.82 * hookK})`; ctx.fillRect(0, 140, W, H - 140);
+    const k = E.outExpo(prog(f, -20, 4)), k2 = E.outExpo(prog(f, -14, 10)), k3 = E.outExpo(prog(f, 6, 26));
+    text(ctx, 'Same burst.', W / 2, 470 + (1 - k) * 30, { size: 132, weight: 850, color: C.paper, spacing: -3, align: 'center', alpha: Math.min(k, hookK) });
+    text(ctx, 'Two rate limiters.', W / 2, 580 + (1 - k2) * 30, { size: 84, weight: 850, color: C.coin, spacing: -2, align: 'center', alpha: Math.min(k2, hookK) });
+    text(ctx, `both: ${SIZE} deep, ${RATE} per second`, W / 2, 660 + (1 - k3) * 20, { size: 40, weight: 600, color: C.dim, align: 'center', alpha: Math.min(k3, hookK) });
+  }
+  // summary
+  {
+    const [al, dy] = env(f, TL.sum, TL.end + 4, 14, 10);
+    if (al > 0.01) {
+      ctx.fillStyle = `rgba(${C.bgRGB},${0.8 * al})`; ctx.fillRect(0, 150, W, 560);
+      text(ctx, 'Token bucket', PT.cx, 300 + dy, { size: 64, weight: 850, color: C.tok, align: 'center', alpha: al * a });
+      text(ctx, 'lets bursts through', PT.cx, 380 + dy, { size: 48, weight: 700, color: C.paper, align: 'center', alpha: al * a });
+      text(ctx, `up to ${STATS.tbPeak} in one second`, PT.cx, 450 + dy, { size: 36, weight: 600, color: C.dim, align: 'center', alpha: al * a });
+      text(ctx, `${STATS.tbOk} of ${NREQ} passed`, PT.cx, 520 + dy, { size: 36, weight: 700, fam: MONO, color: C.tok, align: 'center', alpha: al * a });
+      text(ctx, 'Leaky bucket', PL.cx, 300 + dy, { size: 64, weight: 850, color: C.leak, align: 'center', alpha: al * a });
+      text(ctx, 'smooths them out', PL.cx, 380 + dy, { size: 48, weight: 700, color: C.paper, align: 'center', alpha: al * a });
+      text(ctx, `never more than ${STATS.lbPeak} a second, waits up to ${STATS.lbWait.toFixed(1)} s`, PL.cx, 450 + dy, { size: 32, weight: 600, color: C.dim, align: 'center', alpha: al * a });
+      text(ctx, `${STATS.lbOk} of ${NREQ} passed`, PL.cx, 520 + dy, { size: 36, weight: 700, fam: MONO, color: C.leak, align: 'center', alpha: al * a });
+    }
+  }
+  if (endK > 0) {
+    ctx.fillStyle = `rgba(${C.bgRGB},${0.88 * endK})`; ctx.fillRect(0, 0, W, H);
+    const k1 = E.outCubic(prog(f, TL.end + 6, TL.end + 28)), k2 = E.outCubic(prog(f, TL.end + 16, TL.end + 38)), k3 = E.outCubic(prog(f, TL.end + 26, TL.end + 48));
+    text(ctx, 'Token Bucket vs Leaky Bucket', W / 2, 500 + (1 - k1) * 30, { size: 112, weight: 850, color: C.paper, spacing: -3, align: 'center', alpha: k1 });
+    text(ctx, `${NREQ} requests  ·  ${SIZE} deep, ${RATE} per second  ·  bursts vs a steady stream`, W / 2, 580 + (1 - k2) * 20, { size: 42, weight: 500, color: C.coin, align: 'center', alpha: k2 });
+    text(ctx, 'bytepatterns · motion lab', W / 2, 1000, { size: 32, weight: 600, color: C.paper, spacing: 3, align: 'center', alpha: k3 * 0.8 });
+  }
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.letterSpacing = '0px'; ctx.setLineDash([]);
+}
+
+// ---- sound: token bucket on the left, leaky bucket on the right ------------------------------
+/** The soundtrack on a timeline (landscape or vertical): frames long, t = 0 at tl.roll. */
+async function renderAudio(tl = TL, frames = FRAMES, endAt = TL.end) {
+  const SR = 48000, dur = frames / FPS, LEN = Math.round(SR * dur);
+  const ac = new OfflineAudioContext(2, LEN, SR);
+  const at = t => frameOf(t, tl) / FPS;
+  const comp = ac.createDynamicsCompressor();
+  comp.threshold.value = -14; comp.ratio.value = 3; comp.attack.value = 0.003; comp.release.value = 0.2;
+  const master = ac.createGain(); master.gain.value = 0.95; master.connect(comp).connect(ac.destination);
+  master.gain.setValueAtTime(0.95, dur - 0.8); master.gain.linearRampToValueAtTime(0.0001, dur - 0.02);
+  const rnd = mulberry32(0x23A0);
+  const ir = ac.createBuffer(2, SR * 1.8, SR);
+  for (let c = 0; c < 2; c++) { const d = ir.getChannelData(c); for (let k = 0; k < d.length; k++) d[k] = (rnd() * 2 - 1) * Math.pow(1 - k / d.length, 3.6); }
+  const verb = ac.createConvolver(); verb.buffer = ir; const vg = ac.createGain(); vg.gain.value = 0.25; verb.connect(vg).connect(master);
+  const noise = ac.createBuffer(1, SR, SR); { const d = noise.getChannelData(0); for (let k = 0; k < d.length; k++) d[k] = rnd() * 2 - 1; }
+  const hz = m => 440 * Math.pow(2, (m - 69) / 12);
+  const endS = endAt / FPS;
+  const pad = (a, b, notes, amp) => { const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 800; lp.connect(master); lp.connect(verb);
+    for (const m of notes) for (const det of [-5, 5]) {
+      const o = ac.createOscillator(); o.type = 'sawtooth'; o.frequency.value = hz(m); o.detune.value = det;
+      const g = ac.createGain(); g.gain.setValueAtTime(0, a); g.gain.linearRampToValueAtTime(amp, a + (a === 0 ? 0.1 : 1));
+      g.gain.setValueAtTime(amp, Math.max(a + 1, b - 1)); g.gain.linearRampToValueAtTime(0, b);
+      o.connect(g).connect(lp); o.start(a); o.stop(b + 0.05);
+    } };
+  pad(0, dur, [40, 47, 52, 56, 59], 0.014);
+  const pluck = (t0, m, amp, pan, dec = 0.18, type = 'triangle') => {
+    if (t0 < 0 || t0 > endS) return;
+    const o = ac.createOscillator(), g = ac.createGain(), p = ac.createStereoPanner();
+    o.type = type; o.frequency.value = hz(m); p.pan.value = pan;
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(amp, t0 + 0.003); g.gain.exponentialRampToValueAtTime(0.0001, t0 + dec);
+    o.connect(g).connect(p); p.connect(master); p.connect(verb); o.start(t0); o.stop(t0 + dec + 0.05);
+  };
+  const thud = (t0, pan) => {
+    if (t0 < 0 || t0 > endS) return;
+    const s = ac.createBufferSource(); s.buffer = noise; const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 380;
+    const g = ac.createGain(), p = ac.createStereoPanner(); p.pan.value = pan;
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(0.32, t0 + 0.004); g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.12);
+    s.connect(lp).connect(g).connect(p).connect(master); s.start(t0, (t0 * 3.7) % 0.8, 0.15);
+  };
+  // every arrival: a soft click in the middle
+  for (const t of ARR) { const t0 = at(t); if (t0 < 0 || t0 > endS) continue;
+    const s = ac.createBufferSource(); s.buffer = noise; const bp = ac.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 6000; bp.Q.value = 1.5;
+    const g = ac.createGain(); g.gain.setValueAtTime(0.06, t0); g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.025);
+    s.connect(bp).connect(g).connect(master); s.start(t0, (t0 * 5.3) % 0.8, 0.04); }
+  const TOK = [76, 79, 81, 84], LEAK = [64, 67, 69, 72];
+  TB.forEach((e, i) => e.ok ? pluck(at(e.out), TOK[i % 4], 0.09, -0.55) : thud(at(e.t), -0.55));
+  LB.forEach((e, i) => e.ok ? pluck(at(e.out), LEAK[i % 4], 0.1, 0.55, 0.22, 'sine') : thud(at(e.t), 0.55));
+  const bell = (t0, m, amp, pn) => { for (const [r2, a2, d2] of [[1, 1, 1.8], [2.76, 0.3, 0.8], [5.4, 0.1, 0.3]]) {
+    const o = ac.createOscillator(); o.frequency.value = hz(m) * r2; const g = ac.createGain(), p = ac.createStereoPanner();
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(amp * a2, t0 + 0.005); g.gain.exponentialRampToValueAtTime(0.0001, t0 + d2);
+    p.pan.value = pn; o.connect(g).connect(p); p.connect(master); p.connect(verb); o.start(t0); o.stop(t0 + d2 + 0.05); } };
+  [69, 72, 76, 81].forEach((m, i) => bell(endS + (8 + i * 6) / FPS, m, 0.08, -0.45 + i * 0.3));
+  const buf = await ac.startRendering();
+  let peak = 0; for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let k = 0; k < d.length; k++) peak = Math.max(peak, Math.abs(d[k])); }
+  if (peak > 0.89) for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let k = 0; k < d.length; k++) d[k] *= 0.89 / peak; }
+  return buf;
+}
+
+/* ==========================================================================
+   VERTICAL CUT — shared block, identical in every piece.
+   1080x1920 for Reels, Shorts and TikTok (__motion.variants.vertical). The
+   piece's own scene code is re-used and recomposed for a phone: everything a
+   viewer must read stays inside the area no platform covers (x 60..900,
+   y 230..1400); outside it there is only dimmed texture.
+   ========================================================================== */
+const VW = 1080, VH = 1920, SAFE = { x: 60, y: 230, w: 840, h: 1170, r: 900, b: 1400 };
+const vcv = document.createElement('canvas'); vcv.width = VW; vcv.height = VH;
+const vx = vcv.getContext('2d', { willReadFrequently: true });   // CPU raster: identical pixels on every redraw
+const VL = 96, VR = 864;                                          // text column inside the safe area
+
+function vReset() {
+  vx.setTransform(1, 0, 0, 1, 0, 0); vx.globalAlpha = 1; vx.globalCompositeOperation = 'source-over';
+  vx.filter = 'none'; vx.shadowBlur = 0; vx.shadowColor = 'transparent'; vx.letterSpacing = '0px'; vx.setLineDash([]);
+  vx.textAlign = 'left'; vx.textBaseline = 'alphabetic'; vx.lineCap = 'butt'; vx.lineJoin = 'miter';
+}
+/** Canvas text on the vertical frame; `max` shrinks the size until the line fits. */
+function vText(str, x, y, { size = 40, weight = 700, color = '#FFFFFF', align = 'left', spacing = 0, alpha = 1, fam = FONT, max = 0 } = {}) {
+  if (alpha <= 0.002 || !str) return size;
+  vx.font = `${weight} ${size}px ${fam}`; vx.letterSpacing = spacing + 'px';
+  if (max) { const w = vx.measureText(str).width; if (w > max) { size = size * max / w; vx.font = `${weight} ${size}px ${fam}`; } }
+  vx.textAlign = align; vx.textBaseline = 'alphabetic';
+  const a0 = vx.globalAlpha; vx.globalAlpha = a0 * alpha; vx.fillStyle = color;
+  vx.fillText(str, x + (align === 'center' ? spacing / 2 : align === 'right' ? spacing : 0), y);   // tracking is added after the last glyph too
+  vx.globalAlpha = a0; vx.letterSpacing = '0px';
+  return size;
+}
+/** Word-wraps with the given font; returns the lines. */
+function vWrap(str, maxW, size, weight = 700, fam = FONT) {
+  vx.font = `${weight} ${size}px ${fam}`; vx.letterSpacing = '0px';
+  const words = str.split(' '), lines = []; let cur = '';
+  for (const w of words) { const t = cur ? cur + ' ' + w : w; if (vx.measureText(t).width > maxW && cur) { lines.push(cur); cur = w; } else cur = t; }
+  if (cur) lines.push(cur);
+  return lines;
+}
+/** Fade envelope with a small rise: [alpha, dy]. */
+function vEnv(v, a, b, fin = 8, fout = 8) {
+  const i = E.outCubic(prog(v, a, a + fin)), o = 1 - E.inCubic(prog(v, b - fout, b));
+  return [Math.min(i, o), (1 - i) * 22 - (1 - o) * 10];
+}
+/** Which segment of a cut list a vertical frame is in: segs = [{ at, src, len }] in frames. */
+function vSeg(segs, v) {
+  let k = 0; while (k < segs.length - 1 && v >= segs[k + 1].at) k++;
+  const s = segs[k];
+  return { k, s, local: v - s.at, src: s.src + (v - s.at) };
+}
+/** Dims everything outside the safe area to a quiet texture (brightness x 0.2), with a soft inner edge. */
+function vShade(rgb, a = 0.8, feather = 40) {
+  vx.save(); vx.setTransform(1, 0, 0, 1, 0, 0); vx.globalAlpha = 1; vx.globalCompositeOperation = 'source-over';
+  vx.fillStyle = `rgba(${rgb},${a})`;
+  vx.beginPath(); vx.rect(0, 0, VW, VH); vx.rect(SAFE.x, SAFE.y, SAFE.w, SAFE.h); vx.fill('evenodd');
+  const strip = (x0, y0, x1, y1, rx, ry, rw, rh) => {
+    const g = vx.createLinearGradient(x0, y0, x1, y1);
+    g.addColorStop(0, `rgba(${rgb},${a})`); g.addColorStop(1, `rgba(${rgb},0)`);
+    vx.fillStyle = g; vx.fillRect(rx, ry, rw, rh);
+  };
+  strip(SAFE.x, 0, SAFE.x + feather, 0, SAFE.x, SAFE.y, feather, SAFE.h);
+  strip(SAFE.r, 0, SAFE.r - feather, 0, SAFE.r - feather, SAFE.y, feather, SAFE.h);
+  strip(0, SAFE.y, 0, SAFE.y + feather, SAFE.x, SAFE.y, SAFE.w, feather);
+  strip(0, SAFE.b, 0, SAFE.b - feather, SAFE.x, SAFE.b - feather, SAFE.w, feather);
+  vx.restore();
+}
+/** Series tag at the top of the safe area, e.g. MADE IN CODE · 04. */
+function vTag(label, color, alpha = 1) {
+  vText('MADE IN CODE', VL, 292, { size: 28, weight: 800, color, spacing: 5, alpha });
+  vx.font = `800 28px ${FONT}`; vx.letterSpacing = '5px';
+  const w = vx.measureText('MADE IN CODE').width; vx.letterSpacing = '0px';
+  vText('·  ' + label, VL + w + 14, 292, { size: 28, weight: 600, color: 'rgba(255,255,255,0.72)', spacing: 3, alpha, max: VR - VL - w - 14 });
+}
+/** Big hook lines, left-aligned from y0; visible from frame 0, settles in a few frames. */
+function vHook(v, lines, y0, { size = 84, lh = 1.08, color = '#FFFFFF', accent = null, weight = 800, spacing = -1.5, alpha = 1 } = {}) {
+  const k = E.outExpo(prog(v, -6, 12));
+  lines.forEach((ln, i) => {
+    const kk = E.outExpo(prog(v, -12 + i * 2, 8 + i * 2));
+    vText(ln, VL, y0 + i * size * lh + (1 - kk) * 30, { size, weight, spacing, color: accent && i === lines.length - 1 ? accent : color, alpha: alpha * Math.max(0.25, kk), max: VR - VL });
+  });
+  return k;
+}
+/** Closing card, the last 60 frames: piece title, "drawn in code · bytepatterns.com". l = frames into the card. */
+function vEndCard(l, { title, line = '', ink = '#FFFFFF', dim = 'rgba(255,255,255,0.66)', accent = '#FFFFFF', scrim = '0,0,0', a = 0.84 }) {
+  const k = E.outCubic(prog(l, 0, 12));
+  vx.save(); vx.setTransform(1, 0, 0, 1, 0, 0);
+  vx.fillStyle = `rgba(${scrim},${a * k})`; vx.fillRect(0, 0, VW, VH);
+  vx.restore();
+  const t1 = E.outExpo(prog(l, 3, 19)), t2 = E.outExpo(prog(l, 11, 27)), t3 = E.outExpo(prog(l, 19, 35));
+  vx.fillStyle = accent; vx.globalAlpha = t1; vx.fillRect(VL, 742, 88 * t1, 7); vx.globalAlpha = 1;
+  const size = vText(title, VL, 850 + (1 - t1) * 40, { size: 92, weight: 800, color: ink, spacing: -2, alpha: t1, max: VR - VL });
+  const y2 = 850 + Math.max(size, 60) * 0.25 + 70;
+  vx.font = `600 44px ${FONT}`;
+  const lead = 'drawn in code  ·  ', lw = vx.measureText(lead).width;
+  vText(lead, VL, y2 + (1 - t2) * 24, { size: 44, weight: 600, color: dim, alpha: t2 });
+  vText('bytepatterns.com', VL + lw, y2 + (1 - t2) * 24, { size: 44, weight: 800, color: accent, alpha: t2 });
+  if (line) vText(line, VL, y2 + 72 + (1 - t3) * 18, { size: 32, weight: 500, color: dim, alpha: t3, max: VR - VL });
+}
+/** Seeks a cut. The first frame a page draws is drawn twice: the very first read of a
+ *  GPU-backed source canvas can come out a shade different from every later one. */
+let vWarm = false;
+function vSeek(draw, i, frames) {
+  const f = Math.max(0, Math.min(frames - 1, Math.floor(i)));
+  if (!vWarm) { vWarm = true; draw(f); }
+  draw(f);
+}
+/** The soundtrack of a cut: the piece's own audio() spliced to the same segments as the picture. */
+async function vAudio(segs, frames, { xf = 0.025, fadeOut = 0.6, extra = null } = {}) {
+  const src = await renderAudio();
+  const SR = 48000, dur = frames / FPS, ac = new OfflineAudioContext(2, Math.round(SR * dur), SR);
+  const out = ac.createGain(); out.connect(ac.destination);
+  out.gain.setValueAtTime(1, 0); out.gain.setValueAtTime(1, dur - fadeOut); out.gain.linearRampToValueAtTime(0, dur - 0.01);
+  segs.forEach((s, k) => {
+    const at = s.at / FPS, off = s.src / FPS, d = s.len / FPS;
+    const pre = k === 0 ? 0 : Math.min(xf, off), post = k === segs.length - 1 ? 0 : xf;
+    const b = ac.createBufferSource(), g = ac.createGain(); b.buffer = src;
+    g.gain.setValueAtTime(pre ? 0 : 1, at - pre);
+    if (pre) g.gain.linearRampToValueAtTime(1, at + pre);
+    if (post) { g.gain.setValueAtTime(1, at + d - post); g.gain.linearRampToValueAtTime(0, at + d + post); }
+    b.connect(g).connect(out); b.start(at - pre, off - pre, d + pre + post);
+  });
+  if (extra) extra(ac, out);
+  const buf = await ac.startRendering();
+  let peak = 0; for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) peak = Math.max(peak, Math.abs(d[i])); }
+  if (peak > 0.9) for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) d[i] *= 0.9 / peak; }
+  return buf;
+}
+/** A soft three-partial bell, for the closing card. */
+function vChime(ac, dest, at, freq, vol = 0.08) {
+  for (const [mul, v, dec] of [[1, 1, 1.8], [2.01, 0.35, 0.8], [3.02, 0.12, 0.4]]) {
+    const o = ac.createOscillator(), g = ac.createGain(); o.type = 'sine'; o.frequency.value = freq * mul;
+    g.gain.setValueAtTime(0.0001, at); g.gain.exponentialRampToValueAtTime(vol * v, at + 0.006); g.gain.exponentialRampToValueAtTime(0.0001, at + dec);
+    o.connect(g).connect(dest); o.start(at); o.stop(at + dec + 0.05);
+  }
+}
+
+/* VERTICAL CUT — this piece */
+// The two buckets stacked, the token bucket above the leaky one, on a
+// slightly faster clock; the output rasters underneath. The soundtrack is
+// rendered from the same runs on this clock.
+const VFR = 600, VEND = VFR - 60;
+const TLV = { roll: 45, spd: 26, sum: 45 + Math.ceil(STATS.tEnd * 26) + 6, end: VEND };
+const PTV = { cx: 380, by: 566, s: 0.82 }, PLV = { cx: 380, by: 950, s: 0.82 };
+const RAST_V = { x: 96, w: 768, y: 1256, dy: 94, lx: 96, rows: [1, 2], above: true };
+function vDraw(v) {
+  vReset();
+  backdrop(vx, VW, VH);
+  const t = simT(v, TLV), tc = clamp(t, 0, STATS.tEnd);
+  const hookK = 1 - E.inCubic(prog(v, TLV.roll - 14, TLV.roll));
+  vText('TOKEN BUCKET', VL, 380, { size: 32, weight: 800, color: C.tok, spacing: 4 });
+  vText(`${SIZE} tokens, +${RATE} per second`, VL, 420, { size: 28, weight: 500, color: C.dim });
+  vText('LEAKY BUCKET', VL, 770, { size: 32, weight: 800, color: C.leak, spacing: 4 });
+  vText(`queue of ${SIZE}, one out every ${GAP.toFixed(1)} s`, VL, 810, { size: 28, weight: 500, color: C.dim });
+  drawTokenPanel(vx, t, PTV);
+  drawLeakyPanel(vx, t, PLV);
+  {
+    const al = E.outCubic(prog(v, TLV.roll - 6, TLV.roll + 6));
+    const col = (x, y, lines) => lines.forEach(([s2, c], k) => vText(s2, x, y + k * 44, { size: 32, weight: 700, fam: MONO, color: c, alpha: al }));
+    col(640, 620, [[`passed ${countUpTo(TB, tc, e => e.ok)}`, C.tok], [`rejected ${countUpTo(TB, tc, e => !e.ok)}`, C.no], [`tokens ${Math.floor(tokensAt(tc))}`, C.coin]]);
+    col(640, 1004, [[`passed ${countUpTo(LB, tc, e => e.ok)}`, C.leak], [`rejected ${countUpTo(LB, tc, e => !e.ok)}`, C.no], [`waiting ${queueAt(tc)}`, C.dim]]);
+  }
+  drawRastersV(t);
+  vReset();
+  if (hookK > 0) {
+    vx.fillStyle = `rgba(${C.bgRGB},${0.84 * hookK})`; vx.fillRect(0, 320, VW, VH - 320);
+    vHook(v, ['Same burst.'], 470, { size: 116, color: C.paper, alpha: hookK });
+    vText('Two rate limiters.', VL, 570, { size: 76, weight: 850, color: C.coin, spacing: -2, alpha: hookK, max: VR - VL });
+  }
+  {
+    const [al, dy] = vEnv(v, TLV.sum, VEND + 4, 10, 8);
+    if (al > 0.01) {
+      vx.fillStyle = `rgba(${C.bgRGB},${0.84 * al})`; vx.fillRect(0, 330, VW, 780);
+      vText('Token bucket', VL, 480 + dy, { size: 72, weight: 850, color: C.tok, alpha: al });
+      vText(`lets bursts through: up to ${STATS.tbPeak}/s`, VL, 540 + dy, { size: 38, weight: 700, color: C.paper, alpha: al, max: VR - VL });
+      vText('Leaky bucket', VL, 700 + dy, { size: 72, weight: 850, color: C.leak, alpha: al });
+      vText(`smooths them: ${STATS.lbPeak}/s, waits up to ${STATS.lbWait.toFixed(1)} s`, VL, 760 + dy, { size: 38, weight: 700, color: C.paper, alpha: al, max: VR - VL });
+    }
+  }
+  vShade(C.bgRGB, 0.84);
+  vTag('RATE LIMITERS', C.coin);
+  if (v >= VEND) vEndCard(v - VEND, { title: 'Token Bucket vs Leaky Bucket', line: `same ${NREQ} requests · ${SIZE} deep · ${RATE} per second`,
+    ink: C.paper, dim: 'rgba(239,234,226,0.72)', accent: C.coin, scrim: C.bgRGB, a: 0.88 });
+  vReset();
+}
+/** The two output rows, labels above them, for the phone. */
+function drawRastersV(t) {
+  const R = RAST_V, X = s => R.x + clamp(s / tEndAxis) * R.w, tt = Math.max(0, t);
+  const rows = [
+    { label: 'token bucket out', col: C.tok, ticks: TB.filter(e => e.ok).map(e => e.out), rej: TB.filter(e => !e.ok).map(e => e.t) },
+    { label: 'leaky bucket out', col: C.leak, ticks: LB.filter(e => e.ok).map(e => e.out), rej: LB.filter(e => !e.ok).map(e => e.t) },
+  ];
+  vx.fillStyle = 'rgba(239,234,226,0.06)';
+  for (const [a, b] of BURSTS) vx.fillRect(X(a), R.y - 30, X(b) - X(a), R.dy + 60);
+  rows.forEach((r, k) => {
+    const y = R.y + k * R.dy;
+    vText(r.label, R.x, y - 30, { size: 28, weight: 700, color: r.col });
+    vx.strokeStyle = 'rgba(239,234,226,0.14)'; vx.lineWidth = 2; vx.beginPath(); vx.moveTo(R.x, y + 12); vx.lineTo(R.x + R.w, y + 12); vx.stroke();
+    vx.strokeStyle = r.col; vx.lineWidth = 3;
+    vx.beginPath(); for (const s of r.ticks) { if (s > tt) break; vx.moveTo(X(s), y + 10); vx.lineTo(X(s), y - 14); } vx.stroke();
+    vx.fillStyle = C.no; for (const s of r.rej) { if (s > tt) continue; vx.beginPath(); vx.arc(X(s), y + 24, 4.5, 0, Math.PI * 2); vx.fill(); }
+  });
+  if (t >= 0 && t <= tEndAxis) { vx.strokeStyle = 'rgba(239,234,226,0.5)'; vx.lineWidth = 2; vx.beginPath(); vx.moveTo(X(tt), R.y - 20); vx.lineTo(X(tt), R.y + R.dy + 30); vx.stroke(); }
+}
+
+window.__motion = {
+  title: 'Token Bucket vs Leaky Bucket',
+  description: `The same ${NREQ} bursty requests hit two rate limiters, both ${SIZE} deep at ${RATE} per second: the token bucket lets up to ${STATS.tbPeak} through in a second, the leaky bucket never more than ${STATS.lbPeak}, at the cost of waits up to ${STATS.lbWait.toFixed(1)} s.`,
+  fps: FPS, width: W, height: H, frames: FRAMES,
+  poster: 400,
+  gifStart: 11,
+  seek(i) { draw(Math.max(0, Math.min(FRAMES - 1, Math.floor(i)))); },
+  audio: () => renderAudio(TL, FRAMES, TL.end),
+  variants: {
+    vertical: {
+      width: VW, height: VH, frames: VFR, canvas: vcv,
+      poster: 300, gifStart: 8,
+      seek(i) { vSeek(vDraw, i, VFR); },
+      audio: () => renderAudio(TLV, VFR, VEND),
+    },
+  },
+};
+
+/* ==========================================================================
+   PLAYER — identical in every piece; keep as is.
+   Autoplays and loops, starts sound on the first click, ?frame=N pauses on a
+   frame, ?variant=vertical plays the vertical cut (if the piece has one).
+   When the renderer sets window.__MOTION_RENDER__ it stays out of the way.
+   ========================================================================== */
+(function player() {
+  const btn = document.getElementById('sound'), q = new URLSearchParams(location.search);
+  let M = window.__motion;
+  const V = !window.__MOTION_RENDER__ && M.variants && M.variants[q.get('variant')];
+  if (V) {                                                // show the variant's own canvas instead
+    M = Object.assign({}, M, V);
+    V.canvas.style.cssText = `width:min(100vw,calc(100vh*${V.width}/${V.height}));height:auto;aspect-ratio:${V.width}/${V.height}`;
+    document.querySelector('canvas').replaceWith(V.canvas);
+  }
+  const dur = M.frames / M.fps;
+  if (window.__MOTION_RENDER__) { btn.hidden = true; M.seek(0); return; }
+  if (q.has('frame')) { btn.hidden = true; M.seek(+q.get('frame') || 0); return; }
+  let t0 = performance.now(), ac = null, src = null, buf = null, paused = false, pausedAt = 0;
+  const clock = () => ac && src ? (ac.currentTime - t0) : (performance.now() - t0) / 1000;
+  function loop() {
+    if (!paused) M.seek(Math.floor(((clock() % dur) + dur) % dur * M.fps));
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+  btn.addEventListener('click', async () => {
+    if (src) { src.stop(); src = null; btn.textContent = 'Click for sound'; t0 = performance.now(); return; }
+    btn.textContent = 'Loading sound…';
+    ac = ac || new AudioContext({ sampleRate: 48000 });
+    buf = buf || await M.audio();
+    await ac.resume();
+    src = ac.createBufferSource(); src.buffer = buf; src.loop = true; src.connect(ac.destination);
+    t0 = ac.currentTime + 0.05; src.start(t0);        // picture restarts from frame 0 in sync with the sound
+    btn.textContent = 'Sound on — click to mute';
+  });
+  addEventListener('keydown', e => {
+    if (e.code !== 'Space') return;
+    e.preventDefault(); paused = !paused;
+    if (ac) paused ? ac.suspend() : ac.resume();
+    if (!ac) { if (paused) pausedAt = performance.now(); else t0 += performance.now() - pausedAt; }
+  });
+})();
+</script>
+</body>
+</html>

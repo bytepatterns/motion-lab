@@ -1,0 +1,672 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="author" content="teambytepatterns">
+<meta name="description" content="About 1,800 smoothed particles, a dam break and a tilting tank: water drawn in code, flowing around the word code.">
+<title>Liquid Letters — motion-lab</title>
+<style>
+  /* Player chrome. The piece itself lives entirely in the canvas. */
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  body { display: grid; place-items: center; font: 500 15px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #fff; }
+  canvas { display: block; width: min(100vw, calc(100vh * 16 / 9)); height: auto; aspect-ratio: 16 / 9; }
+  #sound { position: fixed; left: 16px; bottom: 16px; padding: 8px 14px; border: 1px solid rgba(255,255,255,.35); border-radius: 999px;
+           background: rgba(0,0,0,.55); color: #fff; font: inherit; cursor: pointer; }
+  #sound[hidden] { display: none; }
+</style>
+</head>
+<body>
+<canvas id="stage" width="1920" height="1080" aria-label="A block of simulated water is released in a tank, crashes over the letters of the word code and sloshes as the tank tilts"></canvas>
+<button id="sound" type="button">Click for sound</button>
+<script>
+'use strict';
+/* ==========================================================================
+   PIECE — Liquid Letters.
+   A tank, the word "code" built from rings and bars (its outline is an
+   exact distance field, no font), and a block of water held back by a dam.
+   The water is about 1,800 particles: each sub-step every particle measures
+   how crowded its neighbourhood is, and pairs that are too crowded push
+   apart while pairs that are too sparse pull together (double density
+   relaxation). The dam opens, the wave crashes over the letters, then the
+   tank tilts back and forth and the water sloshes through them.
+   The simulation runs once at load (fixed steps, fixed order) and stores
+   every particle's position per frame; seek(i) draws frame i from those:
+   a smooth surface ("metaballs": a field summed from every particle and
+   cut at a threshold), shaded by depth and by speed for the foam.
+   ========================================================================== */
+const W = 1920, H = 1080, FPS = 30, FRAMES = 720;          // 24 s
+const cv = document.getElementById('stage');
+const ctx = cv.getContext('2d', { willReadFrequently: true });   // CPU raster: identical pixels on every redraw
+const FONT = 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
+const MONO = 'ui-monospace, "Cascadia Code", Consolas, Menlo, monospace';
+
+// ---- helpers -------------------------------------------------------------
+// ---- helpers -------------------------------------------------------------
+function mulberry32(a) { return function () { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a);
+  t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const lerp = (a, b, t) => a + (b - a) * t;
+const prog = (f, a, b) => clamp((f - a) / (b - a));
+const smooth = t => t * t * (3 - 2 * t);
+const E = {
+  inCubic: t => t * t * t,
+  outCubic: t => 1 - Math.pow(1 - t, 3),
+  inOutCubic: t => t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2,
+  outExpo: t => t === 1 ? 1 : 1 - Math.pow(2, -10 * t),
+  inExpo: t => t === 0 ? 0 : Math.pow(2, 10 * t - 10),
+  inOutExpo: t => t === 0 ? 0 : t === 1 ? 1 : t < .5 ? Math.pow(2, 20 * t - 10) / 2 : (2 - Math.pow(2, -20 * t + 10)) / 2,
+  outBack: t => 1 + 2.70158 * Math.pow(t - 1, 3) + 1.70158 * Math.pow(t - 1, 2),
+};
+function text(g, str, x, y, { size = 40, weight = 600, color = '#fff', alpha = 1, spacing = 0, align = 'left', fam = FONT, base = 'alphabetic' } = {}) {
+  if (alpha <= 0.002 || !str) return 0;
+  g.font = `${weight} ${size}px ${fam}`; g.letterSpacing = spacing + 'px';
+  g.textAlign = align; g.textBaseline = base;
+  const a0 = g.globalAlpha; g.globalAlpha = a0 * alpha; g.fillStyle = color;
+  g.fillText(str, x, y);
+  const w = g.measureText(str).width;
+  g.globalAlpha = a0; g.letterSpacing = '0px';
+  return w;
+}
+const env = (f, a, b, fin = 12, fout = 10) => {
+  const i = E.outCubic(prog(f, a, a + fin)), o = 1 - E.inCubic(prog(f, b - fout, b));
+  return [Math.min(i, o), (1 - i) * 24 - (1 - o) * 10];
+};
+// ---- the letters: a geometric "code", as a signed distance field (tank pixels) -------------
+/** Signed distance to an arc of a ring: centre (cx, cy), radius r, half-width hw, with a gap of
+ *  half-angle ga around direction ang (radians, screen y down). */
+function sdRingGap(x, y, cx, cy, r, hw, ang, ga) {
+  const dx = x - cx, dy = y - cy;
+  let a = Math.atan2(dy, dx) - ang; a = Math.atan2(Math.sin(a), Math.cos(a));
+  if (Math.abs(a) > ga) return Math.abs(Math.hypot(dx, dy) - r) - hw;
+  // inside the gap: distance to the nearer end cap
+  const e1 = ang + ga, e2 = ang - ga;
+  const d1 = Math.hypot(x - (cx + r * Math.cos(e1)), y - (cy + r * Math.sin(e1)));
+  const d2 = Math.hypot(x - (cx + r * Math.cos(e2)), y - (cy + r * Math.sin(e2)));
+  return Math.min(d1, d2) - hw;
+}
+function sdBox(x, y, x0, y0, x1, y1) {                      // axis-aligned box
+  const qx = Math.max(x0 - x, 0, x - x1), qy = Math.max(y0 - y, 0, y - y1);
+  const out = Math.hypot(qx, qy), inx = Math.min(Math.max(x0 - x, x - x1), 0), iny = Math.min(Math.max(y0 - y, y - y1), 0);
+  return out + Math.max(inx, iny);
+}
+/** The word, laid out from its left edge x0 with ring centres on line cy. s scales it. */
+function makeWord(x0, cy, s = 1) {
+  const r = 58 * s, hw = 15 * s, adv = 2 * r + 2 * hw + 34 * s;
+  const cxs = [0, 1, 2, 3].map(k => x0 + r + hw + k * adv);
+  const sd = (x, y) => {
+    let d = sdRingGap(x, y, cxs[0], cy, r, hw, 0, 0.72);                                  // c
+    d = Math.min(d, Math.abs(Math.hypot(x - cxs[1], y - cy) - r) - hw);                   // o
+    d = Math.min(d, Math.abs(Math.hypot(x - cxs[2], y - cy) - r) - hw);                   // d: bowl
+    d = Math.min(d, sdBox(x, y, cxs[2] + r - hw, cy - 2.3 * r, cxs[2] + r + hw, cy + r + hw));   //    stem
+    d = Math.min(d, sdRingGap(x, y, cxs[3], cy, r, hw, 0.62, 0.5));                      // e: ring open at lower right
+    d = Math.min(d, sdBox(x, y, cxs[3] - r, cy - hw * 0.9, cxs[3] + r, cy + hw * 0.9));   //    bar
+    return d;
+  };
+  return { sd, r, hw, cxs, cy, x0, x1: cxs[3] + r + hw, top: cy - 2.3 * r, bottom: cy + r + hw };
+}
+/** Traces the word's outline for drawing: the same shapes as paths. */
+function wordPath(g, Wd) {
+  const { r, hw, cxs, cy } = Wd;
+  g.beginPath();
+  const ring = (cx, a0, a1) => { g.moveTo(cx + (r + hw) * Math.cos(a0), cy + (r + hw) * Math.sin(a0)); g.arc(cx, cy, r + hw, a0, a1); g.arc(cx + r * Math.cos(a1), cy + r * Math.sin(a1), hw, a1, a1 + Math.PI); g.arc(cx, cy, r - hw, a1, a0, true); g.arc(cx + r * Math.cos(a0), cy + r * Math.sin(a0), hw, a0 + Math.PI, a0); g.closePath(); };
+  ring(cxs[0], 0.72, Math.PI * 2 - 0.72);
+  g.moveTo(cxs[1] + r + hw, cy); g.arc(cxs[1], cy, r + hw, 0, Math.PI * 2); g.moveTo(cxs[1] + r - hw, cy); g.arc(cxs[1], cy, r - hw, 0, Math.PI * 2, true);
+  g.moveTo(cxs[2] + r + hw, cy); g.arc(cxs[2], cy, r + hw, 0, Math.PI * 2); g.moveTo(cxs[2] + r - hw, cy); g.arc(cxs[2], cy, r - hw, 0, Math.PI * 2, true);
+  g.rect(cxs[2] + r - hw, cy - 2.3 * r, 2 * hw, 3.3 * r + hw);
+  ring(cxs[3], 0.62 + 0.5, 0.62 - 0.5 + Math.PI * 2);
+  g.rect(cxs[3] - r, cy - hw * 0.9, 2 * r, hw * 1.8);
+}
+
+// ---- the fluid ------------------------------------------------------------------------
+/* Smoothed particles with double density relaxation (Clavet, Beaudoin and Poulin, 2005):
+   every sub-step each particle measures a density from its neighbours within h,
+       rho = sum (1 - r/h)^2,   rho_near = sum (1 - r/h)^3,
+   turns it into a pressure P = k (rho - rho0) and a near pressure Pn = kn rho_near, and
+   moves each pair apart (P > 0: too crowded) or together (P < 0: too sparse) by
+       D = dt^2 (P (1 - r/h) + Pn (1 - r/h)^2).
+   Velocities come from the positions (Verlet style). Walls and the letters push particles
+   out along the gradient of their distance field. Fixed steps, fixed order: deterministic. */
+function simulate(o) {
+  const { w, h: TH, frames, sub, word, block, spacing, tRelease, tilt } = o;
+  const H = o.H || 22, K = o.K ?? 2, KN = o.KN ?? 5, SIGMA = o.SIGMA ?? 0.2, BETA = o.BETA ?? 0.1, G = o.g;
+  const P = [];
+  for (let y = TH - spacing / 2; y > block.y0; y -= spacing * 0.9)
+    for (let x = block.x0 + spacing / 2 + ((P.length / 7) % 2) * 0; x < block.x1; x += spacing) {
+      const jit = mulberry32((P.length + 1) * 7919)();
+      P.push(x + (jit - 0.5) * 1.5, y);
+    }
+  const N = P.length / 2;
+  const x = new Float64Array(P), px = new Float64Array(2 * N), v = new Float64Array(2 * N);
+  const rho = new Float64Array(N), rhoN = new Float64Array(N);
+  const POS = new Float32Array(frames * 2 * N), SPD = new Uint8Array(frames * N);
+  const PAIRS = new Int32Array(frames), SPLASH = new Float32Array(frames), MEAN = new Float32Array(frames);
+  const cell = H, gw = Math.ceil(w / cell) + 1, gh = Math.ceil(TH / cell) + 1;
+  const head = new Int32Array(gw * gh), next = new Int32Array(N);
+  const nb = new Int32Array(N * 64), nbc = new Int32Array(N), nq = new Float64Array(N * 64);
+  const rest = (() => {                                       // rest density: an interior particle of a square packing at `spacing`
+    let s = 0; for (let i = -3; i <= 3; i++) for (let j = -3; j <= 3; j++) { if (!i && !j) continue; const r = Math.hypot(i * spacing, j * spacing * 0.9); if (r < H) s += (1 - r / H) ** 2; }
+    return s;
+  })();
+  const PR = 5;                                               // particle radius against solids
+  const wall = { x0: PR, x1: w - PR, y0: -1e9, y1: TH - PR };
+  const gate = block.x1 + PR;                                 // the dam, until it is released
+  const WARM = o.warm || 0;                                   // settle the held block before frame 0
+  for (let ff = -WARM; ff < frames; ff++) {
+    const f = Math.max(0, ff), rec = ff >= 0;
+    const th = ff < 0 ? 0 : tilt(f), gx = G * Math.sin(th), gy = G * Math.cos(th);
+    let pairs = 0, splash = 0;
+    for (let s = 0; s < sub; s++) {
+      for (let i = 0; i < N; i++) { v[2 * i] += gx; v[2 * i + 1] += gy; }
+      // neighbours
+      head.fill(-1);
+      for (let i = 0; i < N; i++) {
+        const cx = clamp(Math.floor(x[2 * i] / cell), 0, gw - 1), cy = clamp(Math.floor(x[2 * i + 1] / cell), 0, gh - 1), c = cy * gw + cx;
+        next[i] = head[c]; head[c] = i;
+      }
+      // viscosity (linear and quadratic), then advance
+      for (let i = 0; i < N; i++) {
+        nbc[i] = 0;
+        const cx = clamp(Math.floor(x[2 * i] / cell), 0, gw - 1), cy = clamp(Math.floor(x[2 * i + 1] / cell), 0, gh - 1);
+        for (let yy = Math.max(0, cy - 1); yy <= Math.min(gh - 1, cy + 1); yy++) for (let xx = Math.max(0, cx - 1); xx <= Math.min(gw - 1, cx + 1); xx++)
+          for (let j = head[yy * gw + xx]; j >= 0; j = next[j]) {
+            if (j <= i) continue;
+            const dx = x[2 * j] - x[2 * i], dy = x[2 * j + 1] - x[2 * i + 1], r2 = dx * dx + dy * dy;
+            if (r2 >= H * H || r2 < 1e-9 || nbc[i] >= 64) continue;
+            const r = Math.sqrt(r2), q = r / H, ux = dx / r, uy = dy / r;
+            nb[i * 64 + nbc[i]] = j; nq[i * 64 + nbc[i]] = q; nbc[i]++;
+            const u = (v[2 * i] - v[2 * j]) * ux + (v[2 * i + 1] - v[2 * j + 1]) * uy;
+            if (u > 0) { const I = 0.5 * (1 - q) * (SIGMA * u + BETA * u * u), Ix = I * ux, Iy = I * uy; v[2 * i] -= Ix; v[2 * i + 1] -= Iy; v[2 * j] += Ix; v[2 * j + 1] += Iy; }
+          }
+      }
+      for (let i = 0; i < 2 * N; i++) { px[i] = x[i]; x[i] += v[i]; }
+      // double density relaxation (pairs found above, distances recomputed)
+      rho.fill(0); rhoN.fill(0);
+      for (let i = 0; i < N; i++) for (let k = 0; k < nbc[i]; k++) {
+        const j = nb[i * 64 + k], dx = x[2 * j] - x[2 * i], dy = x[2 * j + 1] - x[2 * i + 1], r = Math.hypot(dx, dy);
+        if (r >= H) { nq[i * 64 + k] = 2; continue; }
+        const q = r / H, a = 1 - q; nq[i * 64 + k] = q;
+        rho[i] += a * a; rho[j] += a * a; rhoN[i] += a * a * a; rhoN[j] += a * a * a;
+      }
+      for (let i = 0; i < N; i++) {
+        const Pi = K * (rho[i] - rest), PNi = KN * rhoN[i];
+        let dxi = 0, dyi = 0;
+        for (let k = 0; k < nbc[i]; k++) {
+          const q = nq[i * 64 + k]; if (q >= 1) continue;
+          const j = nb[i * 64 + k], Pj = K * (rho[j] - rest), PNj = KN * rhoN[j];
+          const dx = x[2 * j] - x[2 * i], dy = x[2 * j + 1] - x[2 * i + 1], r = Math.hypot(dx, dy) || 1e-6;
+          const a = 1 - q, D = 0.5 * ((Pi + Pj) * 0.5 * a + (PNi + PNj) * 0.5 * a * a), Dx = D * dx / r * 0.5, Dy = D * dy / r * 0.5;
+          x[2 * j] += Dx; x[2 * j + 1] += Dy; dxi -= Dx; dyi -= Dy;
+          if (s === 0) pairs++;
+        }
+        x[2 * i] += dxi; x[2 * i + 1] += dyi;
+      }
+      // walls, the dam, the letters
+      const damOn = ff < tRelease;
+      for (let i = 0; i < N; i++) {
+        let X = x[2 * i], Y = x[2 * i + 1];
+        if (X < wall.x0) X = wall.x0; if (X > wall.x1) X = wall.x1; if (Y > wall.y1) Y = wall.y1;
+        if (damOn && X > gate - 2 * PR) X = gate - 2 * PR;
+        const d = word.sd(X, Y);
+        if (d < PR) {
+          const e = 0.5, nx = word.sd(X + e, Y) - word.sd(X - e, Y), ny = word.sd(X, Y + e) - word.sd(X, Y - e), nl = Math.hypot(nx, ny) || 1;
+          X += nx / nl * (PR - d); Y += ny / nl * (PR - d);
+        }
+        x[2 * i] = X; x[2 * i + 1] = Y;
+      }
+      // velocities from positions; splash = how hard particles were stopped
+      for (let i = 0; i < N; i++) {
+        const nvx = x[2 * i] - px[2 * i], nvy = x[2 * i + 1] - px[2 * i + 1];
+        splash += Math.max(0, Math.hypot(v[2 * i] - nvx, v[2 * i + 1] - nvy) - 1.2);
+        v[2 * i] = nvx; v[2 * i + 1] = nvy;
+      }
+    }
+    if (!rec) { for (let i = 0; i < 2 * N; i++) v[i] *= 0.9; continue; }         // warm-up: damp and do not record
+    let ms = 0;
+    for (let i = 0; i < N; i++) {
+      POS[(f * N + i) * 2] = x[2 * i]; POS[(f * N + i) * 2 + 1] = x[2 * i + 1];
+      const sp = Math.hypot(v[2 * i], v[2 * i + 1]); ms += sp; SPD[f * N + i] = Math.min(255, Math.round(sp * 40));
+    }
+    PAIRS[f] = pairs; SPLASH[f] = splash / sub; MEAN[f] = ms / N;
+  }
+  return { N, POS, SPD, PAIRS, SPLASH, MEAN, rest };
+}
+
+// ---- palette -------------------------------------------------------------
+const C = {
+  bg: '#0A0D13', bgRGB: '10,13,19', tank: '#0F141C', paper: '#F2ECE2', dim: 'rgba(242,236,226,0.64)', faint: 'rgba(242,236,226,0.28)',
+  rim: [150, 226, 255], water: [34, 118, 196], deep: [14, 52, 110], foam: [236, 248, 255], amber: '#F5B83D', coral: '#FF7A59', teal: '#6FD6C8',
+};
+
+// ---- the scene, simulated once ------------------------------------------------------
+const TW = 1500, TH = 800;
+const WORD = makeWord(420, 700, 1);
+const T = { release: 18, xray0: 118, xray1: 232, tilt0: 250, tilt1: 600, calm: 604, end: 648 };
+const tiltAt = f => { const p = prog(f, T.tilt0, T.tilt1); return 0.16 * Math.sin(Math.PI * 3 * p) * Math.sin(Math.PI * p); };
+const SIM = simulate({ w: TW, h: TH, frames: FRAMES, sub: 4, word: WORD, block: { x0: 0, x1: 460, y0: 90 }, spacing: 14,
+  tRelease: T.release, g: 0.07 * 25 / 16, warm: 100, tilt: tiltAt });
+const NP = SIM.N;
+const MAXTILT = (() => { let m = 0; for (let f = 0; f < FRAMES; f++) m = Math.max(m, Math.abs(tiltAt(f))); return m * 180 / Math.PI; })();
+const fmtN = n => n.toLocaleString('en-US');
+
+// ---- the surface: a field summed from every particle, cut at a threshold -----------------------
+const FS = 2, FW = TW / FS, FH = TH / FS, KR = 8, T0 = 0.42;   // cells of 2 tank px; kernel radius 8 cells
+const FIELD = new Float32Array(FW * FH), SFIELD = new Float32Array(FW * FH);
+const SOLID = new Uint8Array(FW * FH);
+for (let y = 0; y < FH; y++) for (let x = 0; x < FW; x++) SOLID[y * FW + x] = WORD.sd((x + 0.5) * FS, (y + 0.5) * FS) < 0 ? 1 : 0;
+const surf = document.createElement('canvas'); surf.width = FW; surf.height = FH;
+const sfx = surf.getContext('2d', { willReadFrequently: true });
+const SIMG = sfx.createImageData(FW, FH);
+function paintSurface(f, fade) {
+  FIELD.fill(0); SFIELD.fill(0);
+  const base = f * NP, P2 = SIM.POS, SP = SIM.SPD;
+  for (let i = 0; i < NP; i++) {
+    const X = P2[(base + i) * 2] / FS, Y = P2[(base + i) * 2 + 1] / FS, sp = SP[base + i];
+    const x0 = Math.max(0, Math.ceil(X - KR - 0.5)), x1 = Math.min(FW - 1, Math.floor(X + KR - 0.5));
+    const y0 = Math.max(0, Math.ceil(Y - KR - 0.5)), y1 = Math.min(FH - 1, Math.floor(Y + KR - 0.5));
+    for (let yy = y0; yy <= y1; yy++) {
+      const dy = yy + 0.5 - Y, row = yy * FW;
+      for (let xx = x0; xx <= x1; xx++) {
+        const dx = xx + 0.5 - X, d2 = (dx * dx + dy * dy) / (KR * KR);
+        if (d2 >= 1) continue;
+        const w = (1 - d2) * (1 - d2); FIELD[row + xx] += w; SFIELD[row + xx] += w * sp;
+      }
+    }
+  }
+  const d = SIMG.data;
+  for (let k = 0, n = FW * FH; k < n; k++) {
+    const F = FIELD[k], o = k * 4;
+    if (F < T0 - 0.1 || SOLID[k]) { d[o + 3] = 0; continue; }
+    const a = clamp((F - (T0 - 0.1)) / 0.2), e = Math.sqrt(clamp((F - T0) / 1.4));
+    const ty = Math.floor(k / FW) * FS, dep = clamp((ty - 560) / 240);
+    const foam = clamp(((SFIELD[k] / F) / 40 - 3.2) / 3);
+    for (let c = 0; c < 3; c++) {
+      let v = lerp(C.rim[c], lerp(C.water[c], C.deep[c], dep), e);
+      v = lerp(v, C.foam[c], foam * 0.85);
+      d[o + c] = v;
+    }
+    d[o + 3] = 255 * a * fade;
+  }
+  sfx.putImageData(SIMG, 0, 0);
+}
+/** The tank at frame f through a camera { cx, cy, s } (screen centre of the tank and its scale). */
+function drawTank(g, f, cam, xray) {
+  g.save();
+  g.translate(cam.cx, cam.cy); g.rotate(tiltAt(f)); g.scale(cam.s, cam.s); g.translate(-TW / 2, -TH / 2);
+  g.fillStyle = C.tank; g.beginPath(); g.roundRect(-14, -14, TW + 28, TH + 28, 20); g.fill();
+  // the dam, until it lifts
+  const lift = E.inCubic(prog(f, T.release - 6, T.release + 8));
+  if (lift < 1) { g.fillStyle = 'rgba(242,236,226,0.55)'; g.fillRect(462, -40 - lift * 900, 10, TH + 40); }
+  paintSurface(f, 1 - 0.7 * xray);
+  g.imageSmoothingEnabled = true; g.imageSmoothingQuality = 'high';
+  g.drawImage(surf, 0, 0, TW, TH);
+  if (xray > 0.01) {                                         // the particles themselves
+    const base = f * NP; g.fillStyle = `rgba(190,238,255,${0.95 * xray})`;
+    for (let i = 0; i < NP; i++) g.fillRect(SIM.POS[(base + i) * 2] - 2.5, SIM.POS[(base + i) * 2 + 1] - 2.5, 5, 5);
+  }
+  wordPath(g, WORD); g.fillStyle = C.paper; g.fill();
+  g.strokeStyle = C.faint; g.lineWidth = 3 / cam.s; g.beginPath(); g.roundRect(-14, -14, TW + 28, TH + 28, 20); g.stroke();
+  g.restore();
+}
+function backdrop(g, w, h) { g.fillStyle = C.bg; g.fillRect(0, 0, w, h); }
+const xrayAt = f => E.inOutCubic(prog(f, T.xray0, T.xray0 + 16)) * (1 - E.inOutCubic(prog(f, T.xray1 - 16, T.xray1)));
+
+// ---- landscape picture ------------------------------------------------------------------
+const CAM_L = { cx: 960, cy: 600, s: 0.94 };
+function draw(f) {
+  if (ctx.reset) ctx.reset();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; ctx.filter = 'none'; ctx.shadowBlur = 0;
+  backdrop(ctx, W, H);
+  drawTank(ctx, f, CAM_L, xrayAt(f));
+  const endK = E.inOutCubic(prog(f, T.end, T.end + 20)), a = 1 - endK;
+  text(ctx, 'PHYSICS  ·  PARTICLE FLUID', 120, 104, { size: 26, weight: 600, color: C.dim, spacing: 5, alpha: a });
+  text(ctx, 'BYTEPATTERNS', 1800, 104, { size: 26, weight: 600, color: C.dim, spacing: 5, align: 'right', alpha: a });
+  text(ctx, `${fmtN(NP)} particles`, 1800, 160, { size: 30, weight: 700, fam: MONO, color: C.dim, align: 'right', alpha: a });
+  // hook
+  {
+    const k = E.outExpo(prog(f, -20, 4)), k2 = E.outExpo(prog(f, -14, 10)), o = 1 - E.inCubic(prog(f, 84, 100));
+    text(ctx, `${fmtN(NP)} particles.`, 760, 390 + (1 - k) * 30, { size: 96, weight: 850, color: C.paper, spacing: -3, alpha: Math.min(k, o) });
+    text(ctx, 'Each one only feels its neighbours.', 764, 460 + (1 - k2) * 30, { size: 44, weight: 700, color: C.teal, alpha: Math.min(k2, o) });
+  }
+  // x-ray
+  {
+    const [al, dy] = env(f, T.xray0 + 4, T.xray1, 14, 12);
+    text(ctx, 'Each dot is a particle.', 330, 380 + dy, { size: 64, weight: 850, color: C.paper, spacing: -2, alpha: al });
+    text(ctx, 'The surface is drawn around them.', 334, 446 + dy, { size: 40, weight: 700, color: C.teal, alpha: al });
+  }
+  // the rule
+  {
+    const [al, dy] = env(f, T.xray1 + 6, T.tilt0 + 150, 14, 12);
+    text(ctx, 'Too crowded: push apart.', 330, 360 + dy, { size: 52, weight: 850, color: C.coral, alpha: al });
+    text(ctx, 'Too sparse: pull together.', 330, 426 + dy, { size: 52, weight: 850, color: C.teal, alpha: al });
+    text(ctx, `${fmtN(SIM.PAIRS[f])} neighbour pairs this frame`, 334, 486 + dy, { size: 32, weight: 600, fam: MONO, color: C.dim, alpha: al });
+  }
+  // the tilt
+  {
+    const [al, dy] = env(f, T.tilt0 + 160, T.calm, 14, 12);
+    const deg = tiltAt(f) * 180 / Math.PI;
+    text(ctx, 'Tilt the tank.', 330, 360 + dy, { size: 64, weight: 850, color: C.paper, spacing: -2, alpha: al });
+    text(ctx, `${deg >= 0 ? '+' : '−'}${Math.abs(deg).toFixed(1)}°`, 334, 440 + dy, { size: 56, weight: 800, fam: MONO, color: C.amber, alpha: al });
+  }
+  // calm
+  {
+    const [al, dy] = env(f, T.calm + 2, T.end + 4, 14, 10);
+    text(ctx, 'Water, drawn in code.', W / 2, 400 + dy, { size: 104, weight: 850, color: C.paper, spacing: -3, align: 'center', alpha: al * a });
+  }
+  if (endK > 0) {
+    ctx.fillStyle = `rgba(${C.bgRGB},${0.86 * endK})`; ctx.fillRect(0, 0, W, H);
+    const k1 = E.outCubic(prog(f, T.end + 6, T.end + 28)), k2 = E.outCubic(prog(f, T.end + 16, T.end + 38)), k3 = E.outCubic(prog(f, T.end + 26, T.end + 48));
+    text(ctx, 'Liquid Letters', W / 2, 500 + (1 - k1) * 30, { size: 140, weight: 850, color: C.paper, spacing: -3, align: 'center', alpha: k1 });
+    text(ctx, `${fmtN(NP)} particles  ·  one dam break  ·  a tank tilting ±${MAXTILT.toFixed(1)}°`, W / 2, 580 + (1 - k2) * 20, { size: 42, weight: 500, color: C.amber, align: 'center', alpha: k2 });
+    text(ctx, 'bytepatterns · motion lab', W / 2, 1000, { size: 32, weight: 600, color: C.paper, spacing: 3, align: 'center', alpha: k3 * 0.8 });
+  }
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.letterSpacing = '0px';
+}
+
+// ---- sound: the water itself, from the simulation -------------------------------------------
+async function renderAudio() {
+  const SR = 48000, dur = FRAMES / FPS, LEN = Math.round(SR * dur);
+  const ac = new OfflineAudioContext(2, LEN, SR);
+  const comp = ac.createDynamicsCompressor();
+  comp.threshold.value = -16; comp.ratio.value = 3; comp.attack.value = 0.004; comp.release.value = 0.25;
+  const master = ac.createGain(); master.gain.value = 0.95; master.connect(comp).connect(ac.destination);
+  master.gain.setValueAtTime(0.95, dur - 0.8); master.gain.linearRampToValueAtTime(0.0001, dur - 0.02);
+  const rnd = mulberry32(0x25F1);
+  const ir = ac.createBuffer(2, SR * 2.6, SR);
+  for (let c = 0; c < 2; c++) { const d = ir.getChannelData(c); for (let k = 0; k < d.length; k++) d[k] = (rnd() * 2 - 1) * Math.pow(1 - k / d.length, 3); }
+  const verb = ac.createConvolver(); verb.buffer = ir; const vg = ac.createGain(); vg.gain.value = 0.35; verb.connect(vg).connect(master);
+  const hz = m => 440 * Math.pow(2, (m - 69) / 12);
+  // the body of water: noise through a band that follows how fast the water moves
+  { const nb = ac.createBuffer(2, SR * 3, SR);
+    for (let c = 0; c < 2; c++) { const d = nb.getChannelData(c); let v = 0; for (let k = 0; k < d.length; k++) { v = v * 0.92 + (rnd() * 2 - 1) * 0.4; d[k] = v; } }
+    const s = ac.createBufferSource(); s.buffer = nb; s.loop = true;
+    const bp = ac.createBiquadFilter(); bp.type = 'lowpass'; bp.Q.value = 0.7;
+    const g = ac.createGain(); g.gain.setValueAtTime(0.0001, 0);
+    for (let f = 0; f < FRAMES; f += 2) {
+      const m = SIM.MEAN[f] * 4, t = f / FPS;                 // px per frame
+      g.gain.linearRampToValueAtTime(0.04 + Math.min(0.5, m * 0.045), t);
+      bp.frequency.linearRampToValueAtTime(380 + Math.min(2600, m * 260), t);
+    }
+    s.connect(bp).connect(g); g.connect(master); g.connect(verb); s.start(0); s.stop(dur); }
+  // the crash: a burst of noise when the wave hits
+  { const at = (T.release + 16) / FPS, nb = ac.createBuffer(1, SR * 2, SR); const d = nb.getChannelData(0); for (let k = 0; k < d.length; k++) d[k] = rnd() * 2 - 1;
+    const s = ac.createBufferSource(); s.buffer = nb; const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.setValueAtTime(3000, at); lp.frequency.exponentialRampToValueAtTime(300, at + 1.6);
+    const g = ac.createGain(); g.gain.setValueAtTime(0.0001, at); g.gain.exponentialRampToValueAtTime(0.35, at + 0.08); g.gain.exponentialRampToValueAtTime(0.0001, at + 1.8);
+    s.connect(lp).connect(g); g.connect(master); g.connect(verb); s.start(at); s.stop(at + 2); }
+  // droplets: little rising blips, more of them the faster the water is moving
+  for (let f = 0; f < T.end + 10; f++) {
+    const m = SIM.MEAN[f] * 4, n = Math.floor(rnd() * Math.min(3, m * 0.35) + (rnd() < m * 0.06 ? 1 : 0));
+    for (let q = 0; q < n; q++) {
+      const at = (f + rnd()) / FPS, f0 = 500 + rnd() * 900, o = ac.createOscillator(), g = ac.createGain(), p = ac.createStereoPanner();
+      o.frequency.setValueAtTime(f0, at); o.frequency.exponentialRampToValueAtTime(f0 * 2.2, at + 0.035);
+      g.gain.setValueAtTime(0.0001, at); g.gain.exponentialRampToValueAtTime(0.05, at + 0.004); g.gain.exponentialRampToValueAtTime(0.0001, at + 0.05);
+      p.pan.value = rnd() * 1.4 - 0.7; o.connect(g).connect(p); p.connect(master); p.connect(verb); o.start(at); o.stop(at + 0.06);
+    }
+  }
+  // a slow pad
+  const pad = (fa, fb, notes, amp) => { const a0 = fa / FPS, b0 = Math.min(dur, fb / FPS), lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 900; lp.connect(master); lp.connect(verb);
+    for (const m of notes) for (const det of [-7, 7]) {
+      const o = ac.createOscillator(); o.type = 'triangle'; o.frequency.value = hz(m); o.detune.value = det;
+      const g = ac.createGain(); g.gain.setValueAtTime(0, a0); g.gain.linearRampToValueAtTime(amp, a0 + (fa === 0 ? 0.1 : 1.5));
+      g.gain.setValueAtTime(amp, Math.max(a0 + 1.5, b0 - 1.2)); g.gain.linearRampToValueAtTime(0, b0);
+      o.connect(g).connect(lp); o.start(a0); o.stop(b0 + 0.05);
+    } };
+  pad(0, T.tilt0 + 20, [50, 57, 62, 66, 69], 0.02); pad(T.tilt0, T.calm + 20, [47, 54, 59, 62, 66], 0.02); pad(T.calm, FRAMES, [43, 50, 55, 59, 62, 67], 0.022);
+  const bell = (at, m, amp, pan) => { for (const [r2, a2, d2] of [[1, 1, 2.2], [2.76, 0.3, 0.9], [5.4, 0.1, 0.4]]) {
+    const o = ac.createOscillator(); o.frequency.value = hz(m) * r2; const g = ac.createGain(), p = ac.createStereoPanner();
+    g.gain.setValueAtTime(0.0001, at); g.gain.exponentialRampToValueAtTime(amp * a2, at + 0.006); g.gain.exponentialRampToValueAtTime(0.0001, at + d2);
+    p.pan.value = pan; o.connect(g).connect(p); p.connect(master); p.connect(verb); o.start(at); o.stop(at + d2 + 0.05); } };
+  [67, 71, 74, 79].forEach((m, i) => bell((T.calm + 4 + i * 5) / FPS, m, 0.07, -0.3 + i * 0.2));
+  [69, 72, 76, 81].forEach((m, i) => bell((T.end + 8 + i * 6) / FPS, m, 0.08, -0.45 + i * 0.3));
+  const buf = await ac.startRendering();
+  let peak = 0; for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let k = 0; k < d.length; k++) peak = Math.max(peak, Math.abs(d[k])); }
+  if (peak > 0.89) for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let k = 0; k < d.length; k++) d[k] *= 0.89 / peak; }
+  return buf;
+}
+
+/* ==========================================================================
+   VERTICAL CUT — shared block, identical in every piece.
+   1080x1920 for Reels, Shorts and TikTok (__motion.variants.vertical). The
+   piece's own scene code is re-used and recomposed for a phone: everything a
+   viewer must read stays inside the area no platform covers (x 60..900,
+   y 230..1400); outside it there is only dimmed texture.
+   ========================================================================== */
+const VW = 1080, VH = 1920, SAFE = { x: 60, y: 230, w: 840, h: 1170, r: 900, b: 1400 };
+const vcv = document.createElement('canvas'); vcv.width = VW; vcv.height = VH;
+const vx = vcv.getContext('2d', { willReadFrequently: true });   // CPU raster: identical pixels on every redraw
+const VL = 96, VR = 864;                                          // text column inside the safe area
+
+function vReset() {
+  vx.setTransform(1, 0, 0, 1, 0, 0); vx.globalAlpha = 1; vx.globalCompositeOperation = 'source-over';
+  vx.filter = 'none'; vx.shadowBlur = 0; vx.shadowColor = 'transparent'; vx.letterSpacing = '0px'; vx.setLineDash([]);
+  vx.textAlign = 'left'; vx.textBaseline = 'alphabetic'; vx.lineCap = 'butt'; vx.lineJoin = 'miter';
+}
+/** Canvas text on the vertical frame; `max` shrinks the size until the line fits. */
+function vText(str, x, y, { size = 40, weight = 700, color = '#FFFFFF', align = 'left', spacing = 0, alpha = 1, fam = FONT, max = 0 } = {}) {
+  if (alpha <= 0.002 || !str) return size;
+  vx.font = `${weight} ${size}px ${fam}`; vx.letterSpacing = spacing + 'px';
+  if (max) { const w = vx.measureText(str).width; if (w > max) { size = size * max / w; vx.font = `${weight} ${size}px ${fam}`; } }
+  vx.textAlign = align; vx.textBaseline = 'alphabetic';
+  const a0 = vx.globalAlpha; vx.globalAlpha = a0 * alpha; vx.fillStyle = color;
+  vx.fillText(str, x + (align === 'center' ? spacing / 2 : align === 'right' ? spacing : 0), y);   // tracking is added after the last glyph too
+  vx.globalAlpha = a0; vx.letterSpacing = '0px';
+  return size;
+}
+/** Word-wraps with the given font; returns the lines. */
+function vWrap(str, maxW, size, weight = 700, fam = FONT) {
+  vx.font = `${weight} ${size}px ${fam}`; vx.letterSpacing = '0px';
+  const words = str.split(' '), lines = []; let cur = '';
+  for (const w of words) { const t = cur ? cur + ' ' + w : w; if (vx.measureText(t).width > maxW && cur) { lines.push(cur); cur = w; } else cur = t; }
+  if (cur) lines.push(cur);
+  return lines;
+}
+/** Fade envelope with a small rise: [alpha, dy]. */
+function vEnv(v, a, b, fin = 8, fout = 8) {
+  const i = E.outCubic(prog(v, a, a + fin)), o = 1 - E.inCubic(prog(v, b - fout, b));
+  return [Math.min(i, o), (1 - i) * 22 - (1 - o) * 10];
+}
+/** Which segment of a cut list a vertical frame is in: segs = [{ at, src, len }] in frames. */
+function vSeg(segs, v) {
+  let k = 0; while (k < segs.length - 1 && v >= segs[k + 1].at) k++;
+  const s = segs[k];
+  return { k, s, local: v - s.at, src: s.src + (v - s.at) };
+}
+/** Dims everything outside the safe area to a quiet texture (brightness x 0.2), with a soft inner edge. */
+function vShade(rgb, a = 0.8, feather = 40) {
+  vx.save(); vx.setTransform(1, 0, 0, 1, 0, 0); vx.globalAlpha = 1; vx.globalCompositeOperation = 'source-over';
+  vx.fillStyle = `rgba(${rgb},${a})`;
+  vx.beginPath(); vx.rect(0, 0, VW, VH); vx.rect(SAFE.x, SAFE.y, SAFE.w, SAFE.h); vx.fill('evenodd');
+  const strip = (x0, y0, x1, y1, rx, ry, rw, rh) => {
+    const g = vx.createLinearGradient(x0, y0, x1, y1);
+    g.addColorStop(0, `rgba(${rgb},${a})`); g.addColorStop(1, `rgba(${rgb},0)`);
+    vx.fillStyle = g; vx.fillRect(rx, ry, rw, rh);
+  };
+  strip(SAFE.x, 0, SAFE.x + feather, 0, SAFE.x, SAFE.y, feather, SAFE.h);
+  strip(SAFE.r, 0, SAFE.r - feather, 0, SAFE.r - feather, SAFE.y, feather, SAFE.h);
+  strip(0, SAFE.y, 0, SAFE.y + feather, SAFE.x, SAFE.y, SAFE.w, feather);
+  strip(0, SAFE.b, 0, SAFE.b - feather, SAFE.x, SAFE.b - feather, SAFE.w, feather);
+  vx.restore();
+}
+/** Series tag at the top of the safe area, e.g. MADE IN CODE · 04. */
+function vTag(label, color, alpha = 1) {
+  vText('MADE IN CODE', VL, 292, { size: 28, weight: 800, color, spacing: 5, alpha });
+  vx.font = `800 28px ${FONT}`; vx.letterSpacing = '5px';
+  const w = vx.measureText('MADE IN CODE').width; vx.letterSpacing = '0px';
+  vText('·  ' + label, VL + w + 14, 292, { size: 28, weight: 600, color: 'rgba(255,255,255,0.72)', spacing: 3, alpha, max: VR - VL - w - 14 });
+}
+/** Big hook lines, left-aligned from y0; visible from frame 0, settles in a few frames. */
+function vHook(v, lines, y0, { size = 84, lh = 1.08, color = '#FFFFFF', accent = null, weight = 800, spacing = -1.5, alpha = 1 } = {}) {
+  const k = E.outExpo(prog(v, -6, 12));
+  lines.forEach((ln, i) => {
+    const kk = E.outExpo(prog(v, -12 + i * 2, 8 + i * 2));
+    vText(ln, VL, y0 + i * size * lh + (1 - kk) * 30, { size, weight, spacing, color: accent && i === lines.length - 1 ? accent : color, alpha: alpha * Math.max(0.25, kk), max: VR - VL });
+  });
+  return k;
+}
+/** Closing card, the last 60 frames: piece title, "drawn in code · bytepatterns.com". l = frames into the card. */
+function vEndCard(l, { title, line = '', ink = '#FFFFFF', dim = 'rgba(255,255,255,0.66)', accent = '#FFFFFF', scrim = '0,0,0', a = 0.84 }) {
+  const k = E.outCubic(prog(l, 0, 12));
+  vx.save(); vx.setTransform(1, 0, 0, 1, 0, 0);
+  vx.fillStyle = `rgba(${scrim},${a * k})`; vx.fillRect(0, 0, VW, VH);
+  vx.restore();
+  const t1 = E.outExpo(prog(l, 3, 19)), t2 = E.outExpo(prog(l, 11, 27)), t3 = E.outExpo(prog(l, 19, 35));
+  vx.fillStyle = accent; vx.globalAlpha = t1; vx.fillRect(VL, 742, 88 * t1, 7); vx.globalAlpha = 1;
+  const size = vText(title, VL, 850 + (1 - t1) * 40, { size: 92, weight: 800, color: ink, spacing: -2, alpha: t1, max: VR - VL });
+  const y2 = 850 + Math.max(size, 60) * 0.25 + 70;
+  vx.font = `600 44px ${FONT}`;
+  const lead = 'drawn in code  ·  ', lw = vx.measureText(lead).width;
+  vText(lead, VL, y2 + (1 - t2) * 24, { size: 44, weight: 600, color: dim, alpha: t2 });
+  vText('bytepatterns.com', VL + lw, y2 + (1 - t2) * 24, { size: 44, weight: 800, color: accent, alpha: t2 });
+  if (line) vText(line, VL, y2 + 72 + (1 - t3) * 18, { size: 32, weight: 500, color: dim, alpha: t3, max: VR - VL });
+}
+/** Seeks a cut. The first frame a page draws is drawn twice: the very first read of a
+ *  GPU-backed source canvas can come out a shade different from every later one. */
+let vWarm = false;
+function vSeek(draw, i, frames) {
+  const f = Math.max(0, Math.min(frames - 1, Math.floor(i)));
+  if (!vWarm) { vWarm = true; draw(f); }
+  draw(f);
+}
+/** The soundtrack of a cut: the piece's own audio() spliced to the same segments as the picture. */
+async function vAudio(segs, frames, { xf = 0.025, fadeOut = 0.6, extra = null } = {}) {
+  const src = await renderAudio();
+  const SR = 48000, dur = frames / FPS, ac = new OfflineAudioContext(2, Math.round(SR * dur), SR);
+  const out = ac.createGain(); out.connect(ac.destination);
+  out.gain.setValueAtTime(1, 0); out.gain.setValueAtTime(1, dur - fadeOut); out.gain.linearRampToValueAtTime(0, dur - 0.01);
+  segs.forEach((s, k) => {
+    const at = s.at / FPS, off = s.src / FPS, d = s.len / FPS;
+    const pre = k === 0 ? 0 : Math.min(xf, off), post = k === segs.length - 1 ? 0 : xf;
+    const b = ac.createBufferSource(), g = ac.createGain(); b.buffer = src;
+    g.gain.setValueAtTime(pre ? 0 : 1, at - pre);
+    if (pre) g.gain.linearRampToValueAtTime(1, at + pre);
+    if (post) { g.gain.setValueAtTime(1, at + d - post); g.gain.linearRampToValueAtTime(0, at + d + post); }
+    b.connect(g).connect(out); b.start(at - pre, off - pre, d + pre + post);
+  });
+  if (extra) extra(ac, out);
+  const buf = await ac.startRendering();
+  let peak = 0; for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) peak = Math.max(peak, Math.abs(d[i])); }
+  if (peak > 0.9) for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) d[i] *= 0.9 / peak; }
+  return buf;
+}
+/** A soft three-partial bell, for the closing card. */
+function vChime(ac, dest, at, freq, vol = 0.08) {
+  for (const [mul, v, dec] of [[1, 1, 1.8], [2.01, 0.35, 0.8], [3.02, 0.12, 0.4]]) {
+    const o = ac.createOscillator(), g = ac.createGain(); o.type = 'sine'; o.frequency.value = freq * mul;
+    g.gain.setValueAtTime(0.0001, at); g.gain.exponentialRampToValueAtTime(vol * v, at + 0.006); g.gain.exponentialRampToValueAtTime(0.0001, at + dec);
+    o.connect(g).connect(dest); o.start(at); o.stop(at + dec + 0.05);
+  }
+}
+
+/* VERTICAL CUT — this piece */
+// The same simulation through a portrait camera: close on the dam and the
+// crash, panning with the wave, then pulled back to the whole tank while it
+// tilts. The soundtrack is the piece's own, cut to the same segments.
+const VSEG = [
+  { at: 0, src: 0, len: 150 },                               // hook, the dam opens, the crash
+  { at: 150, src: T.xray1 + 8, len: 144 },                   // the rule
+  { at: 294, src: T.tilt0 + 190, len: 186 },                 // the tilt, and calm
+  { at: 480, src: T.end + 2, len: 60 },                      // closing card
+];
+const VFR = 540, VEND = VFR - 60;
+function camV(v, seg, f) {
+  if (seg === 0) return { cx: 480, cy: 930, s: 1.02, tx: lerp(300, 750, E.inOutCubic(prog(f, 16, 110))) };
+  const z = seg >= 2 ? E.inOutCubic(prog(v, 294, 330)) : 0;
+  return { cx: 480, cy: lerp(930, 1010, z), s: lerp(1.02, 0.68, z), tx: lerp(750, 790, z) };
+}
+function vDraw(v) {
+  const { k: seg, src } = vSeg(VSEG, v), f = Math.min(FRAMES - 1, src);
+  vReset();
+  backdrop(vx, VW, VH);
+  const cam = camV(v, seg, f);
+  // centre the camera on tank x = cam.tx: shift the tank's screen centre accordingly
+  drawTank(vx, f, { cx: cam.cx + (TW / 2 - cam.tx) * cam.s, cy: cam.cy, s: cam.s }, seg === 0 ? xrayAt(f) : 0);
+  vReset();
+  vShade(C.bgRGB, 0.86);
+  vTag('LIQUID LETTERS', C.amber);
+  if (seg === 0) {
+    vHook(v, [`${fmtN(NP)} particles.`], 400, { size: 92, color: C.paper });
+    vText('Each only feels', VL, 480, { size: 52, weight: 800, color: C.teal });
+    vText('its neighbours.', VL, 542, { size: 52, weight: 800, color: C.teal });
+  } else if (seg === 1) {
+    const [al, dy] = vEnv(v, 150, 296, 8, 8);
+    vText('Too crowded:', VL, 380 + dy, { size: 56, weight: 850, color: C.coral, alpha: al });
+    vText('push apart.', VL, 440 + dy, { size: 56, weight: 850, color: C.coral, alpha: al });
+    vText('Too sparse:', VL, 520 + dy, { size: 56, weight: 850, color: C.teal, alpha: al });
+    vText('pull together.', VL, 580 + dy, { size: 56, weight: 850, color: C.teal, alpha: al });
+  } else {
+    const [al, dy] = vEnv(v, 294, 420, 8, 8), deg = tiltAt(f) * 180 / Math.PI;
+    vText('Tilt the tank.', VL, 420 + dy, { size: 76, weight: 850, color: C.paper, alpha: al });
+    vText(`${deg >= 0 ? '+' : '−'}${Math.abs(deg).toFixed(1)}°`, VL, 510 + dy, { size: 64, weight: 800, fam: MONO, color: C.amber, alpha: al });
+    const [a2, d2] = vEnv(v, 420, VEND + 4, 10, 8);
+    vText('Water,', VL, 420 + d2, { size: 92, weight: 850, color: C.paper, alpha: a2 });
+    vText('drawn in code.', VL, 520 + d2, { size: 92, weight: 850, color: C.amber, alpha: a2, max: VR - VL });
+  }
+  if (v >= VEND) vEndCard(v - VEND, { title: 'Liquid Letters', line: `${fmtN(NP)} particles · one dam break · a tilting tank`,
+    ink: C.paper, dim: 'rgba(242,236,226,0.72)', accent: C.amber, scrim: C.bgRGB, a: 0.86 });
+  vReset();
+}
+
+window.__motion = {
+  title: 'Liquid Letters',
+  description: `${fmtN(NP)} simulated particles of water are released from a dam, crash over the word "code" and slosh through its letters as the tank tilts; the surface is drawn around the particles in every frame.`,
+  fps: FPS, width: W, height: H, frames: FRAMES,
+  poster: 44,
+  gifStart: 0.6,
+  seek(i) { draw(Math.max(0, Math.min(FRAMES - 1, Math.floor(i)))); },
+  audio: renderAudio,
+  variants: {
+    vertical: {
+      width: VW, height: VH, frames: VFR, canvas: vcv,
+      poster: 112, gifStart: 0.4,
+      seek(i) { vSeek(vDraw, i, VFR); },
+      audio: () => vAudio(VSEG, VFR),
+    },
+  },
+};
+
+/* ==========================================================================
+   PLAYER — identical in every piece; keep as is.
+   Autoplays and loops, starts sound on the first click, ?frame=N pauses on a
+   frame, ?variant=vertical plays the vertical cut (if the piece has one).
+   When the renderer sets window.__MOTION_RENDER__ it stays out of the way.
+   ========================================================================== */
+(function player() {
+  const btn = document.getElementById('sound'), q = new URLSearchParams(location.search);
+  let M = window.__motion;
+  const V = !window.__MOTION_RENDER__ && M.variants && M.variants[q.get('variant')];
+  if (V) {                                                // show the variant's own canvas instead
+    M = Object.assign({}, M, V);
+    V.canvas.style.cssText = `width:min(100vw,calc(100vh*${V.width}/${V.height}));height:auto;aspect-ratio:${V.width}/${V.height}`;
+    document.querySelector('canvas').replaceWith(V.canvas);
+  }
+  const dur = M.frames / M.fps;
+  if (window.__MOTION_RENDER__) { btn.hidden = true; M.seek(0); return; }
+  if (q.has('frame')) { btn.hidden = true; M.seek(+q.get('frame') || 0); return; }
+  let t0 = performance.now(), ac = null, src = null, buf = null, paused = false, pausedAt = 0;
+  const clock = () => ac && src ? (ac.currentTime - t0) : (performance.now() - t0) / 1000;
+  function loop() {
+    if (!paused) M.seek(Math.floor(((clock() % dur) + dur) % dur * M.fps));
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+  btn.addEventListener('click', async () => {
+    if (src) { src.stop(); src = null; btn.textContent = 'Click for sound'; t0 = performance.now(); return; }
+    btn.textContent = 'Loading sound…';
+    ac = ac || new AudioContext({ sampleRate: 48000 });
+    buf = buf || await M.audio();
+    await ac.resume();
+    src = ac.createBufferSource(); src.buffer = buf; src.loop = true; src.connect(ac.destination);
+    t0 = ac.currentTime + 0.05; src.start(t0);        // picture restarts from frame 0 in sync with the sound
+    btn.textContent = 'Sound on — click to mute';
+  });
+  addEventListener('keydown', e => {
+    if (e.code !== 'Space') return;
+    e.preventDefault(); paused = !paused;
+    if (ac) paused ? ac.suspend() : ac.resume();
+    if (!ac) { if (paused) pausedAt = performance.now(); else t0 += performance.now() - pausedAt; }
+  });
+})();
+</script>
+</body>
+</html>

@@ -271,6 +271,71 @@ Click a preview to open the piece live in your browser (click once more there fo
 <br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/20-domino-chain/?variant=vertical">open</a> · <a href="out/20-domino-chain.vertical.png">still</a></sub>
 </td>
 </tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/21-rush-hour-dijkstra/"><img src="out/21-rush-hour-dijkstra.gif" width="100%" alt="Dijkstra at Rush Hour — animated preview"></a>
+<br><b>21 · Dijkstra at Rush Hour</b> <sub>24 s</sub>
+<br>Dijkstra's search spreads through a generated city where every street costs its rush-hour travel time; the fastest way to work is 14% longer than the shortest and 15.4 minutes sooner.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/21-rush-hour-dijkstra/">open in browser</a> · <a href="out/21-rush-hour-dijkstra.png">still</a> · <a href="projects/21-rush-hour-dijkstra/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/21-rush-hour-dijkstra/?variant=vertical"><img src="out/21-rush-hour-dijkstra.vertical.gif" width="100%" alt="Dijkstra at Rush Hour — vertical cut, animated preview"></a>
+<br><sub>9:16 · 20 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/21-rush-hour-dijkstra/?variant=vertical">open</a> · <a href="out/21-rush-hour-dijkstra.vertical.png">still</a></sub>
+</td>
+</tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/22-rolling-update/"><img src="out/22-rolling-update.gif" width="100%" alt="Rolling Update — animated preview"></a>
+<br><b>22 · Rolling Update</b> <sub>24 s</sub>
+<br>A Kubernetes rolling update of 4 pods from v1 to v2 with maxSurge 1 and maxUnavailable 0: each new pod must pass its readiness probe before an old one is let go, so ready pods never drop below 4.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/22-rolling-update/">open in browser</a> · <a href="out/22-rolling-update.png">still</a> · <a href="projects/22-rolling-update/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/22-rolling-update/?variant=vertical"><img src="out/22-rolling-update.vertical.gif" width="100%" alt="Rolling Update — vertical cut, animated preview"></a>
+<br><sub>9:16 · 18 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/22-rolling-update/?variant=vertical">open</a> · <a href="out/22-rolling-update.vertical.png">still</a></sub>
+</td>
+</tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/23-token-vs-leaky-bucket/"><img src="out/23-token-vs-leaky-bucket.gif" width="100%" alt="Token Bucket vs Leaky Bucket — animated preview"></a>
+<br><b>23 · Token Bucket vs Leaky Bucket</b> <sub>24 s</sub>
+<br>The same 92 bursty requests hit two rate limiters, both 8 deep at 5 per second: the token bucket lets up to 12 through in a second, the leaky bucket never more than 5, at the cost of waits up to 1.6 s.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/23-token-vs-leaky-bucket/">open in browser</a> · <a href="out/23-token-vs-leaky-bucket.png">still</a> · <a href="projects/23-token-vs-leaky-bucket/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/23-token-vs-leaky-bucket/?variant=vertical"><img src="out/23-token-vs-leaky-bucket.vertical.gif" width="100%" alt="Token Bucket vs Leaky Bucket — vertical cut, animated preview"></a>
+<br><sub>9:16 · 20 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/23-token-vs-leaky-bucket/?variant=vertical">open</a> · <a href="out/23-token-vs-leaky-bucket.vertical.png">still</a></sub>
+</td>
+</tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/24-two-pointers/"><img src="out/24-two-pointers.gif" width="100%" alt="Two Pointers — animated preview"></a>
+<br><b>24 · Two Pointers</b> <sub>24 s</sub>
+<br>Kinetic type where the words left and right are the pointers: they check that 14 letters read the same both ways, find the pair that sums to 19 in 4 steps and reverse STRESSED in 4 swaps.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/24-two-pointers/">open in browser</a> · <a href="out/24-two-pointers.png">still</a> · <a href="projects/24-two-pointers/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/24-two-pointers/?variant=vertical"><img src="out/24-two-pointers.vertical.gif" width="100%" alt="Two Pointers — vertical cut, animated preview"></a>
+<br><sub>9:16 · 19 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/24-two-pointers/?variant=vertical">open</a> · <a href="out/24-two-pointers.vertical.png">still</a></sub>
+</td>
+</tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/25-liquid-letters/"><img src="out/25-liquid-letters.gif" width="100%" alt="Liquid Letters — animated preview"></a>
+<br><b>25 · Liquid Letters</b> <sub>24 s</sub>
+<br>1,848 simulated particles of water are released from a dam, crash over the word &quot;code&quot; and slosh through its letters as the tank tilts; the surface is drawn around the particles in every frame.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/25-liquid-letters/">open in browser</a> · <a href="out/25-liquid-letters.png">still</a> · <a href="projects/25-liquid-letters/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/25-liquid-letters/?variant=vertical"><img src="out/25-liquid-letters.vertical.gif" width="100%" alt="Liquid Letters — vertical cut, animated preview"></a>
+<br><sub>9:16 · 18 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/25-liquid-letters/?variant=vertical">open</a> · <a href="out/25-liquid-letters.vertical.png">still</a></sub>
+</td>
+</tr>
 </table>
 <!-- gallery:end -->
 

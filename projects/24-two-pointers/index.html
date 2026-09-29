@@ -1,0 +1,641 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="author" content="teambytepatterns">
+<meta name="description" content="Kinetic type in which the words left and right are the two pointers: they check a palindrome, find a pair that sums to 19 and reverse a word in place, each in one pass.">
+<title>Two Pointers — motion-lab</title>
+<style>
+  /* Player chrome. The piece itself lives entirely in the canvas. */
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  body { display: grid; place-items: center; font: 500 15px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #fff; }
+  canvas { display: block; width: min(100vw, calc(100vh * 16 / 9)); height: auto; aspect-ratio: 16 / 9; }
+  #sound { position: fixed; left: 16px; bottom: 16px; padding: 8px 14px; border: 1px solid rgba(255,255,255,.35); border-radius: 999px;
+           background: rgba(0,0,0,.55); color: #fff; font: inherit; cursor: pointer; }
+  #sound[hidden] { display: none; }
+</style>
+</head>
+<body>
+<canvas id="stage" width="1920" height="1080" aria-label="Kinetic type: the words left and right walk in from both ends of a row of letters and numbers, checking a palindrome, finding a pair sum and reversing a word"></canvas>
+<button id="sound" type="button">Click for sound</button>
+<script>
+'use strict';
+/* ==========================================================================
+   PIECE — Two Pointers.
+   Kinetic type where the words themselves do the algorithm: "left" starts
+   at one end of a row, "right" at the other, and they walk in.
+   1. Is NEVER ODD OR EVEN a palindrome? Compare the two ends, step both in.
+   2. Which two of 1 3 4 7 9 12 15 20 (sorted) sum to 19? Too small: left
+      steps in. Too big: right steps in.
+   3. Reverse STRESSED in place: swap the ends, step both in.
+   Every step is computed by running the three loops once, at load; the
+   picture and the beat read the recorded steps. Motion trails are drawn by
+   re-evaluating the pointer positions a few sub-frames earlier.
+   ========================================================================== */
+const W = 1920, H = 1080, FPS = 30, FRAMES = 720;          // 24 s
+const cv = document.getElementById('stage');
+const ctx = cv.getContext('2d', { willReadFrequently: true });   // CPU raster: identical pixels on every redraw
+const FONT = 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
+const MONO = 'ui-monospace, "Cascadia Code", Consolas, Menlo, monospace';
+
+// ---- helpers -------------------------------------------------------------
+// ---- helpers -------------------------------------------------------------
+function mulberry32(a) { return function () { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a);
+  t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const lerp = (a, b, t) => a + (b - a) * t;
+const prog = (f, a, b) => clamp((f - a) / (b - a));
+const smooth = t => t * t * (3 - 2 * t);
+const E = {
+  inCubic: t => t * t * t,
+  outCubic: t => 1 - Math.pow(1 - t, 3),
+  inOutCubic: t => t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2,
+  outExpo: t => t === 1 ? 1 : 1 - Math.pow(2, -10 * t),
+  inExpo: t => t === 0 ? 0 : Math.pow(2, 10 * t - 10),
+  inOutExpo: t => t === 0 ? 0 : t === 1 ? 1 : t < .5 ? Math.pow(2, 20 * t - 10) / 2 : (2 - Math.pow(2, -20 * t + 10)) / 2,
+  outBack: t => 1 + 2.70158 * Math.pow(t - 1, 3) + 1.70158 * Math.pow(t - 1, 2),
+};
+function text(g, str, x, y, { size = 40, weight = 600, color = '#fff', alpha = 1, spacing = 0, align = 'left', fam = FONT, base = 'alphabetic' } = {}) {
+  if (alpha <= 0.002 || !str) return 0;
+  g.font = `${weight} ${size}px ${fam}`; g.letterSpacing = spacing + 'px';
+  g.textAlign = align; g.textBaseline = base;
+  const a0 = g.globalAlpha; g.globalAlpha = a0 * alpha; g.fillStyle = color;
+  g.fillText(str, x, y);
+  const w = g.measureText(str).width;
+  g.globalAlpha = a0; g.letterSpacing = '0px';
+  return w;
+}
+const env = (f, a, b, fin = 12, fout = 10) => {
+  const i = E.outCubic(prog(f, a, a + fin)), o = 1 - E.inCubic(prog(f, b - fout, b));
+  return [Math.min(i, o), (1 - i) * 24 - (1 - o) * 10];
+};
+
+// ---- palette -------------------------------------------------------------
+const C = {
+  bg: '#0F0D12', bgRGB: '15,13,18', paper: '#F2ECE2', dim: 'rgba(242,236,226,0.6)', faint: 'rgba(242,236,226,0.2)',
+  L: '#58C4B8', R: '#FFB547', ok: '#9BE36D', hot: '#FF6B57',
+};
+
+// ---- the three loops, run once -----------------------------------------------------
+const BEAT = 18;                                             // frames per beat (100 BPM)
+const PAL = 'NEVERODDOREVEN';
+const PAL_STEPS = (() => { const s = []; for (let i = 0, j = PAL.length - 1; i < j; i++, j--) s.push({ i, j, match: PAL[i] === PAL[j] }); return s; })();
+const NUMS = [1, 3, 4, 7, 9, 12, 15, 20], TARGET = 19;
+const SUM_STEPS = (() => {
+  const s = []; let i = 0, j = NUMS.length - 1;
+  while (i < j) {
+    const v = NUMS[i] + NUMS[j], dir = v === TARGET ? 'found' : v < TARGET ? 'small' : 'big';
+    s.push({ i, j, v, dir });
+    if (dir === 'found') break; if (dir === 'small') i++; else j--;
+  }
+  return s;
+})();
+const WORD = 'STRESSED';
+const REV_STEPS = (() => { const s = []; for (let i = 0, j = WORD.length - 1; i < j; i++, j--) s.push({ i, j }); return s; })();
+const REVERSED = WORD.split('').reverse().join('');
+
+// ---- timeline (frames) ---------------------------------------------------------------
+const T = {
+  slam: 54, pal: 72, palPtr: 108, palC: 126, palRes: 252, palOut: 280,
+  sum: 288, sumPtr: 324, sumC: 342, sumOut: 440,
+  rev: 450, revPtr: 470, revC: 486, revOut: 596, outro: 604, end: 648,
+};
+T.sumRes = T.sumC + BEAT * SUM_STEPS.length;
+T.revRes = T.revC + BEAT * REV_STEPS.length;
+const beatOf = (c0, m) => c0 + BEAT * m;
+/** Pointer index (float) at frame f: starts at `start`, moves by `d` in the second half of each step's beat. */
+function ptrPos(f, start, c0, steps, d, moves) {
+  let p = start;
+  steps.forEach((s, m) => { if (moves(s)) p += d * E.inOutCubic(prog(f, beatOf(c0, m) + 8, beatOf(c0, m) + 16)); });
+  return p;
+}
+const palL = f => ptrPos(f, 0, T.palC, PAL_STEPS, 1, () => true);
+const palR = f => ptrPos(f, PAL.length - 1, T.palC, PAL_STEPS, -1, () => true);
+const sumL = f => ptrPos(f, 0, T.sumC, SUM_STEPS, 1, s => s.dir === 'small');
+const sumR = f => ptrPos(f, NUMS.length - 1, T.sumC, SUM_STEPS, -1, s => s.dir === 'big');
+const revL = f => ptrPos(f, 0, T.revC + 2, REV_STEPS, 1, () => true);
+const revR = f => ptrPos(f, WORD.length - 1, T.revC + 2, REV_STEPS, -1, () => true);
+
+// ---- drawing ------------------------------------------------------------------------
+/** G: the layout of a stage (landscape or vertical). */
+const slotX = (G, n, k) => G.cx + (k - (n - 1) / 2) * G.pitch;
+const sceneG = (G, key) => G[key] ? Object.assign({}, G, G[key]) : G;      // per-scene pitch and size
+/** A glyph drawn at (x, y) with a scale about its centre. */
+function glyph(g, ch, x, y, size, color, { sc = 1, sx = 1, alpha = 1, weight = 850, fam = FONT } = {}) {
+  if (alpha <= 0.01) return;
+  g.save(); g.translate(x, y); g.scale(sc * sx, sc);
+  text(g, ch, 0, size * 0.36, { size, weight, color, align: 'center', alpha, fam });
+  g.restore();
+}
+/** A pointer: caret and word under a row, with a motion trail. pos(f) gives the index. */
+function pointer(g, G, f, n, pos, word, col, alpha) {
+  if (alpha <= 0.01) return;
+  const y0 = G.rowY + G.size * 0.62;
+  for (const [dt, a] of [[4.5, 0.12], [3, 0.2], [1.5, 0.32], [0, 1]]) {
+    const x = slotX(G, n, pos(f - dt)), v = Math.abs(pos(f - dt) - pos(f - dt - 1));
+    if (dt && v < 0.01) continue;                           // trails only while it moves
+    const sx = 1 + 0.9 * v, sy = 1 - 0.25 * Math.min(1, v);
+    g.save(); g.globalAlpha = alpha * a; g.translate(x, y0); g.scale(sx, sy);
+    g.fillStyle = col; g.beginPath(); g.moveTo(0, 0); g.lineTo(-G.caret, G.caret * 1.3); g.lineTo(G.caret, G.caret * 1.3); g.closePath(); g.fill();
+    if (!dt) text(g, word, 0, G.caret * 1.3 + G.ptr * 1.05, { size: G.ptr, weight: 850, color: col, align: 'center' });   // the word: squash and stretch, no ghosts
+    g.restore();
+  }
+}
+/** An arc over the row between slots i and j, drawn on over u (0..1). */
+function arcOver(g, G, n, i, j, u, col, alpha, lift = 1) {
+  if (alpha <= 0.01 || u <= 0) return;
+  const x0 = slotX(G, n, i), x1 = slotX(G, n, j), y = G.rowY - G.size * 0.7, hgt = (G.size * 0.3 + (x1 - x0) * 0.07) * lift;
+  g.save(); g.globalAlpha = alpha; g.strokeStyle = col; g.lineWidth = G.arcW; g.lineCap = 'round';
+  g.beginPath();
+  const N = 40;
+  for (let k = 0; k <= N * u; k++) { const s = k / N, x = lerp(x0, x1, s), yy = y - hgt * 4 * s * (1 - s); if (k === 0) g.moveTo(x, yy); else g.lineTo(x, yy); }
+  g.stroke(); g.restore();
+}
+/** The headline of a scene, kinetic: words fall in one after another. */
+function headline(g, G, f, str, t0, t1, color = C.paper) {
+  const words = str.split(' ');
+  g.font = `850 ${G.cap}px ${FONT}`; g.letterSpacing = '-1px';
+  const widths = words.map(w => g.measureText(w + ' ').width), total = widths.reduce((a, b) => a + b, 0);
+  let x = G.capAlign === 'center' ? G.cx - total / 2 : G.capX;
+  words.forEach((w, k) => {
+    const a = E.outBack(prog(f, t0 + k * 3, t0 + k * 3 + 12)), o = 1 - E.inCubic(prog(f, t1 - 10, t1));
+    text(g, w, x, G.capY + (1 - a) * 40 - (1 - o) * 20, { size: G.cap, weight: 850, color, spacing: -1, alpha: clamp(a) * o });
+    x += widths[k];
+  });
+  g.letterSpacing = '0px';
+}
+/** Scene 1: the palindrome. */
+function scenePal(g, G, f) {
+  G = sceneG(G, 'sPal');
+  const n = PAL.length, out = E.inCubic(prog(f, T.palOut, T.palOut + 16));
+  if (f < T.pal || out >= 1) return;
+  headline(g, G, f, 'Is it a palindrome?', T.pal, T.palOut + 10);
+  for (let k = 0; k < n; k++) {
+    const a = E.outBack(prog(f, T.pal + k * 2.4, T.pal + k * 2.4 + 10));
+    let col = C.paper, sc = lerp(0.4, 1, clamp(a));
+    PAL_STEPS.forEach((s, m) => {
+      if (k !== s.i && k !== s.j) return;
+      const c = beatOf(T.palC, m);
+      sc *= 1 + 0.22 * Math.sin(Math.PI * prog(f, c, c + 8));
+      if (f >= c + 3) col = s.match ? C.ok : C.hot;
+    });
+    const y = G.rowY + (1 - clamp(a)) * 40 - out * (k % 2 ? 60 : -60);
+    glyph(g, PAL[k], slotX(G, n, k), y, G.size, col, { sc, alpha: clamp(a * 1.4) * (1 - out) });
+  }
+  PAL_STEPS.forEach((s, m) => {
+    const c = beatOf(T.palC, m);
+    arcOver(g, G, n, s.i, s.j, E.outCubic(prog(f, c, c + 7)), s.match ? C.ok : C.hot, (1 - prog(f, c + 10, c + 20)) * (1 - out));
+  });
+  const pa = E.outCubic(prog(f, T.palPtr, T.palPtr + 12)) * (1 - out);
+  pointer(g, G, f, n, palL, 'left', C.L, pa);
+  pointer(g, G, f, n, palR, 'right', C.R, pa);
+  const [ra, rdy] = env(f, T.palRes, T.palOut + 8, 10, 10);
+  const line = `${PAL_STEPS.length} checks for ${n} letters: yes.`;
+  text(g, line, G.resAlign === 'center' ? G.cx : G.capX, G.resY + rdy, { size: G.res, weight: 800, color: C.ok, align: G.resAlign, alpha: ra });
+}
+/** Scene 2: two numbers that sum to the target. */
+function sceneSum(g, G, f) {
+  G = sceneG(G, 'sSum');
+  const n = NUMS.length, out = E.inCubic(prog(f, T.sumOut, T.sumOut + 16));
+  if (f < T.sum || out >= 1) return;
+  headline(g, G, f, `Two that sum to ${TARGET}?`, T.sum, T.sumOut + 10);
+  const found = SUM_STEPS[SUM_STEPS.length - 1];
+  for (let k = 0; k < n; k++) {
+    const a = E.outBack(prog(f, T.sum + 6 + k * 3, T.sum + 18 + k * 3));
+    let col = C.paper, sc = 1;
+    SUM_STEPS.forEach((s, m) => {
+      if (k !== s.i && k !== s.j) return;
+      const c = beatOf(T.sumC, m); sc *= 1 + 0.2 * Math.sin(Math.PI * prog(f, c, c + 8));
+    });
+    if (f >= beatOf(T.sumC, SUM_STEPS.length - 1) + 3 && (k === found.i || k === found.j)) col = C.ok;
+    const outOf = k < found.i || k > found.j ? prog(f, T.sumRes, T.sumRes + 10) * 0.6 : 0;   // the ruled-out ends dim
+    glyph(g, String(NUMS[k]), slotX(G, n, k), G.rowY + (1 - clamp(a)) * 60 - out * 50, G.size, col, { sc: sc * lerp(0.5, 1, clamp(a)), alpha: clamp(a * 1.5) * (1 - out) * (1 - outOf) });
+  }
+  const pa = E.outCubic(prog(f, T.sumPtr, T.sumPtr + 12)) * (1 - out);
+  pointer(g, G, f, n, sumL, 'left', C.L, pa);
+  pointer(g, G, f, n, sumR, 'right', C.R, pa);
+  // the sum of the two ends, and what it means, one beat at a time
+  SUM_STEPS.forEach((s, m) => {
+    const c = beatOf(T.sumC, m), last = m === SUM_STEPS.length - 1;
+    const a = E.outBack(prog(f, c, c + 8)), o = last ? 1 - out : 1 - E.inCubic(prog(f, c + BEAT - 4, c + BEAT));
+    if (f < c || o <= 0) return;
+    const col = s.dir === 'found' ? C.ok : s.dir === 'small' ? C.L : C.R;
+    const expr = `${NUMS[s.i]} + ${NUMS[s.j]} = ${s.v}`;
+    glyph(g, expr, G.cx, G.sumY, G.sum, C.paper, { sc: lerp(0.7, 1, clamp(a)), alpha: clamp(a * 2) * o, fam: MONO, weight: 800 });
+    const verdict = s.dir === 'found' ? `found in ${SUM_STEPS.length} steps` : s.dir === 'small' ? `too small: left steps in` : `too big: right steps in`;
+    text(g, verdict, G.cx, G.sumY + G.sum * 0.95, { size: G.res, weight: 800, color: col, align: 'center', alpha: clamp(a * 2) * o });
+  });
+}
+/** Scene 3: reverse in place. Letter k's slot at frame f follows the swaps so far. */
+function slotOf(k, f) {
+  let p = k;                                                // start slot of letter k
+  let x = p;
+  REV_STEPS.forEach((s, m) => {
+    const c = beatOf(T.revC, m), u = E.inOutCubic(prog(f, c, c + 12));
+    if (p === s.i) { x = lerp(s.i, s.j, u); if (u >= 1) p = s.j; }
+    else if (p === s.j) { x = lerp(s.j, s.i, u); if (u >= 1) p = s.i; }
+  });
+  return { x, p };
+}
+function sceneRev(g, G, f) {
+  G = sceneG(G, 'sRev');
+  const n = WORD.length, out = E.inCubic(prog(f, T.revOut, T.revOut + 14));
+  if (f < T.rev || out >= 1) return;
+  headline(g, G, f, 'Reverse it in place.', T.rev, T.revOut + 8);
+  const done = prog(f, T.revRes, T.revRes + 10);
+  for (let k = 0; k < n; k++) {
+    const a = E.outBack(prog(f, T.rev + 4 + k * 3, T.rev + 16 + k * 3));
+    const { x } = slotOf(k, f);
+    // the arc of a swap: the letter moving right goes over, the one moving left goes under
+    let lift = 0, sc = 1;
+    REV_STEPS.forEach((s, m) => {
+      const c = beatOf(T.revC, m), u = prog(f, c, c + 12);
+      if (u <= 0 || u >= 1) return;
+      const from = slotOf(k, c - 0.01).p;
+      if (from === s.i) { lift = -Math.sin(Math.PI * E.inOutCubic(u)); sc = 1.12; }
+      if (from === s.j) { lift = Math.sin(Math.PI * E.inOutCubic(u)); sc = 0.9; }
+    });
+    const swapped = REV_STEPS.some((s, m) => f >= beatOf(T.revC, m) + 12 && (slotOf(k, f).p === s.i || slotOf(k, f).p === s.j));
+    const col = done > 0 ? C.ok : swapped ? C.R : C.paper;
+    const y = G.rowY + lift * G.size * 0.95 + (1 - clamp(a)) * 50 - out * 40;
+    glyph(g, WORD[k], slotX(G, n, x), y, G.size, col, { sc: sc * lerp(0.5, 1, clamp(a)) * (1 + 0.12 * Math.sin(Math.PI * done)), alpha: clamp(a * 1.5) * (1 - out) });
+  }
+  const pa = E.outCubic(prog(f, T.revPtr, T.revPtr + 12)) * (1 - out) * (1 - done);
+  pointer(g, G, f, n, revL, 'left', C.L, pa);
+  pointer(g, G, f, n, revR, 'right', C.R, pa);
+  const [ra, rdy] = env(f, T.revRes + 4, T.revOut + 6, 10, 10);
+  text(g, `${WORD} → ${REVERSED}, ${REV_STEPS.length} swaps`, G.resAlign === 'center' ? G.cx : G.capX, G.resY + rdy, { size: G.res, weight: 800, color: C.ok, align: G.resAlign, alpha: ra });
+}
+function backdrop(g, w, h) {
+  g.fillStyle = C.bg; g.fillRect(0, 0, w, h);
+  // the "array": a faint rule the rows sit on
+  g.fillStyle = 'rgba(242,236,226,0.035)';
+  for (let x = 0; x < w; x += 48) g.fillRect(x, 0, 1, h);
+}
+
+// ---- landscape picture ------------------------------------------------------------------
+const GL = { cx: 960, capX: 120, capY: 300, cap: 76, capAlign: 'left', rowY: 560, pitch: 118, size: 116, ptr: 44, caret: 18, arcW: 5,
+  sumY: 410, sum: 80, res: 44, resY: 900, resAlign: 'left',
+  sSum: { pitch: 170, rowY: 640 }, sRev: { pitch: 170, size: 156 } };
+function hookL(f) {
+  // TWO at the left end, POINTERS at the right end; they walk in and meet
+  const u = E.inCubic(prog(f, 24, T.slam)), o = 1 - E.inCubic(prog(f, T.pal - 8, T.pal + 8));
+  if (o <= 0) return;
+  const size = 170;
+  ctx.font = `900 ${size}px ${FONT}`; ctx.letterSpacing = '-4px';
+  const wa = ctx.measureText('TWO').width, wb = ctx.measureText('POINTERS').width, gap = 50; ctx.letterSpacing = '0px';
+  const ax0 = 120, bx0 = 1800 - wb, ax1 = W / 2 - (wa + gap + wb) / 2, bx1 = ax1 + wa + gap;
+  const shake = f >= T.slam ? Math.sin((f - T.slam) * 1.9) * 10 * Math.exp(-(f - T.slam) / 5) : 0;
+  const ax = lerp(ax0, ax1, u) - shake, bx = lerp(bx0, bx1, u) + shake;
+  for (const [dt, a] of [[3, 0.14], [1.5, 0.26], [0, 1]]) {
+    const uu = E.inCubic(prog(f - dt, 24, T.slam));
+    if (dt && (uu <= 0 || uu >= 1)) continue;
+    text(ctx, 'TWO', dt ? lerp(ax0, ax1, uu) : ax, 590, { size, weight: 900, color: C.L, spacing: -4, alpha: o * a });
+    text(ctx, 'POINTERS', dt ? lerp(bx0, bx1, uu) : bx, 590, { size, weight: 900, color: C.R, spacing: -4, alpha: o * a });
+  }
+  const k = E.outExpo(prog(f, -10, 8));
+  text(ctx, '→', ax + wa / 2, 700, { size: 64, weight: 700, color: C.L, align: 'center', alpha: o * k * (1 - u) });
+  text(ctx, '←', bx + wb / 2, 700, { size: 64, weight: 700, color: C.R, align: 'center', alpha: o * k * (1 - u) });
+  const k2 = E.outCubic(prog(f, T.slam + 2, T.slam + 12));
+  text(ctx, 'one from each end, walking in', W / 2, 700 + (1 - k2) * 20, { size: 48, weight: 700, color: C.paper, align: 'center', alpha: o * k2 });
+}
+function outro(g, G, f, lines, y0, lh, align, x) {
+  lines.forEach(([str, size, col], k) => {
+    const a = E.outBack(prog(f, T.outro + k * 6, T.outro + k * 6 + 14)), o = 1 - E.inCubic(prog(f, T.end + 2, T.end + 16));
+    text(g, str, x, y0 + k * lh + (1 - clamp(a)) * 40, { size, weight: 900, color: col, spacing: -3, align, alpha: clamp(a) * o });
+  });
+}
+function draw(f) {
+  if (ctx.reset) ctx.reset();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; ctx.filter = 'none'; ctx.shadowBlur = 0;
+  backdrop(ctx, W, H);
+  const endK = E.inOutCubic(prog(f, T.end, T.end + 20)), a = 1 - endK;
+  text(ctx, 'ALGORITHMS  ·  TWO POINTERS', 120, 104, { size: 26, weight: 600, color: C.dim, spacing: 5, alpha: a });
+  text(ctx, 'BYTEPATTERNS', 1800, 104, { size: 26, weight: 600, color: C.dim, spacing: 5, align: 'right', alpha: a });
+  hookL(f);
+  scenePal(ctx, GL, f);
+  sceneSum(ctx, GL, f);
+  sceneRev(ctx, GL, f);
+  outro(ctx, GL, f, [['Two pointers.', 150, C.paper], ['One pass. O(n).', 110, C.R]], 520, 150, 'center', W / 2);
+  if (endK > 0) {
+    ctx.fillStyle = `rgba(${C.bgRGB},${0.9 * endK})`; ctx.fillRect(0, 0, W, H);
+    const k1 = E.outCubic(prog(f, T.end + 6, T.end + 28)), k2 = E.outCubic(prog(f, T.end + 16, T.end + 38)), k3 = E.outCubic(prog(f, T.end + 26, T.end + 48));
+    text(ctx, 'Two Pointers', W / 2, 500 + (1 - k1) * 30, { size: 140, weight: 850, color: C.paper, spacing: -3, align: 'center', alpha: k1 });
+    text(ctx, 'a palindrome  ·  a pair sum  ·  a reverse  ·  each in one pass', W / 2, 580 + (1 - k2) * 20, { size: 42, weight: 500, color: C.R, align: 'center', alpha: k2 });
+    text(ctx, 'bytepatterns · motion lab', W / 2, 1000, { size: 32, weight: 600, color: C.paper, spacing: 3, align: 'center', alpha: k3 * 0.8 });
+  }
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.letterSpacing = '0px';
+}
+
+// ---- sound: a 100 BPM beat; left knocks low on the left, right knocks high on the right ---------------
+async function renderAudio() {
+  const SR = 48000, dur = FRAMES / FPS, LEN = Math.round(SR * dur);
+  const ac = new OfflineAudioContext(2, LEN, SR);
+  const at = fr => fr / FPS;
+  const comp = ac.createDynamicsCompressor();
+  comp.threshold.value = -14; comp.ratio.value = 3.5; comp.attack.value = 0.003; comp.release.value = 0.18;
+  const master = ac.createGain(); master.gain.value = 0.95; master.connect(comp).connect(ac.destination);
+  master.gain.setValueAtTime(0.95, dur - 0.8); master.gain.linearRampToValueAtTime(0.0001, dur - 0.02);
+  const rnd = mulberry32(0x24B7);
+  const ir = ac.createBuffer(2, SR * 1.6, SR);
+  for (let c = 0; c < 2; c++) { const d = ir.getChannelData(c); for (let k = 0; k < d.length; k++) d[k] = (rnd() * 2 - 1) * Math.pow(1 - k / d.length, 3.8); }
+  const verb = ac.createConvolver(); verb.buffer = ir; const vg = ac.createGain(); vg.gain.value = 0.24; verb.connect(vg).connect(master);
+  const noise = ac.createBuffer(1, SR, SR); { const d = noise.getChannelData(0); for (let k = 0; k < d.length; k++) d[k] = rnd() * 2 - 1; }
+  const hz = m => 440 * Math.pow(2, (m - 69) / 12);
+  const kick = (t0, amp = 0.5) => { const o = ac.createOscillator(), g = ac.createGain();
+    o.frequency.setValueAtTime(140, t0); o.frequency.exponentialRampToValueAtTime(42, t0 + 0.14);
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(amp, t0 + 0.004); g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.3);
+    o.connect(g).connect(master); o.start(t0); o.stop(t0 + 0.32); };
+  const hat = (t0, amp = 0.05) => { const s = ac.createBufferSource(); s.buffer = noise; const hp = ac.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 7000;
+    const g = ac.createGain(); g.gain.setValueAtTime(amp, t0); g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.05);
+    s.connect(hp).connect(g).connect(master); s.start(t0, (t0 * 3.1) % 0.9, 0.06); };
+  const wood = (t0, m, pan, amp = 0.2) => { const o = ac.createOscillator(), g = ac.createGain(), p = ac.createStereoPanner(), bp = ac.createBiquadFilter();
+    o.type = 'triangle'; o.frequency.value = hz(m); bp.type = 'bandpass'; bp.frequency.value = hz(m) * 2; bp.Q.value = 1.2; p.pan.value = pan;
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(amp, t0 + 0.002); g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.12);
+    o.connect(bp).connect(g).connect(p); p.connect(master); p.connect(verb); o.start(t0); o.stop(t0 + 0.15); };
+  const bell = (t0, m, amp, pn) => { for (const [r2, a2, d2] of [[1, 1, 1.4], [2.76, 0.3, 0.6], [5.4, 0.1, 0.25]]) {
+    const o = ac.createOscillator(); o.frequency.value = hz(m) * r2; const g = ac.createGain(), p = ac.createStereoPanner();
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(amp * a2, t0 + 0.004); g.gain.exponentialRampToValueAtTime(0.0001, t0 + d2);
+    p.pan.value = pn; o.connect(g).connect(p); p.connect(master); p.connect(verb); o.start(t0); o.stop(t0 + d2 + 0.05); } };
+  const whoosh = (t0, d, pan0, pan1) => { const s = ac.createBufferSource(); s.buffer = noise; const bp = ac.createBiquadFilter(); bp.type = 'bandpass'; bp.Q.value = 3;
+    bp.frequency.setValueAtTime(600, t0); bp.frequency.exponentialRampToValueAtTime(3200, t0 + d);
+    const g = ac.createGain(), p = ac.createStereoPanner(); p.pan.setValueAtTime(pan0, t0); p.pan.linearRampToValueAtTime(pan1, t0 + d);
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(0.12, t0 + d * 0.6); g.gain.exponentialRampToValueAtTime(0.0001, t0 + d);
+    s.connect(bp).connect(g).connect(p).connect(master); s.start(t0, (t0 * 1.7) % 0.5, d + 0.05); };
+  // bass line: one note per bar, under everything but the hook's first beats
+  const BASS = [40, 40, 43, 45, 40, 38, 36, 38, 40, 43];
+  for (let bar = 0; bar * BEAT * 4 < T.end; bar++) {
+    const t0 = at(bar * BEAT * 4), o = ac.createOscillator(), g = ac.createGain(), lp = ac.createBiquadFilter();
+    o.type = 'sawtooth'; o.frequency.value = hz(BASS[bar % BASS.length]); lp.type = 'lowpass'; lp.frequency.value = 320;
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(0.11, t0 + 0.02); g.gain.exponentialRampToValueAtTime(0.0001, t0 + BEAT * 4 / FPS);
+    o.connect(lp).connect(g).connect(master); o.start(t0); o.stop(t0 + BEAT * 4 / FPS + 0.05);
+  }
+  // the beat
+  for (let b = 0; b * BEAT < T.end; b++) { const t0 = at(b * BEAT); if (b % 2 === 0) kick(t0, b === 3 ? 0.7 : 0.42); hat(t0 + BEAT / 2 / FPS, 0.045); }
+  kick(at(T.slam), 0.8); whoosh(at(24), (T.slam - 24) / FPS, 0, 0);
+  // palindrome: every comparison is a pair of knocks, then both step in
+  PAL_STEPS.forEach((s, m) => { const c = at(beatOf(T.palC, m)); wood(c, 72, -0.6); wood(c + 0.02, 79, 0.6); bell(c + 0.1, 84 + [0, 2, 4, 7, 9, 12, 14][m], 0.05, 0);
+    wood(at(beatOf(T.palC, m) + 12), 60, -0.4, 0.12); wood(at(beatOf(T.palC, m) + 12), 67, 0.4, 0.12); });
+  [72, 76, 79, 84].forEach((m, i) => bell(at(T.palRes) + i * 0.07, m, 0.07, -0.3 + i * 0.2));
+  // pair sum: too small knocks left and low, too big knocks right and high; found rings
+  SUM_STEPS.forEach((s, m) => { const c = at(beatOf(T.sumC, m));
+    if (s.dir === 'small') { wood(c, 65, -0.6, 0.24); wood(at(beatOf(T.sumC, m) + 12), 60, -0.6, 0.14); }
+    else if (s.dir === 'big') { wood(c, 82, 0.6, 0.24); wood(at(beatOf(T.sumC, m) + 12), 77, 0.6, 0.14); }
+    else [74, 78, 81, 86].forEach((mm, i) => bell(c + i * 0.06, mm, 0.08, -0.3 + i * 0.2)); });
+  // reverse: each swap is a whoosh across
+  REV_STEPS.forEach((s, m) => { const c = at(beatOf(T.revC, m)); whoosh(c, 0.4, -0.7, 0.7); wood(c + 0.4, 76 + m * 2, -0.5, 0.15); wood(c + 0.42, 76 + m * 2, 0.5, 0.15); });
+  [74, 77, 81, 86].forEach((m, i) => bell(at(T.revRes) + i * 0.07, m, 0.07, -0.3 + i * 0.2));
+  kick(at(T.outro), 0.7); kick(at(T.outro + 6), 0.5);
+  [69, 72, 76, 81].forEach((m, i) => bell(at(T.end + 8 + i * 6), m, 0.08, -0.45 + i * 0.3));
+  const buf = await ac.startRendering();
+  let peak = 0; for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let k = 0; k < d.length; k++) peak = Math.max(peak, Math.abs(d[k])); }
+  if (peak > 0.89) for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let k = 0; k < d.length; k++) d[k] *= 0.89 / peak; }
+  return buf;
+}
+
+/* ==========================================================================
+   VERTICAL CUT — shared block, identical in every piece.
+   1080x1920 for Reels, Shorts and TikTok (__motion.variants.vertical). The
+   piece's own scene code is re-used and recomposed for a phone: everything a
+   viewer must read stays inside the area no platform covers (x 60..900,
+   y 230..1400); outside it there is only dimmed texture.
+   ========================================================================== */
+const VW = 1080, VH = 1920, SAFE = { x: 60, y: 230, w: 840, h: 1170, r: 900, b: 1400 };
+const vcv = document.createElement('canvas'); vcv.width = VW; vcv.height = VH;
+const vx = vcv.getContext('2d', { willReadFrequently: true });   // CPU raster: identical pixels on every redraw
+const VL = 96, VR = 864;                                          // text column inside the safe area
+
+function vReset() {
+  vx.setTransform(1, 0, 0, 1, 0, 0); vx.globalAlpha = 1; vx.globalCompositeOperation = 'source-over';
+  vx.filter = 'none'; vx.shadowBlur = 0; vx.shadowColor = 'transparent'; vx.letterSpacing = '0px'; vx.setLineDash([]);
+  vx.textAlign = 'left'; vx.textBaseline = 'alphabetic'; vx.lineCap = 'butt'; vx.lineJoin = 'miter';
+}
+/** Canvas text on the vertical frame; `max` shrinks the size until the line fits. */
+function vText(str, x, y, { size = 40, weight = 700, color = '#FFFFFF', align = 'left', spacing = 0, alpha = 1, fam = FONT, max = 0 } = {}) {
+  if (alpha <= 0.002 || !str) return size;
+  vx.font = `${weight} ${size}px ${fam}`; vx.letterSpacing = spacing + 'px';
+  if (max) { const w = vx.measureText(str).width; if (w > max) { size = size * max / w; vx.font = `${weight} ${size}px ${fam}`; } }
+  vx.textAlign = align; vx.textBaseline = 'alphabetic';
+  const a0 = vx.globalAlpha; vx.globalAlpha = a0 * alpha; vx.fillStyle = color;
+  vx.fillText(str, x + (align === 'center' ? spacing / 2 : align === 'right' ? spacing : 0), y);   // tracking is added after the last glyph too
+  vx.globalAlpha = a0; vx.letterSpacing = '0px';
+  return size;
+}
+/** Word-wraps with the given font; returns the lines. */
+function vWrap(str, maxW, size, weight = 700, fam = FONT) {
+  vx.font = `${weight} ${size}px ${fam}`; vx.letterSpacing = '0px';
+  const words = str.split(' '), lines = []; let cur = '';
+  for (const w of words) { const t = cur ? cur + ' ' + w : w; if (vx.measureText(t).width > maxW && cur) { lines.push(cur); cur = w; } else cur = t; }
+  if (cur) lines.push(cur);
+  return lines;
+}
+/** Fade envelope with a small rise: [alpha, dy]. */
+function vEnv(v, a, b, fin = 8, fout = 8) {
+  const i = E.outCubic(prog(v, a, a + fin)), o = 1 - E.inCubic(prog(v, b - fout, b));
+  return [Math.min(i, o), (1 - i) * 22 - (1 - o) * 10];
+}
+/** Which segment of a cut list a vertical frame is in: segs = [{ at, src, len }] in frames. */
+function vSeg(segs, v) {
+  let k = 0; while (k < segs.length - 1 && v >= segs[k + 1].at) k++;
+  const s = segs[k];
+  return { k, s, local: v - s.at, src: s.src + (v - s.at) };
+}
+/** Dims everything outside the safe area to a quiet texture (brightness x 0.2), with a soft inner edge. */
+function vShade(rgb, a = 0.8, feather = 40) {
+  vx.save(); vx.setTransform(1, 0, 0, 1, 0, 0); vx.globalAlpha = 1; vx.globalCompositeOperation = 'source-over';
+  vx.fillStyle = `rgba(${rgb},${a})`;
+  vx.beginPath(); vx.rect(0, 0, VW, VH); vx.rect(SAFE.x, SAFE.y, SAFE.w, SAFE.h); vx.fill('evenodd');
+  const strip = (x0, y0, x1, y1, rx, ry, rw, rh) => {
+    const g = vx.createLinearGradient(x0, y0, x1, y1);
+    g.addColorStop(0, `rgba(${rgb},${a})`); g.addColorStop(1, `rgba(${rgb},0)`);
+    vx.fillStyle = g; vx.fillRect(rx, ry, rw, rh);
+  };
+  strip(SAFE.x, 0, SAFE.x + feather, 0, SAFE.x, SAFE.y, feather, SAFE.h);
+  strip(SAFE.r, 0, SAFE.r - feather, 0, SAFE.r - feather, SAFE.y, feather, SAFE.h);
+  strip(0, SAFE.y, 0, SAFE.y + feather, SAFE.x, SAFE.y, SAFE.w, feather);
+  strip(0, SAFE.b, 0, SAFE.b - feather, SAFE.x, SAFE.b - feather, SAFE.w, feather);
+  vx.restore();
+}
+/** Series tag at the top of the safe area, e.g. MADE IN CODE · 04. */
+function vTag(label, color, alpha = 1) {
+  vText('MADE IN CODE', VL, 292, { size: 28, weight: 800, color, spacing: 5, alpha });
+  vx.font = `800 28px ${FONT}`; vx.letterSpacing = '5px';
+  const w = vx.measureText('MADE IN CODE').width; vx.letterSpacing = '0px';
+  vText('·  ' + label, VL + w + 14, 292, { size: 28, weight: 600, color: 'rgba(255,255,255,0.72)', spacing: 3, alpha, max: VR - VL - w - 14 });
+}
+/** Big hook lines, left-aligned from y0; visible from frame 0, settles in a few frames. */
+function vHook(v, lines, y0, { size = 84, lh = 1.08, color = '#FFFFFF', accent = null, weight = 800, spacing = -1.5, alpha = 1 } = {}) {
+  const k = E.outExpo(prog(v, -6, 12));
+  lines.forEach((ln, i) => {
+    const kk = E.outExpo(prog(v, -12 + i * 2, 8 + i * 2));
+    vText(ln, VL, y0 + i * size * lh + (1 - kk) * 30, { size, weight, spacing, color: accent && i === lines.length - 1 ? accent : color, alpha: alpha * Math.max(0.25, kk), max: VR - VL });
+  });
+  return k;
+}
+/** Closing card, the last 60 frames: piece title, "drawn in code · bytepatterns.com". l = frames into the card. */
+function vEndCard(l, { title, line = '', ink = '#FFFFFF', dim = 'rgba(255,255,255,0.66)', accent = '#FFFFFF', scrim = '0,0,0', a = 0.84 }) {
+  const k = E.outCubic(prog(l, 0, 12));
+  vx.save(); vx.setTransform(1, 0, 0, 1, 0, 0);
+  vx.fillStyle = `rgba(${scrim},${a * k})`; vx.fillRect(0, 0, VW, VH);
+  vx.restore();
+  const t1 = E.outExpo(prog(l, 3, 19)), t2 = E.outExpo(prog(l, 11, 27)), t3 = E.outExpo(prog(l, 19, 35));
+  vx.fillStyle = accent; vx.globalAlpha = t1; vx.fillRect(VL, 742, 88 * t1, 7); vx.globalAlpha = 1;
+  const size = vText(title, VL, 850 + (1 - t1) * 40, { size: 92, weight: 800, color: ink, spacing: -2, alpha: t1, max: VR - VL });
+  const y2 = 850 + Math.max(size, 60) * 0.25 + 70;
+  vx.font = `600 44px ${FONT}`;
+  const lead = 'drawn in code  ·  ', lw = vx.measureText(lead).width;
+  vText(lead, VL, y2 + (1 - t2) * 24, { size: 44, weight: 600, color: dim, alpha: t2 });
+  vText('bytepatterns.com', VL + lw, y2 + (1 - t2) * 24, { size: 44, weight: 800, color: accent, alpha: t2 });
+  if (line) vText(line, VL, y2 + 72 + (1 - t3) * 18, { size: 32, weight: 500, color: dim, alpha: t3, max: VR - VL });
+}
+/** Seeks a cut. The first frame a page draws is drawn twice: the very first read of a
+ *  GPU-backed source canvas can come out a shade different from every later one. */
+let vWarm = false;
+function vSeek(draw, i, frames) {
+  const f = Math.max(0, Math.min(frames - 1, Math.floor(i)));
+  if (!vWarm) { vWarm = true; draw(f); }
+  draw(f);
+}
+/** The soundtrack of a cut: the piece's own audio() spliced to the same segments as the picture. */
+async function vAudio(segs, frames, { xf = 0.025, fadeOut = 0.6, extra = null } = {}) {
+  const src = await renderAudio();
+  const SR = 48000, dur = frames / FPS, ac = new OfflineAudioContext(2, Math.round(SR * dur), SR);
+  const out = ac.createGain(); out.connect(ac.destination);
+  out.gain.setValueAtTime(1, 0); out.gain.setValueAtTime(1, dur - fadeOut); out.gain.linearRampToValueAtTime(0, dur - 0.01);
+  segs.forEach((s, k) => {
+    const at = s.at / FPS, off = s.src / FPS, d = s.len / FPS;
+    const pre = k === 0 ? 0 : Math.min(xf, off), post = k === segs.length - 1 ? 0 : xf;
+    const b = ac.createBufferSource(), g = ac.createGain(); b.buffer = src;
+    g.gain.setValueAtTime(pre ? 0 : 1, at - pre);
+    if (pre) g.gain.linearRampToValueAtTime(1, at + pre);
+    if (post) { g.gain.setValueAtTime(1, at + d - post); g.gain.linearRampToValueAtTime(0, at + d + post); }
+    b.connect(g).connect(out); b.start(at - pre, off - pre, d + pre + post);
+  });
+  if (extra) extra(ac, out);
+  const buf = await ac.startRendering();
+  let peak = 0; for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) peak = Math.max(peak, Math.abs(d[i])); }
+  if (peak > 0.9) for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) d[i] *= 0.9 / peak; }
+  return buf;
+}
+/** A soft three-partial bell, for the closing card. */
+function vChime(ac, dest, at, freq, vol = 0.08) {
+  for (const [mul, v, dec] of [[1, 1, 1.8], [2.01, 0.35, 0.8], [3.02, 0.12, 0.4]]) {
+    const o = ac.createOscillator(), g = ac.createGain(); o.type = 'sine'; o.frequency.value = freq * mul;
+    g.gain.setValueAtTime(0.0001, at); g.gain.exponentialRampToValueAtTime(vol * v, at + 0.006); g.gain.exponentialRampToValueAtTime(0.0001, at + dec);
+    o.connect(g).connect(dest); o.start(at); o.stop(at + dec + 0.05);
+  }
+}
+
+/* VERTICAL CUT — this piece */
+// The same three scenes, laid out again for a phone (smaller pitch for the
+// fourteen letters, the sum above the row); the gaps between them are cut on
+// the beat, so the soundtrack splices cleanly.
+const VSEG = [
+  { at: 0, src: 0, len: 66 },                                // hook: TWO POINTERS
+  { at: 66, src: 102, len: 150 },                            // palindrome
+  { at: 216, src: 306, len: 126 },                           // pair sum
+  { at: 342, src: 468, len: 136 },                           // reverse
+  { at: 478, src: T.outro, len: 44 },                        // one pass
+  { at: 522, src: T.end + 2, len: 60 },                      // closing card
+];
+const VFR = 582, VEND = VFR - 60;
+const GV = { cx: 480, capX: VL, capY: 520, cap: 60, capAlign: 'left', rowY: 900, pitch: 56, size: 66, ptr: 36, caret: 13, arcW: 4,
+  sumY: 700, sum: 64, res: 40, resY: 1200, resAlign: 'left',
+  sSum: { pitch: 104, size: 72 }, sRev: { pitch: 100, size: 100 } };
+function hookV(v) {
+  const f = v, u = E.inCubic(prog(f, 24, T.slam)), o = 1 - E.inCubic(prog(f, 56, 66));
+  const size = 124;
+  vx.font = `900 ${size}px ${FONT}`; vx.letterSpacing = '-3px';
+  const wa = vx.measureText('TWO').width, wb = vx.measureText('POINTERS').width; vx.letterSpacing = '0px';
+  const shake = f >= T.slam ? Math.sin((f - T.slam) * 1.9) * 8 * Math.exp(-(f - T.slam) / 5) : 0;
+  const ax = lerp(VL, 480 - wa / 2, u) - shake, bx = lerp(VR - wb, 480 - wb / 2, u) + shake;
+  vText('TWO', ax, 720, { size, weight: 900, color: C.L, spacing: -3, alpha: o });
+  vText('POINTERS', bx, 860, { size, weight: 900, color: C.R, spacing: -3, alpha: o });
+  const k = E.outExpo(prog(f, -10, 8));
+  vText('→', ax + wa + 20, 706, { size: 64, weight: 700, color: C.L, alpha: o * k * (1 - u) });
+  vText('←', bx - 84, 846, { size: 64, weight: 700, color: C.R, alpha: o * k * (1 - u) });
+  vText('one from each end,', VL, 990, { size: 44, weight: 700, color: C.paper, alpha: o });
+  vText('walking in', VL, 1046, { size: 44, weight: 700, color: C.dim, alpha: o });
+}
+function vDraw(v) {
+  const { k: seg, src } = vSeg(VSEG, v), f = Math.min(FRAMES - 1, src);
+  vReset();
+  backdrop(vx, VW, VH);
+  if (seg === 0) hookV(v);
+  else if (seg === 1) scenePal(vx, GV, f);
+  else if (seg === 2) sceneSum(vx, GV, f);
+  else if (seg === 3) sceneRev(vx, GV, f);
+  else if (seg >= 4) outro(vx, GV, f, [['Two pointers.', 100, C.paper], ['One pass.', 100, C.R], ['O(n).', 100, C.R]], 720, 116, 'left', VL);
+  vReset();
+  vShade(C.bgRGB, 0.84);
+  vTag('TWO POINTERS', C.R);
+  if (v >= VEND) vEndCard(v - VEND, { title: 'Two Pointers', line: 'palindrome · pair sum · reverse · one pass each',
+    ink: C.paper, dim: 'rgba(242,236,226,0.72)', accent: C.R, scrim: C.bgRGB, a: 0.9 });
+  vReset();
+}
+
+window.__motion = {
+  title: 'Two Pointers',
+  description: `Kinetic type where the words left and right are the pointers: they check that ${PAL.length} letters read the same both ways, find the pair that sums to ${TARGET} in ${SUM_STEPS.length} steps and reverse ${WORD} in ${REV_STEPS.length} swaps.`,
+  fps: FPS, width: W, height: H, frames: FRAMES,
+  poster: 372,
+  gifStart: 10,
+  seek(i) { draw(Math.max(0, Math.min(FRAMES - 1, Math.floor(i)))); },
+  audio: renderAudio,
+  variants: {
+    vertical: {
+      width: VW, height: VH, frames: VFR, canvas: vcv,
+      poster: 250, gifStart: 7,
+      seek(i) { vSeek(vDraw, i, VFR); },
+      audio: () => vAudio(VSEG, VFR),
+    },
+  },
+};
+
+/* ==========================================================================
+   PLAYER — identical in every piece; keep as is.
+   Autoplays and loops, starts sound on the first click, ?frame=N pauses on a
+   frame, ?variant=vertical plays the vertical cut (if the piece has one).
+   When the renderer sets window.__MOTION_RENDER__ it stays out of the way.
+   ========================================================================== */
+(function player() {
+  const btn = document.getElementById('sound'), q = new URLSearchParams(location.search);
+  let M = window.__motion;
+  const V = !window.__MOTION_RENDER__ && M.variants && M.variants[q.get('variant')];
+  if (V) {                                                // show the variant's own canvas instead
+    M = Object.assign({}, M, V);
+    V.canvas.style.cssText = `width:min(100vw,calc(100vh*${V.width}/${V.height}));height:auto;aspect-ratio:${V.width}/${V.height}`;
+    document.querySelector('canvas').replaceWith(V.canvas);
+  }
+  const dur = M.frames / M.fps;
+  if (window.__MOTION_RENDER__) { btn.hidden = true; M.seek(0); return; }
+  if (q.has('frame')) { btn.hidden = true; M.seek(+q.get('frame') || 0); return; }
+  let t0 = performance.now(), ac = null, src = null, buf = null, paused = false, pausedAt = 0;
+  const clock = () => ac && src ? (ac.currentTime - t0) : (performance.now() - t0) / 1000;
+  function loop() {
+    if (!paused) M.seek(Math.floor(((clock() % dur) + dur) % dur * M.fps));
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+  btn.addEventListener('click', async () => {
+    if (src) { src.stop(); src = null; btn.textContent = 'Click for sound'; t0 = performance.now(); return; }
+    btn.textContent = 'Loading sound…';
+    ac = ac || new AudioContext({ sampleRate: 48000 });
+    buf = buf || await M.audio();
+    await ac.resume();
+    src = ac.createBufferSource(); src.buffer = buf; src.loop = true; src.connect(ac.destination);
+    t0 = ac.currentTime + 0.05; src.start(t0);        // picture restarts from frame 0 in sync with the sound
+    btn.textContent = 'Sound on — click to mute';
+  });
+  addEventListener('keydown', e => {
+    if (e.code !== 'Space') return;
+    e.preventDefault(); paused = !paused;
+    if (ac) paused ? ac.suspend() : ac.resume();
+    if (!ac) { if (paused) pausedAt = performance.now(); else t0 += performance.now() - pausedAt; }
+  });
+})();
+</script>
+</body>
+</html>
