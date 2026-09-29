@@ -1,0 +1,756 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="author" content="teambytepatterns">
+<meta name="description" content="A simulated CDN on a dot-matrix world map: requests land on seven edge caches, misses cross the ocean to one origin, cached copies drain their TTL, and every counter comes from the simulation.">
+<title>CDN Edge Cache: Hit, Miss, TTL — motion-lab</title>
+<style>
+  /* Player chrome. The piece itself lives entirely in the canvas. */
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  body { display: grid; place-items: center; font: 500 15px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #fff; }
+  canvas { display: block; width: min(100vw, calc(100vh * 16 / 9)); height: auto; aspect-ratio: 16 / 9; }
+  #sound { position: fixed; left: 16px; bottom: 16px; padding: 8px 14px; border: 1px solid rgba(255,255,255,.35); border-radius: 999px;
+           background: rgba(0,0,0,.55); color: #fff; font: inherit; cursor: pointer; }
+  #sound[hidden] { display: none; }
+</style>
+</head>
+<body>
+<canvas id="stage" width="1920" height="1080" aria-label="A dotted world map with seven glowing edge servers and one origin in Virginia; small dots fly from users to the nearest edge, green ones bounce straight back, orange ones arc across the map to the origin and back, while little cache slots under each edge fill up and slowly drain"></canvas>
+<button id="sound" type="button">Click for sound</button>
+<script>
+'use strict';
+/* ==========================================================================
+   PIECE — CDN Edge Cache: Hit, Miss, TTL.
+   A content delivery network keeps copies of files on edge servers near
+   the users. A request goes to its nearest edge. If the edge holds a copy
+   that has not expired, it answers at once: a HIT. If not, it is a MISS:
+   the edge fetches the file from the ORIGIN, keeps the copy for its TTL
+   (time to live), and answers. When the TTL runs out, the next request for
+   that file at that edge is a miss again.
+   The simulation runs ONCE at load: requests arrive as a seeded Poisson
+   process (rate rising over time) at seven edges, for four files of
+   different popularity and TTL; hits and misses are decided in time order,
+   and a copy is stored only when the origin's answer gets back to the
+   edge, so requests that arrive before that are misses too. Latency is
+   MODELLED from distance, not measured: 1 ms of round trip per 100 km of
+   great-circle distance, plus 2 ms at the edge and 20 ms at the origin.
+   Every number on screen is read from that run; seek(i) only looks up
+   where each request is at frame i.
+   ========================================================================== */
+const W = 1920, H = 1080, FPS = 30;
+const cv = document.getElementById('stage');
+const ctx = cv.getContext('2d', { willReadFrequently: true });   // CPU raster: identical pixels on every redraw
+const FONT = 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
+const MONO = 'ui-monospace, "Cascadia Code", Consolas, Menlo, monospace';
+
+// ---- helpers -------------------------------------------------------------
+function mulberry32(a) { return function () { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a);
+  t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const lerp = (a, b, t) => a + (b - a) * t;
+const prog = (f, a, b) => clamp((f - a) / (b - a));
+const smooth = t => t * t * (3 - 2 * t);
+const E = {
+  inCubic: t => t * t * t,
+  outCubic: t => 1 - Math.pow(1 - t, 3),
+  inOutCubic: t => t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2,
+  outExpo: t => t === 1 ? 1 : 1 - Math.pow(2, -10 * t),
+  inExpo: t => t === 0 ? 0 : Math.pow(2, 10 * t - 10),
+  inOutExpo: t => t === 0 ? 0 : t === 1 ? 1 : t < .5 ? Math.pow(2, 20 * t - 10) / 2 : (2 - Math.pow(2, -20 * t + 10)) / 2,
+  outBack: t => 1 + 2.70158 * Math.pow(t - 1, 3) + 1.70158 * Math.pow(t - 1, 2),
+};
+/** Canvas text; `max` shrinks the size until the line fits. Returns the width drawn. */
+function text(g, str, x, y, { size = 40, weight = 600, color = '#fff', alpha = 1, spacing = 0, align = 'left', fam = FONT, base = 'alphabetic', max = 0 } = {}) {
+  if (alpha <= 0.002 || !str) return 0;
+  g.font = `${weight} ${size}px ${fam}`; g.letterSpacing = spacing + 'px';
+  if (max) { const w0 = g.measureText(str).width; if (w0 > max) { size *= max / w0; g.font = `${weight} ${size}px ${fam}`; } }
+  g.textAlign = align; g.textBaseline = base;
+  const a0 = g.globalAlpha; g.globalAlpha = a0 * alpha; g.fillStyle = color;
+  g.fillText(str, x, y);
+  const w = g.measureText(str).width;
+  g.globalAlpha = a0; g.letterSpacing = '0px';
+  return w;
+}
+const measure = (g, str, size, weight = 800, fam = FONT, spacing = 0) => { g.font = `${weight} ${size}px ${fam}`; g.letterSpacing = spacing + 'px'; const w = g.measureText(str).width; g.letterSpacing = '0px'; return w; };
+const env = (f, a, b, fin = 12, fout = 10) => {
+  const i = E.outCubic(prog(f, a, a + fin)), o = 1 - E.inCubic(prog(f, b - fout, b));
+  return [Math.min(i, o), (1 - i) * 24 - (1 - o) * 10];
+};
+
+// ---- palette -------------------------------------------------------------
+const C = {
+  bg: '#0A0F16', bgRGB: '10,15,22', paper: '#EEF3F7', dim: 'rgba(238,243,247,0.62)', faint: 'rgba(238,243,247,0.14)',
+  land: '#223142', landHi: '#2C3F54', hit: '#4BE38A', hitRGB: '75,227,138', miss: '#FF9F43', missRGB: '255,159,67', origin: '#FF5E7E', user: '#B9C6D3',
+};
+
+// ---- the world, as crude lon/lat outlines -------------------------------------------------------
+const LAND = [
+  // North America
+  [-168,66,-162,70,-156,71.3,-140,69.6,-128,70,-115,68.5,-100,69,-94,71.5,-86,69.5,-82,66.5,-86,64,-94,61,-93,58.8,-87,56,-82,53,-79,54.5,-78,58.5,-76,61,-70,59,-64,60,-61.5,56,-56,52.5,-59,48,-66,45,-70,42,-73.5,40.5,-76,38,-76,35,-81,31,-80,26.5,-81.5,25,-83,29,-89,30.2,-94,29.5,-97.3,26,-97.5,21.5,-95,18.5,-91,19,-90.5,21,-87,21.5,-88.5,16,-84,15.5,-83.5,11,-79.5,9.3,-77.5,8.5,-78,7.3,-80.5,7.3,-83,8.3,-86,11,-87.8,13.3,-92,14.5,-95,16,-100,17,-105.5,20,-105.7,23,-109,26,-112,29.5,-110,23.5,-112,24.8,-114.5,29,-117,32.5,-120.5,34.5,-122.5,37.5,-124,40.5,-124,46,-123.5,48.5,-127.5,50.5,-131,55,-136,58.5,-140,60,-146,61,-152,59.5,-157,57,-162,55.5,-158,58.5,-162,60,-165.5,61.5,-164.5,63.5,-161,64.5,-165,65.5],
+  [-80,63.5,-73,62,-65,62.5,-62,66.5,-68,70,-73,71.8,-80,73.5,-90,72,-86,70,-80,69.5,-76,67.5],   // Baffin Island
+  [-118,71.5,-110,73,-102,73,-100,70,-106,69,-115,69],                                              // Victoria Island
+  [-92,76,-80,76.5,-75,79,-62,82,-80,83,-95,81,-98,78],                                             // Ellesmere
+  [-55,60,-44,60,-40,65,-22,70,-20,76,-18,81,-35,83.5,-60,82,-72,78,-60,75.5,-56,71,-52,65.5],       // Greenland
+  [-24,64,-22,66.3,-15,66.5,-13.5,65,-18,63.4],                                                     // Iceland
+  // South America
+  [-80,9,-75,11,-72,12,-63,11,-60,8,-52,5,-50,0,-45,-1.5,-38,-4,-35,-7,-35.5,-10,-39,-15,-39.5,-20,-42,-23,-48,-26,-49,-29,-53,-34,-57,-35,-58,-38.5,-62,-39,-65,-42,-66,-47,-69,-51,-68.5,-55,-72,-54,-75,-50,-74,-44,-73.5,-37,-71.5,-30,-70.5,-24,-70.3,-18,-76,-14,-78.5,-10,-81,-5,-80,-1,-78.5,2,-77.3,6.5],
+  // Eurasia
+  [-9,37,-9,43,-2,43.5,-1.5,46,-4.5,48,-1.5,49.5,2,51,4.5,52,8,53.5,8.5,57.5,10.5,57.7,11,59,6,58,5,62,8,63.5,13,66,17,69,21,70.5,28,71,33,69.5,41,67,44,68.5,53,68.5,60,69.5,68,69,73,72.5,80,73.5,87,75,100,77.5,113,74,128,72.5,140,72,150,71,160,70,170,70,180,68.5,180,65,172,62,163,60,160,55,156,51,155,56,150,59,142,59,137,54,141,52,140,48,135,43,130,42.5,129,40,127.5,39.5,129.3,35.2,126.3,34.5,126.3,37.5,125,39.5,121.5,40.8,121.5,37.5,119,35,121,32,122,30,120,26,116,23,110,21.2,108,21.5,106,19,108.8,15.5,109.2,12,106,9,103,10.5,100,13.5,99.2,9.5,103,5.5,104.2,1.5,101,3,98.3,8,98,16,94.3,18,92,21.5,88,21.5,86.5,20,80.3,15.5,80,10.3,77,8,73,17,72.5,21,69,22.5,67,24.8,61,25.2,57.3,25.7,54,26.7,51.5,27.9,49,30,48,28.5,50.5,25,51.5,24,54.5,24.3,56.3,26,58.5,23.5,59.8,22.4,57,19,55,17,52,16,45,13,43.2,13.2,42.5,16,39.2,21.5,35.2,28,34.2,31,35,33,36,36,32,36.5,28,36.7,26.3,38.5,26.2,40,29,41,26,41,23,40,22.5,37,21,38.5,19.5,42,15,45,13.5,45.5,12.3,44.3,16,41.5,18.5,40.2,16.6,38.9,15.7,38,12.5,41.5,10,44,7,43.7,3,43.3,3.2,42,0,39.5,-0.5,38,-2,36.7,-5.5,36],
+  [-5.5,50,1.5,51,1.7,52.7,0,53.5,-1.5,55,-2,57,-1.8,57.6,-3,58.6,-5,58.6,-6,57,-5,55,-3,54.6,-3,53.3,-4.5,52.8,-5,51.7,-3,51.4],   // Great Britain
+  [-6,52,-6,54.5,-8,55.2,-10,54,-10,51.6],                                                           // Ireland
+  [130.9,34,132.5,35.5,136,35.8,137,37.2,140,40.5,140,41.4,141.5,41.4,142,39,141,36,140,35,138.5,34.6,136.8,34.3,135,33.6,133,34,131,33.3,130,31.3,131.3,31.3,132,33],   // Japan
+  [140,41.5,141.8,45.4,145.5,44,143.3,42,141.2,42.4],                                                // Hokkaido
+  [142,46,143.5,49,142.8,54.3,142,51.5],                                                             // Sakhalin
+  [120.1,23,121.9,25,121.4,22.5,120.8,21.9],                                                         // Taiwan
+  [79.8,9.8,81.9,7.5,81.2,6.1,80,6.2],                                                               // Sri Lanka
+  [120,18.5,122.3,18.5,122.2,16,124,13,121,13.8,120.5,15.5],                                         // Luzon
+  [122,7,126.2,9.5,126.5,6.5,125,5.8,122,6.9],                                                       // Mindanao
+  [95.3,5.6,97.5,5.2,100.5,2,104.5,-2,106,-3.2,105.8,-5.9,102.3,-5.3,100,-2.5,98.6,0.5,96.5,3.5],    // Sumatra
+  [105.2,-6.8,106,-5.9,111,-6.5,114.5,-7.7,114.5,-8.7,110,-8.1,106.5,-7.4],                          // Java
+  [109,1.5,109.7,-1,110.5,-3,114.5,-4,116.5,-3.5,117.5,0,119,1,117.5,4,119,5.3,117,7,115.5,5,113,3.2,111,1.6],   // Borneo
+  [119.5,-5.5,120.5,-1,121.5,1,124.5,1.3,121,-0.5,123,-5.5,121.8,-4.8,120.8,-2.7],                   // Sulawesi
+  [131,-1.3,134,-0.8,138,-1.6,141,-2.6,145,-4.3,148,-8,150.5,-10.3,147,-10,144,-7.7,141,-9.1,139,-8.1,138,-6.3,135,-4.3,132.5,-4,131,-2.4],   // New Guinea
+  // Africa
+  [-17,21,-17,15,-16.5,12,-13,8,-8,4.5,-2,5,4,6.3,9,4,9.5,1,12,-5,13.5,-11,12,-17,15,-27,18,-34.5,20,-34.8,26,-34,31,-29,33,-26,35.5,-24,35,-20,40,-16,40.5,-11,39,-6,40,-3,42,-1,46,2,49,6,51.2,11.5,43.5,11.5,43.2,12.7,39,16,37.2,21,35.5,24,33.5,28,32.5,31,30,31.3,25,31.8,20,32,19.5,30.5,15,32.3,10.5,33.5,11,37,8,37,3,36.8,-2,35.2,-6,35.8,-9.5,32,-10,29,-13,27.5],
+  [43.5,-12,49.5,-12,50.5,-15.5,47,-25,44,-24.8,43.5,-21,44.5,-16.5],                                // Madagascar
+  // Oceania
+  [113,-22,114,-26,115,-34,118,-35,123,-34,129,-31.5,131,-31.5,135,-34.5,138,-35.5,140,-38,145,-38.5,147.5,-38,150,-37.5,153,-31,153.5,-25,151,-23,146,-19,145,-15,142.5,-10.7,141.5,-13,141.5,-17,140,-17.5,136,-15,137,-12,132,-11.3,130,-12.5,129,-15,125,-14.5,122,-17.5,119,-20,116,-20.7],
+  [145,-40.8,148,-40.8,148,-43.3,146,-43.5],                                                         // Tasmania
+  [173,-35,175.5,-37,178.5,-37.7,177,-39.5,175,-41.5,174.6,-39.5,174,-38],                           // New Zealand, north
+  [172.7,-40.5,174.3,-41.7,173,-43.8,171,-44.5,169,-46.6,166.5,-46,168,-44.2,171,-42],               // New Zealand, south
+];
+const WATER = [
+  [-95,60,-88,56.5,-81,54.5,-78,58,-82,62,-90,64,-95,62.5],                                          // Hudson Bay
+  [28,41.3,28,44,30,45.5,33,45,36,45.3,38,47,40,46,41.5,42,38,41,33,42,29,41.2],                     // Black Sea
+  [47,45,50,46.5,53,46,53,42,54,37.5,51,36.8,49,38,49.5,40.5,47,43],                                 // Caspian Sea
+  [10,54,14,54,21,55,21,57,24,57,23,59.5,30,60,22,60.5,21,62,25,65.5,22,66,18,63,17,61,19,59.5,16,57,14,56,11,56],   // Baltic
+  [32.3,30,33.8,28,35,28.5,36,27,39,22,42.5,15,43.5,12.5,42,13,39,16.5,36.5,21,34.5,25.5,32.8,28.5], // Red Sea
+];
+function inPoly(P, x, y) {
+  let c = false;
+  for (let i = 0, j = P.length - 2; i < P.length; j = i, i += 2) {
+    const xi = P[i], yi = P[i + 1], xj = P[j], yj = P[j + 1];
+    if ((yi > y) !== (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi) c = !c;
+  }
+  return c;
+}
+const isLand = (lon, lat) => LAND.some(P => inPoly(P, lon, lat)) && !WATER.some(P => inPoly(P, lon, lat));
+const RAD = Math.PI / 180;
+function km(a, b) {                                          // great-circle distance, haversine, R = 6371 km
+  const dLat = (b.lat - a.lat) * RAD, dLon = (b.lon - a.lon) * RAD;
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(a.lat * RAD) * Math.cos(b.lat * RAD) * Math.sin(dLon / 2) ** 2;
+  return 2 * 6371 * Math.asin(Math.min(1, Math.sqrt(h)));
+}
+
+// ---- the network ----------------------------------------------------------------------------
+const ORIGIN = { name: 'origin', lon: -77.5, lat: 39.0 };
+const EDGES = [
+  { name: 'San Jose', lon: -121.9, lat: 37.3, w: 0.19 },
+  { name: 'São Paulo', lon: -46.6, lat: -23.5, w: 0.11 },
+  { name: 'London', lon: -0.1, lat: 51.5, w: 0.2 },
+  { name: 'Mumbai', lon: 72.9, lat: 19.1, w: 0.13 },
+  { name: 'Singapore', lon: 103.8, lat: 1.35, w: 0.11 },
+  { name: 'Tokyo', lon: 139.7, lat: 35.7, w: 0.16 },
+  { name: 'Sydney', lon: 151.2, lat: -33.9, w: 0.10 },
+];
+const OBJS = [
+  { path: '/index.html', ttl: 4, p: 0.4, col: '#7AB8FF' },
+  { path: '/app.js', ttl: 8, p: 0.25, col: '#FFD166' },
+  { path: '/hero.jpg', ttl: 8, p: 0.2, col: '#5EE0C0' },
+  { path: '/logo.svg', ttl: 60, p: 0.15, col: '#C58CFF' },
+];
+const E_DIST = EDGES.map(e => km(e, ORIGIN));
+
+// ---- the simulation, run once per clock ----------------------------------------------------------
+function simulate(o) {
+  const rnd = mulberry32(o.seed), reqs = [];
+  let t = o.t0;
+  for (;;) {
+    const x = (t - o.t0) / (o.t1 - o.t0), rate = lerp(o.r0, o.r1, smooth(clamp(x * 1.5)));
+    t += -Math.log(1 - rnd()) * FPS / rate;
+    if (t > o.t1) break;
+    let r = rnd(), e = 0; while (e < EDGES.length - 1 && (r -= EDGES[e].w) > 0) e++;
+    let r2 = rnd(), ob = 0; while (ob < OBJS.length - 1 && (r2 -= OBJS[ob].p) > 0) ob++;
+    let u = null;
+    for (let k = 0; k < 12 && !u; k++) {                     // users live on land, a few hundred km from their edge
+      const a = rnd() * 2 * Math.PI, d = 2.5 + rnd() * 6;
+      const lon = EDGES[e].lon + Math.cos(a) * d * 1.3, lat = EDGES[e].lat + Math.sin(a) * d * 0.8;
+      if (isLand(lon, lat)) u = { lon, lat };
+    }
+    if (!u) u = { lon: EDGES[e].lon + 1.5, lat: EDGES[e].lat - 1 };
+    reqs.push({ t0: Math.round(t), e, ob, u });
+  }
+  const cache = EDGES.map(() => OBJS.map(() => -1));        // expiry frame of the copy, -1 = never stored
+  const iv = EDGES.map(() => OBJS.map(() => []));          // [stored, expires] intervals, for the slots
+  let fills = [];
+  const apply = (upTo) => {
+    fills.sort((a, b) => a.t - b.t);
+    while (fills.length && fills[0].t <= upTo) { const F = fills.shift(); const ex = F.t + OBJS[F.ob].ttl * FPS; cache[F.e][F.ob] = ex; iv[F.e][F.ob].push([F.t, ex]); }
+  };
+  for (const q of reqs) {
+    q.tE = q.t0 + o.u2e;
+    apply(q.tE);
+    const ex = cache[q.e][q.ob];
+    q.hit = ex > q.tE; q.expired = !q.hit && ex >= 0;
+    const dU = km(q.u, EDGES[q.e]);
+    q.ms = dU / 100 + 2 + (q.hit ? 0 : E_DIST[q.e] / 100 + 20);
+    if (q.hit) q.tDone = q.tE + o.u2e;
+    else {
+      const fl = Math.round(o.fly0 + E_DIST[q.e] * o.flyK);
+      q.tO = q.tE + fl; q.tB = q.tO + 3; q.tF = q.tB + fl; q.tDone = q.tF + o.u2e;
+      fills.push({ t: q.tF, e: q.e, ob: q.ob });
+    }
+  }
+  apply(1e9);
+  // cumulative counters per frame (decided at tE)
+  const n = o.frames, cum = { req: new Int32Array(n), hit: new Int32Array(n), hitMs: new Float64Array(n), missMs: new Float64Array(n), exp: new Int32Array(n) };
+  const eH = EDGES.map(() => new Int32Array(n)), eN = EDGES.map(() => new Int32Array(n));
+  for (const q of reqs) if (q.tE < n) {
+    cum.req[q.tE]++; eN[q.e][q.tE]++;
+    if (q.hit) { cum.hit[q.tE]++; cum.hitMs[q.tE] += q.ms; eH[q.e][q.tE]++; } else { cum.missMs[q.tE] += q.ms; if (q.expired) cum.exp[q.tE]++; }
+  }
+  for (let f = 1; f < n; f++) {
+    for (const k of Object.keys(cum)) cum[k][f] += cum[k][f - 1];
+    for (let e = 0; e < EDGES.length; e++) { eH[e][f] += eH[e][f - 1]; eN[e][f] += eN[e][f - 1]; }
+  }
+  // hit ratio over a sliding 2 s window, sampled every 6 frames, for the sparkline
+  const spark = [];
+  for (let f = o.t0 + 30; f <= o.t1 + o.u2e; f += 6) {
+    const a = Math.max(0, f - 60), nn = cum.req[f] - cum.req[a], hh = cum.hit[f] - cum.hit[a];
+    spark.push([f, nn ? hh / nn : 0]);
+  }
+  const N = reqs.length, H = reqs.filter(q => q.hit).length;
+  const avg = (arr) => arr.length ? arr.reduce((s, q) => s + q.ms, 0) / arr.length : 0;
+  const tot = { N, H, M: N - H, EXP: reqs.filter(q => q.expired).length, hitMs: avg(reqs.filter(q => q.hit)), missMs: avg(reqs.filter(q => !q.hit)) };
+  const last = Math.max(...reqs.map(q => q.tDone));
+  return { o, reqs, iv, cum, eH, eN, spark, tot, last };
+}
+
+// ---- timeline (frames) ---------------------------------------------------------------------
+function buildTL(o) {
+  const S = simulate(o);
+  const TL = { o, S, start: o.start };
+  TL.stats = o.t1 + o.tail;
+  TL.end = TL.stats + o.statLen;
+  TL.caps = [
+    [o.start - 6, o.c1, 'Cold cache: every edge|has to ask the origin.'],
+    [o.c1 - 2, o.c2, 'Warm cache: the edge|answers on its own.'],
+    [o.c2 - 2, TL.stats + 6, 'Every copy has a TTL. When it runs out,|the next request is a miss again.'],
+  ];
+  return TL;
+}
+const TLL = buildTL({ seed: 0x37C0, start: 54, t0: 56, t1: 660, r0: 5, r1: 12, u2e: 9, fly0: 10, flyK: 0.0016, c1: 250, c2: 470, frames: 900, statLen: 96, tail: 40 });
+const FRAMES = TLL.end + 72;
+
+// ---- drawing -------------------------------------------------------------------------------------
+const proj = (G, lon, lat) => [G.mx + (lon - G.lon0) * G.k, G.my + (G.lat1 - lat) * G.k];
+function mapLayer(G) {                                       // the dotted continents, drawn once per layout (CPU raster)
+  const c = document.createElement('canvas'); c.width = G.W; c.height = G.H;
+  const g = c.getContext('2d', { willReadFrequently: true });
+  for (let lat = G.lat1; lat >= G.lat0; lat -= G.step) for (let lon = G.lon0; lon <= G.lon1; lon += G.step) {
+    if (!isLand(lon, lat)) continue;
+    const [x, y] = proj(G, lon, lat);
+    g.fillStyle = C.land; g.beginPath(); g.arc(x, y, G.dot, 0, Math.PI * 2); g.fill();
+  }
+  return c;
+}
+function arcPt(G, e, u) {                                     // a bowed curve from edge e (u = 0) to the origin (u = 1)
+  const [x0, y0] = proj(G, EDGES[e].lon, EDGES[e].lat), [x3, y3] = proj(G, ORIGIN.lon, ORIGIN.lat);
+  const d = Math.hypot(x3 - x0, y3 - y0), bow = Math.min(G.bowMax, d * 0.3);
+  const cx = (x0 + x3) / 2, cy = (y0 + y3) / 2 - bow;
+  const m = 1 - u;
+  return [m * m * x0 + 2 * m * u * cx + u * u * x3, m * m * y0 + 2 * m * u * cy + u * u * y3];
+}
+function dot(g, x, y, r, col, a) { if (a <= 0.01) return; const ga = g.globalAlpha; g.globalAlpha = ga * a; g.fillStyle = col; g.beginPath(); g.arc(x, y, r, 0, Math.PI * 2); g.fill(); g.globalAlpha = ga; }
+function flights(g, G, f) {
+  const S = G.TL.S;
+  for (const q of S.reqs) {
+    if (f < q.t0 - 2 || f > q.tDone + 12) continue;
+    const [ux, uy] = proj(G, q.u.lon, q.u.lat), [ex, ey] = proj(G, EDGES[q.e].lon, EDGES[q.e].lat);
+    const fade = Math.min(E.outCubic(prog(f, q.t0 - 2, q.t0 + 3)), 1 - E.inCubic(prog(f, q.tDone, q.tDone + 12)));
+    dot(g, ux, uy, G.ur, C.user, 0.7 * fade);
+    const col = q.hit ? C.hit : C.miss;
+    if (f < q.tE) {                                          // user -> edge
+      const u = E.inOutCubic(prog(f, q.t0, q.tE));
+      dot(g, lerp(ux, ex, u), lerp(uy, ey, u), G.fr, C.paper, 0.95);
+    } else if (q.hit || f >= q.tF) {                         // edge -> user
+      const u = E.inOutCubic(prog(f, q.hit ? q.tE : q.tF, q.tDone));
+      if (u < 1) dot(g, lerp(ex, ux, u), lerp(ey, uy, u), G.fr, col, 1);
+    } else {                                                 // edge -> origin -> edge, along the arc
+      const aA = Math.min(E.outCubic(prog(f, q.tE, q.tE + 6)), 1 - E.inCubic(prog(f, q.tF - 4, q.tF + 6)));
+      g.save(); g.globalAlpha *= 0.32 * aA; g.strokeStyle = C.miss; g.lineWidth = G.alw; g.beginPath();
+      for (let k = 0; k <= 32; k++) { const [x, y] = arcPt(G, q.e, k / 32); k ? g.lineTo(x, y) : g.moveTo(x, y); }
+      g.stroke(); g.restore();
+      const out = f < q.tB;
+      for (let k = 4; k >= 0; k--) {                         // a short trail: the same curve a few frames earlier
+        const uu = out ? E.inOutCubic(prog(f - k * 1.5, q.tE, q.tO)) : 1 - E.inOutCubic(prog(f - k * 1.5, q.tB, q.tF));
+        const [x, y] = arcPt(G, q.e, uu);
+        dot(g, x, y, G.fr * (1 - k * 0.14), out ? C.miss : OBJS[q.ob].col, k ? 0.5 - k * 0.09 : 1);
+      }
+    }
+    // a ring at the edge when the request is decided
+    const rk = prog(f, q.tE, q.tE + 14);
+    if (rk > 0 && rk < 1) {
+      g.save(); g.globalAlpha *= (1 - rk) * 0.9; g.strokeStyle = col; g.lineWidth = 2.5;
+      g.beginPath(); g.arc(ex, ey, G.nr + 4 + rk * G.ring, 0, Math.PI * 2); g.stroke(); g.restore();
+    }
+  }
+}
+function nodes(g, G, f) {
+  const S = G.TL.S, ga0 = g.globalAlpha;
+  // the origin
+  const [ox, oy] = proj(G, ORIGIN.lon, ORIGIN.lat);
+  let busy = 0; for (const q of S.reqs) if (!q.hit && f >= q.tO - 2 && f < q.tB + 6) busy = 1;
+  g.save(); g.fillStyle = C.origin; g.globalAlpha *= 0.18 + 0.2 * busy; g.beginPath(); g.arc(ox, oy, G.nr * 2.1, 0, Math.PI * 2); g.fill(); g.restore();
+  g.fillStyle = C.origin; g.fillRect(ox - G.nr * 0.9, oy - G.nr * 0.9, G.nr * 1.8, G.nr * 1.8);
+  text(g, 'origin', ox + G.oLab[0], oy + G.oLab[1], { size: G.lab, weight: 800, color: C.origin, align: G.oLab[2] });
+  // the edges
+  EDGES.forEach((E0, e) => {
+    const [x, y] = proj(G, E0.lon, E0.lat);
+    const n = S.eN[e][Math.min(f, S.eN[e].length - 1)], h = S.eH[e][Math.min(f, S.eN[e].length - 1)];
+    g.fillStyle = C.bg; g.beginPath(); g.arc(x, y, G.nr + 5, 0, Math.PI * 2); g.fill();
+    g.strokeStyle = 'rgba(238,243,247,0.2)'; g.lineWidth = 4; g.beginPath(); g.arc(x, y, G.nr + 1, 0, Math.PI * 2); g.stroke();
+    if (n) {                                                 // the ring: this edge's hit ratio so far
+      const r = h / n;
+      g.lineWidth = 4; g.strokeStyle = C.hit; g.beginPath(); g.arc(x, y, G.nr + 1, -Math.PI / 2, -Math.PI / 2 + r * Math.PI * 2); g.stroke();
+      if (r < 1) { g.strokeStyle = C.miss; g.beginPath(); g.arc(x, y, G.nr + 1, -Math.PI / 2 + r * Math.PI * 2, Math.PI * 1.5); g.stroke(); }
+    }
+    g.fillStyle = C.paper; g.beginPath(); g.arc(x, y, G.nr * 0.42, 0, Math.PI * 2); g.fill();
+    const [lx, ly, la] = G.labs[e];
+    text(g, E0.name, x + lx, y + ly, { size: G.lab, weight: 700, color: C.paper, align: la });
+    // the cache shelf: one slot per file, filled by the time left on its copy
+    const [sx, sy] = G.shelf[e];
+    const sw = G.slot, gap = G.slotGap, x0 = x + sx - (OBJS.length * sw + (OBJS.length - 1) * gap) / 2;
+    OBJS.forEach((O, k) => {
+      const X = x0 + k * (sw + gap), Y = y + sy;
+      let left = 0, flash = 0;
+      for (const [a, b] of S.iv[e][k]) if (f >= a && f < b) { left = Math.max(left, (b - f) / (b - a)); flash = Math.max(flash, 1 - prog(f, a, a + 10)); }
+      g.strokeStyle = O.col; g.globalAlpha = ga0 * 0.45; g.lineWidth = 2; g.strokeRect(X + 1, Y + 1, sw - 2, sw - 2); g.globalAlpha = ga0;
+      if (left > 0) { const hh = (sw - 4) * Math.min(1, left * 1.0); g.fillStyle = O.col; g.fillRect(X + 2, Y + sw - 2 - hh, sw - 4, hh); }
+      if (flash > 0.02) { g.save(); g.globalAlpha = ga0 * flash; g.strokeStyle = C.paper; g.lineWidth = 2; g.strokeRect(X - 3, Y - 3, sw + 6, sw + 6); g.restore(); }
+    });
+  });
+}
+function panel(g, G, f) {
+  const TL = G.TL, S = TL.S, [a] = env(f, TL.o.start - 4, TL.stats + 10, 12, 10);
+  if (a <= 0) return;
+  const i = Math.min(f, S.cum.req.length - 1), n = S.cum.req[i], h = S.cum.hit[i], m = n - h;
+  const pct = n ? Math.round(100 * h / n) : 0;
+  const P = G.P;
+  text(g, 'hit ratio so far', P.x, P.y, { size: P.l, weight: 700, color: C.dim, alpha: a });
+  text(g, n ? `${pct}%` : '—', P.x, P.y + P.big * 0.92, { size: P.big, weight: 900, color: C.hit, fam: FONT, spacing: -2, alpha: a });
+  const hm = h ? S.cum.hitMs[i] / h : 0, mm = m ? S.cum.missMs[i] / m : 0;
+  const rows = [[P.ry, 'requests', String(n), C.paper], [P.ry + P.rh, 'edge hits', String(h), C.hit], [P.ry + 2 * P.rh, 'origin fetches', String(m), C.miss],
+    [P.ly, 'hit latency', h ? `${Math.round(hm)} ms` : '—', C.hit], [P.ly + P.rh, 'miss latency', m ? `${Math.round(mm)} ms` : '—', C.miss]];
+  for (const [y, lab, v, col] of rows) {
+    text(g, lab, P.x, y, { size: P.l, weight: 650, color: C.dim, alpha: a });
+    text(g, v, P.x2, y, { size: P.v, weight: 900, color: col, fam: MONO, align: 'right', alpha: a });
+  }
+  text(g, 'latency modelled from distance', P.x, P.ly + 2 * P.rh - 4, { size: 28, weight: 500, color: C.dim, alpha: a * 0.8, max: P.x2 - P.x });
+  if (!P.sy) return;
+  // the sparkline: hit ratio over the last 2 s
+  const sx = P.x, sy = P.sy, sw = P.x2 - P.x, sh = P.sh;
+  g.save(); g.globalAlpha *= a;
+  g.strokeStyle = C.faint; g.lineWidth = 2; g.beginPath(); g.moveTo(sx, sy + sh); g.lineTo(sx + sw, sy + sh); g.moveTo(sx, sy); g.lineTo(sx + sw, sy); g.stroke();
+  const t0 = S.spark.length ? S.spark[0][0] : 0, t1 = S.spark.length ? S.spark[S.spark.length - 1][0] : 1;
+  g.strokeStyle = C.hit; g.lineWidth = 3; g.lineJoin = 'round'; g.beginPath();
+  let started = false;
+  for (const [ff, r] of S.spark) { if (ff > f) break; const X = sx + (ff - t0) / (t1 - t0) * sw, Y = sy + sh - r * sh; started ? g.lineTo(X, Y) : g.moveTo(X, Y); started = true; }
+  g.stroke(); g.restore();
+  text(g, '100%', sx + sw, sy - 10, { size: 28, weight: 600, color: C.dim, align: 'right', alpha: a * 0.8 });
+  text(g, 'hit ratio, last 2 s', sx, sy - 10, { size: 28, weight: 600, color: C.dim, alpha: a * 0.8 });
+}
+function legend(g, G, f) {
+  if (!G.leg) return;
+  const [a] = env(f, G.TL.o.start + 10, G.TL.stats + 10, 12, 10);
+  if (a <= 0) return;
+  let x = G.leg.x; const y = G.leg.y;
+  const item = (col, s, sq) => {
+    g.save(); g.globalAlpha *= a; g.fillStyle = col;
+    if (sq) g.fillRect(x, y - 20, 18, 18); else { g.beginPath(); g.arc(x + 9, y - 11, 8, 0, Math.PI * 2); g.fill(); }
+    g.restore();
+    x += 30 + text(g, s, x + 30, y, { size: 28, weight: 650, color: C.dim, alpha: a }) + 48;
+  };
+  item(C.hit, 'hit: the edge answers', false);
+  item(C.miss, 'miss: the edge asks the origin', false);
+  item(OBJS[1].col, 'cached copy, draining its TTL', true);
+}
+function caption(g, G, f) {
+  for (const [t0, t1, str] of G.TL.caps) {
+    const [a, dy] = env(f, t0, t1, 10, 8); if (a <= 0) continue;
+    const [p1, p2] = str.split('|');
+    text(g, p1, G.capX, G.capY + dy, { size: G.cap, weight: 850, color: C.paper, spacing: -1, alpha: a, max: G.capMax });
+    text(g, p2, G.capX, G.capY + G.cap * 1.16 + dy, { size: G.cap, weight: 850, color: C.hit, spacing: -1, alpha: a, max: G.capMax });
+  }
+}
+function stats(g, G, f) {
+  const TL = G.TL, T = TL.S.tot, out = 1 - E.inCubic(prog(f, TL.end - 4, TL.end + 12));
+  const k1 = E.outCubic(prog(f, TL.stats + 4, TL.stats + 20)) * out, k2 = E.outCubic(prog(f, TL.stats + 16, TL.stats + 32)) * out, k3 = E.outCubic(prog(f, TL.stats + 28, TL.stats + 44)) * out;
+  if (k1 <= 0) return;
+  const lines = [
+    [`${T.N} requests  ·  ${T.H} edge hits (${Math.round(100 * T.H / T.N)}%)  ·  ${T.M} origin fetches`, C.paper, 850, G.st1, k1],
+    [`${T.EXP} of the misses came after a copy's TTL ran out.`, C.miss, 700, G.st2, k2],
+    [`Modelled latency: ${Math.round(T.hitMs)} ms on a hit, ${Math.round(T.missMs)} ms on a miss.`, C.paper, 700, G.st2, k2],
+    [`The origin answered 1 request in ${(T.N / T.M).toFixed(1)}.`, C.hit, 800, G.st2, k3],
+  ];
+  let y = G.stY;
+  for (const [s, c, wt, sz, k] of lines) {
+    const ls = G.stWrap ? vWrap(s, G.stMax, sz, wt) : wrapL(s, G.stMax, sz, wt);
+    ls.forEach(l => { text(g, l, G.stX, y + (1 - k) * 18, { size: sz, weight: wt, color: c, align: G.stAlign, alpha: k, max: G.stMax }); y += sz * 1.28; });
+    y += sz * 0.45;
+  }
+}
+function wrapL(str, maxW, size, weight) {
+  const words = str.split(' '), lines = []; let cur = '';
+  for (const w of words) { const t = cur ? cur + ' ' + w : w; if (measure(ctx, t, size, weight) > maxW && cur) { lines.push(cur); cur = w; } else cur = t; }
+  if (cur) lines.push(cur);
+  return lines;
+}
+function backdrop(g, w, h) { g.fillStyle = C.bg; g.fillRect(0, 0, w, h); }
+function scene(g, G, f) {
+  const TL = G.TL, a = E.outCubic(prog(f, TL.o.start - 22, TL.o.start - 2));
+  const sk = E.outCubic(prog(f, TL.stats - 2, TL.stats + 14)) * (1 - E.inCubic(prog(f, TL.end - 4, TL.end + 12)));
+  g.save(); g.globalAlpha = 0.35 + 0.65 * a;
+  g.globalAlpha *= 1 - 0.9 * sk;
+  g.drawImage(G.map, 0, 0);
+  g.globalAlpha = a * (1 - 0.95 * sk);
+  flights(g, G, f); nodes(g, G, f);
+  g.restore();
+  g.save(); g.globalAlpha = 1 - sk; panel(g, G, f); legend(g, G, f); g.restore();
+  caption(g, G, f); stats(g, G, f);
+}
+
+// ---- landscape picture ------------------------------------------------------------------
+const GL = { TL: TLL, W, H, lon0: -130, lon1: 166, lat0: -48, lat1: 72, k: 4.5, mx: 104, my: 318, step: 2, dot: 2.6,
+  nr: 11, ring: 22, ur: 3.2, fr: 5.5, alw: 2.5, bowMax: 170, lab: 28, slot: 16, slotGap: 5,
+  oLab: [0, 44, 'center'],
+  labs: [[-14, -24, 'left'], [18, 10, 'left'], [0, -30, 'center'], [-20, 10, 'right'], [-20, 10, 'right'], [18, -14, 'left'], [-20, 0, 'right']],
+  shelf: [[-58, 16], [58, 18], [0, 18], [-60, 18], [-60, 18], [56, 2], [0, 22]],
+  P: { x: 1480, x2: 1820, y: 340, big: 104, l: 28, v: 34, ry: 530, rh: 52, ly: 720, sy: 900, sh: 90 },
+  leg: { x: 110, y: 1004 },
+  capX: 120, capY: 200, cap: 50, capMax: 1300,
+  stX: 960, stY: 420, st1: 52, st2: 40, stAlign: 'center', stMax: 1640, stWrap: false };
+GL.map = mapLayer(GL);
+GL.P.x2 = 1820;
+function hookL(f) {
+  const o = 1 - E.inCubic(prog(f, TLL.o.start - 22, TLL.o.start - 4));
+  if (o <= 0) return;
+  const k = E.outExpo(prog(f, -8, 10)), k2 = E.outExpo(prog(f, -4, 14));
+  ctx.save(); ctx.globalAlpha = 0.8 * o; ctx.fillStyle = C.bg; ctx.fillRect(0, 380, W, 340); ctx.restore();
+  text(ctx, 'The first request crosses the world.', W / 2, 510 + (1 - k) * 30, { size: 96, weight: 900, color: C.miss, spacing: -2, align: 'center', alpha: o * Math.max(0.3, k) });
+  text(ctx, 'The next one stays close to home.', W / 2, 640 + (1 - k2) * 30, { size: 96, weight: 900, color: C.hit, spacing: -2, align: 'center', alpha: o * Math.max(0.3, k2) });
+}
+function draw(f) {
+  if (ctx.reset) ctx.reset();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; ctx.filter = 'none'; ctx.shadowBlur = 0;
+  backdrop(ctx, W, H);
+  const T = TLL, endK = E.inOutCubic(prog(f, T.end, T.end + 20)), a = 1 - endK;
+  text(ctx, 'SYSTEM DESIGN  ·  CDN EDGE CACHE', 120, 104, { size: 26, weight: 600, color: C.dim, spacing: 5, alpha: a });
+  text(ctx, 'BYTEPATTERNS', 1800, 104, { size: 26, weight: 600, color: C.dim, spacing: 5, align: 'right', alpha: a });
+  scene(ctx, GL, f);
+  hookL(f);
+  if (endK > 0) {
+    ctx.fillStyle = `rgba(${C.bgRGB},${0.9 * endK})`; ctx.fillRect(0, 0, W, H);
+    const k1 = E.outCubic(prog(f, T.end + 6, T.end + 28)), k2 = E.outCubic(prog(f, T.end + 16, T.end + 38)), k3 = E.outCubic(prog(f, T.end + 26, T.end + 48));
+    text(ctx, 'CDN Edge Cache', W / 2, 500 + (1 - k1) * 30, { size: 140, weight: 850, color: C.paper, spacing: -3, align: 'center', alpha: k1 });
+    text(ctx, `${EDGES.length} edges  ·  1 origin  ·  hit, miss, TTL`, W / 2, 580 + (1 - k2) * 20, { size: 42, weight: 500, color: C.hit, align: 'center', alpha: k2 });
+    text(ctx, 'drawn in code  ·  bytepatterns.com', W / 2, 1000, { size: 32, weight: 600, color: C.paper, spacing: 3, align: 'center', alpha: k3 * 0.8 });
+  }
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.letterSpacing = '0px';
+}
+
+// ---- sound: a bright blip per hit, a low swoosh out and back per miss, a chime when a copy lands ----------
+const PENTA = [0, 2, 4, 7, 9];
+async function renderAudio(TL = TLL, frames = FRAMES) {
+  const SR = 48000, dur = frames / FPS, LEN = Math.round(SR * dur);
+  const ac = new OfflineAudioContext(2, LEN, SR);
+  const at = fr => fr / FPS;
+  const S = TL.S;
+  const comp = ac.createDynamicsCompressor();
+  comp.threshold.value = -16; comp.ratio.value = 4; comp.attack.value = 0.003; comp.release.value = 0.2;
+  const master = ac.createGain(); master.gain.value = 0.9; master.connect(comp).connect(ac.destination);
+  master.gain.setValueAtTime(0.9, dur - 0.8); master.gain.linearRampToValueAtTime(0.0001, dur - 0.02);
+  const rnd = mulberry32(0x37A5);
+  const ir = ac.createBuffer(2, SR * 2, SR);
+  for (let c = 0; c < 2; c++) { const d = ir.getChannelData(c); for (let k = 0; k < d.length; k++) d[k] = (rnd() * 2 - 1) * Math.pow(1 - k / d.length, 3); }
+  const verb = ac.createConvolver(); verb.buffer = ir; const vg = ac.createGain(); vg.gain.value = 0.25; verb.connect(vg).connect(master);
+  const noise = ac.createBuffer(1, SR, SR); { const d = noise.getChannelData(0); for (let k = 0; k < d.length; k++) d[k] = rnd() * 2 - 1; }
+  const hz = m => 440 * Math.pow(2, (m - 69) / 12);
+  const tone = (t0, m, pan, amp, dec, type = 'sine') => { const o = ac.createOscillator(), g = ac.createGain(), p = ac.createStereoPanner();
+    o.type = type; o.frequency.value = hz(m); p.pan.value = clamp(pan, -1, 1);
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(amp, t0 + 0.004); g.gain.exponentialRampToValueAtTime(0.0001, t0 + dec);
+    o.connect(g).connect(p); p.connect(master); p.connect(verb); o.start(t0); o.stop(t0 + dec + 0.03); };
+  const swoosh = (t0, len, f0, f1, pan0, pan1, amp) => { const s = ac.createBufferSource(); s.buffer = noise; s.loop = true;
+    const bp = ac.createBiquadFilter(); bp.type = 'bandpass'; bp.Q.value = 3; bp.frequency.setValueAtTime(f0, t0); bp.frequency.exponentialRampToValueAtTime(f1, t0 + len);
+    const g = ac.createGain(), p = ac.createStereoPanner(); p.pan.setValueAtTime(pan0, t0); p.pan.linearRampToValueAtTime(pan1, t0 + len);
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(amp, t0 + len * 0.3); g.gain.exponentialRampToValueAtTime(0.0001, t0 + len);
+    s.connect(bp).connect(g).connect(p).connect(master); s.start(t0, (t0 * 5.1) % 0.9); s.stop(t0 + len + 0.02); };
+  const panE = e => (EDGES[e].lon + 10) / 170;
+  const panO = (ORIGIN.lon + 10) / 170;
+  // a soft pad and a pulse under it
+  const PAD = [[50, 57, 62], [48, 55, 60], [45, 52, 57], [47, 54, 59]];
+  const BAR = 64;
+  for (let b = 0; b * BAR < TL.stats + 30; b++) {
+    const t0 = at(b * BAR), len = BAR / FPS;
+    for (const m of PAD[b % 4]) { const o = ac.createOscillator(), g = ac.createGain(), lp = ac.createBiquadFilter(); o.type = 'sawtooth'; o.frequency.value = hz(m); lp.type = 'lowpass'; lp.frequency.value = 700;
+      g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(0.018, t0 + 0.5); g.gain.setValueAtTime(0.018, t0 + len - 0.4); g.gain.exponentialRampToValueAtTime(0.0001, t0 + len + 0.2);
+      o.connect(lp).connect(g).connect(master); o.start(t0); o.stop(t0 + len + 0.3); }
+    for (let q = 0; q < 4; q++) { const k0 = at(b * BAR + q * 16); const o = ac.createOscillator(), g = ac.createGain(); o.frequency.setValueAtTime(110, k0); o.frequency.exponentialRampToValueAtTime(45, k0 + 0.12);
+      g.gain.setValueAtTime(0.0001, k0); g.gain.exponentialRampToValueAtTime(0.2, k0 + 0.004); g.gain.exponentialRampToValueAtTime(0.0001, k0 + 0.25); o.connect(g).connect(master); o.start(k0); o.stop(k0 + 0.3); }
+  }
+  for (const q of S.reqs) {
+    const pe = panE(q.e);
+    if (q.hit) tone(at(q.tE), 79 + PENTA[q.e % 5], pe, 0.045, 0.12);
+    else {
+      tone(at(q.tE), 62, pe, 0.05, 0.18, 'triangle');
+      swoosh(at(q.tE), (q.tO - q.tE) / FPS, 900, 2400, pe, panO, 0.05);
+      tone(at(q.tO), 55, panO, 0.05, 0.2, 'triangle');
+      swoosh(at(q.tB), (q.tF - q.tB) / FPS, 2400, 900, panO, pe, 0.04);
+      tone(at(q.tF), 74 + PENTA[q.ob % 5], pe, 0.05, 0.5);
+    }
+  }
+  [62, 66, 69, 74].forEach((m, i) => tone(at(TL.stats + 4) + i * 0.07, m, -0.3 + i * 0.2, 0.06, 1.2));
+  [74, 78, 81, 86].forEach((m, i) => tone(at(TL.end + 8 + i * 6), m, -0.45 + i * 0.3, 0.07, 1.4));
+  const buf = await ac.startRendering();
+  let peak = 0; for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let k = 0; k < d.length; k++) peak = Math.max(peak, Math.abs(d[k])); }
+  if (peak > 0.89) for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let k = 0; k < d.length; k++) d[k] *= 0.89 / peak; }
+  return buf;
+}
+
+/* ==========================================================================
+   VERTICAL CUT — shared block, identical in every piece.
+   1080x1920 for Reels, Shorts and TikTok (__motion.variants.vertical). The
+   piece's own scene code is re-used and recomposed for a phone: everything a
+   viewer must read stays inside the area no platform covers (x 60..900,
+   y 230..1400); outside it there is only dimmed texture.
+   ========================================================================== */
+const VW = 1080, VH = 1920, SAFE = { x: 60, y: 230, w: 840, h: 1170, r: 900, b: 1400 };
+const vcv = document.createElement('canvas'); vcv.width = VW; vcv.height = VH;
+const vx = vcv.getContext('2d', { willReadFrequently: true });   // CPU raster: identical pixels on every redraw
+const VL = 96, VR = 864;                                          // text column inside the safe area
+
+function vReset() {
+  vx.setTransform(1, 0, 0, 1, 0, 0); vx.globalAlpha = 1; vx.globalCompositeOperation = 'source-over';
+  vx.filter = 'none'; vx.shadowBlur = 0; vx.shadowColor = 'transparent'; vx.letterSpacing = '0px'; vx.setLineDash([]);
+  vx.textAlign = 'left'; vx.textBaseline = 'alphabetic'; vx.lineCap = 'butt'; vx.lineJoin = 'miter';
+}
+/** Canvas text on the vertical frame; `max` shrinks the size until the line fits. */
+function vText(str, x, y, { size = 40, weight = 700, color = '#FFFFFF', align = 'left', spacing = 0, alpha = 1, fam = FONT, max = 0 } = {}) {
+  if (alpha <= 0.002 || !str) return size;
+  vx.font = `${weight} ${size}px ${fam}`; vx.letterSpacing = spacing + 'px';
+  if (max) { const w = vx.measureText(str).width; if (w > max) { size = size * max / w; vx.font = `${weight} ${size}px ${fam}`; } }
+  vx.textAlign = align; vx.textBaseline = 'alphabetic';
+  const a0 = vx.globalAlpha; vx.globalAlpha = a0 * alpha; vx.fillStyle = color;
+  vx.fillText(str, x + (align === 'center' ? spacing / 2 : align === 'right' ? spacing : 0), y);   // tracking is added after the last glyph too
+  vx.globalAlpha = a0; vx.letterSpacing = '0px';
+  return size;
+}
+/** Word-wraps with the given font; returns the lines. */
+function vWrap(str, maxW, size, weight = 700, fam = FONT) {
+  vx.font = `${weight} ${size}px ${fam}`; vx.letterSpacing = '0px';
+  const words = str.split(' '), lines = []; let cur = '';
+  for (const w of words) { const t = cur ? cur + ' ' + w : w; if (vx.measureText(t).width > maxW && cur) { lines.push(cur); cur = w; } else cur = t; }
+  if (cur) lines.push(cur);
+  return lines;
+}
+/** Fade envelope with a small rise: [alpha, dy]. */
+function vEnv(v, a, b, fin = 8, fout = 8) {
+  const i = E.outCubic(prog(v, a, a + fin)), o = 1 - E.inCubic(prog(v, b - fout, b));
+  return [Math.min(i, o), (1 - i) * 22 - (1 - o) * 10];
+}
+/** Which segment of a cut list a vertical frame is in: segs = [{ at, src, len }] in frames. */
+function vSeg(segs, v) {
+  let k = 0; while (k < segs.length - 1 && v >= segs[k + 1].at) k++;
+  const s = segs[k];
+  return { k, s, local: v - s.at, src: s.src + (v - s.at) };
+}
+/** Dims everything outside the safe area to a quiet texture (brightness x 0.2), with a soft inner edge. */
+function vShade(rgb, a = 0.8, feather = 40) {
+  vx.save(); vx.setTransform(1, 0, 0, 1, 0, 0); vx.globalAlpha = 1; vx.globalCompositeOperation = 'source-over';
+  vx.fillStyle = `rgba(${rgb},${a})`;
+  vx.beginPath(); vx.rect(0, 0, VW, VH); vx.rect(SAFE.x, SAFE.y, SAFE.w, SAFE.h); vx.fill('evenodd');
+  const strip = (x0, y0, x1, y1, rx, ry, rw, rh) => {
+    const g = vx.createLinearGradient(x0, y0, x1, y1);
+    g.addColorStop(0, `rgba(${rgb},${a})`); g.addColorStop(1, `rgba(${rgb},0)`);
+    vx.fillStyle = g; vx.fillRect(rx, ry, rw, rh);
+  };
+  strip(SAFE.x, 0, SAFE.x + feather, 0, SAFE.x, SAFE.y, feather, SAFE.h);
+  strip(SAFE.r, 0, SAFE.r - feather, 0, SAFE.r - feather, SAFE.y, feather, SAFE.h);
+  strip(0, SAFE.y, 0, SAFE.y + feather, SAFE.x, SAFE.y, SAFE.w, feather);
+  strip(0, SAFE.b, 0, SAFE.b - feather, SAFE.x, SAFE.b - feather, SAFE.w, feather);
+  vx.restore();
+}
+/** Series tag at the top of the safe area, e.g. MADE IN CODE · 04. */
+function vTag(label, color, alpha = 1) {
+  vText('MADE IN CODE', VL, 292, { size: 28, weight: 800, color, spacing: 5, alpha });
+  vx.font = `800 28px ${FONT}`; vx.letterSpacing = '5px';
+  const w = vx.measureText('MADE IN CODE').width; vx.letterSpacing = '0px';
+  vText('·  ' + label, VL + w + 14, 292, { size: 28, weight: 600, color: 'rgba(255,255,255,0.72)', spacing: 3, alpha, max: VR - VL - w - 14 });
+}
+/** Big hook lines, left-aligned from y0; visible from frame 0, settles in a few frames. */
+function vHook(v, lines, y0, { size = 84, lh = 1.08, color = '#FFFFFF', accent = null, weight = 800, spacing = -1.5, alpha = 1 } = {}) {
+  const k = E.outExpo(prog(v, -6, 12));
+  lines.forEach((ln, i) => {
+    const kk = E.outExpo(prog(v, -12 + i * 2, 8 + i * 2));
+    vText(ln, VL, y0 + i * size * lh + (1 - kk) * 30, { size, weight, spacing, color: accent && i === lines.length - 1 ? accent : color, alpha: alpha * Math.max(0.25, kk), max: VR - VL });
+  });
+  return k;
+}
+/** Closing card, the last 60 frames: piece title, "drawn in code · bytepatterns.com". l = frames into the card. */
+function vEndCard(l, { title, line = '', ink = '#FFFFFF', dim = 'rgba(255,255,255,0.66)', accent = '#FFFFFF', scrim = '0,0,0', a = 0.84 }) {
+  const k = E.outCubic(prog(l, 0, 12));
+  vx.save(); vx.setTransform(1, 0, 0, 1, 0, 0);
+  vx.fillStyle = `rgba(${scrim},${a * k})`; vx.fillRect(0, 0, VW, VH);
+  vx.restore();
+  const t1 = E.outExpo(prog(l, 3, 19)), t2 = E.outExpo(prog(l, 11, 27)), t3 = E.outExpo(prog(l, 19, 35));
+  vx.fillStyle = accent; vx.globalAlpha = t1; vx.fillRect(VL, 742, 88 * t1, 7); vx.globalAlpha = 1;
+  const size = vText(title, VL, 850 + (1 - t1) * 40, { size: 92, weight: 800, color: ink, spacing: -2, alpha: t1, max: VR - VL });
+  const y2 = 850 + Math.max(size, 60) * 0.25 + 70;
+  vx.font = `600 44px ${FONT}`;
+  const lead = 'drawn in code  ·  ', lw = vx.measureText(lead).width;
+  vText(lead, VL, y2 + (1 - t2) * 24, { size: 44, weight: 600, color: dim, alpha: t2 });
+  vText('bytepatterns.com', VL + lw, y2 + (1 - t2) * 24, { size: 44, weight: 800, color: accent, alpha: t2 });
+  if (line) vText(line, VL, y2 + 72 + (1 - t3) * 18, { size: 32, weight: 500, color: dim, alpha: t3, max: VR - VL });
+}
+/** Seeks a cut. The first frame a page draws is drawn twice: the very first read of a
+ *  GPU-backed source canvas can come out a shade different from every later one. */
+let vWarm = false;
+function vSeek(draw, i, frames) {
+  const f = Math.max(0, Math.min(frames - 1, Math.floor(i)));
+  if (!vWarm) { vWarm = true; draw(f); }
+  draw(f);
+}
+/** The soundtrack of a cut: the piece's own audio() spliced to the same segments as the picture. */
+async function vAudio(segs, frames, { xf = 0.025, fadeOut = 0.6, extra = null } = {}) {
+  const src = await renderAudio();
+  const SR = 48000, dur = frames / FPS, ac = new OfflineAudioContext(2, Math.round(SR * dur), SR);
+  const out = ac.createGain(); out.connect(ac.destination);
+  out.gain.setValueAtTime(1, 0); out.gain.setValueAtTime(1, dur - fadeOut); out.gain.linearRampToValueAtTime(0, dur - 0.01);
+  segs.forEach((s, k) => {
+    const at = s.at / FPS, off = s.src / FPS, d = s.len / FPS;
+    const pre = k === 0 ? 0 : Math.min(xf, off), post = k === segs.length - 1 ? 0 : xf;
+    const b = ac.createBufferSource(), g = ac.createGain(); b.buffer = src;
+    g.gain.setValueAtTime(pre ? 0 : 1, at - pre);
+    if (pre) g.gain.linearRampToValueAtTime(1, at + pre);
+    if (post) { g.gain.setValueAtTime(1, at + d - post); g.gain.linearRampToValueAtTime(0, at + d + post); }
+    b.connect(g).connect(out); b.start(at - pre, off - pre, d + pre + post);
+  });
+  if (extra) extra(ac, out);
+  const buf = await ac.startRendering();
+  let peak = 0; for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) peak = Math.max(peak, Math.abs(d[i])); }
+  if (peak > 0.9) for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) d[i] *= 0.9 / peak; }
+  return buf;
+}
+/** A soft three-partial bell, for the closing card. */
+function vChime(ac, dest, at, freq, vol = 0.08) {
+  for (const [mul, v, dec] of [[1, 1, 1.8], [2.01, 0.35, 0.8], [3.02, 0.12, 0.4]]) {
+    const o = ac.createOscillator(), g = ac.createGain(); o.type = 'sine'; o.frequency.value = freq * mul;
+    g.gain.setValueAtTime(0.0001, at); g.gain.exponentialRampToValueAtTime(vol * v, at + 0.006); g.gain.exponentialRampToValueAtTime(0.0001, at + dec);
+    o.connect(g).connect(dest); o.start(at); o.stop(at + dec + 0.05);
+  }
+}
+
+/* VERTICAL CUT — this piece */
+// The same network on a phone: the map narrowed to the band the seven
+// edges live in, the counters and the sparkline under it. Its own, shorter
+// run of the simulation with a faster ramp; the soundtrack is rendered from
+// that run.
+const TLV = buildTL({ seed: 0x37C1, start: 38, t0: 40, t1: 404, r0: 7, r1: 15, u2e: 7, fly0: 8, flyK: 0.0012, c1: 150, c2: 290, frames: 600, statLen: 70, tail: 30 });
+const VFR = TLV.end + 60, VEND = VFR - 60;
+const GV = { TL: TLV, W: VW, H: VH, lon0: -126, lon1: 154, lat0: -48, lat1: 72, k: 2.9, mx: 74, my: 560, step: 3, dot: 2.3,
+  nr: 8, ring: 14, ur: 2.4, fr: 4.2, alw: 2, bowMax: 110, lab: 28, slot: 11, slotGap: 3,
+  oLab: [0, 38, 'center'],
+  labs: [[4, -22, 'left'], [14, 8, 'left'], [0, -22, 'center'], [-14, 8, 'right'], [-14, 10, 'right'], [0, -22, 'center'], [-10, -16, 'right']],
+  shelf: [[20, 12], [34, 14], [0, 12], [-40, 14], [34, 16], [0, 12], [-30, 14]],
+  P: { x: VL, x2: VR, y: 980, big: 96, l: 30, v: 34, ry: 1150, rh: 44, ly: 1284, sy: 0, sh: 0 },
+  leg: null,
+  capX: VL, capY: 392, cap: 44, capMax: VR - VL,
+  stX: VL, stY: 980, st1: 42, st2: 34, stAlign: 'left', stMax: VR - VL, stWrap: true };
+GV.map = mapLayer(GV);
+function hookV(v) {
+  const o = 1 - E.inCubic(prog(v, TLV.o.start - 16, TLV.o.start - 2));
+  if (o <= 0) return;
+  vx.save(); vx.globalAlpha = 0.85 * o; vx.fillStyle = C.bg; vx.fillRect(0, 440, VW, 520); vx.restore();
+  vHook(v, ['The first', 'request crosses', 'the world.'], 540, { size: 96, color: C.miss, weight: 900, spacing: -2, alpha: o });
+  vHook(v, ['The next one', 'stays home.'], 850, { size: 96, color: C.hit, weight: 900, spacing: -2, alpha: o });
+}
+function vDraw(v) {
+  vReset();
+  backdrop(vx, VW, VH);
+  scene(vx, GV, v);
+  hookV(v);
+  vReset();
+  vShade(C.bgRGB, 0.84);
+  vTag('CDN EDGE CACHE', C.hit);
+  if (v >= VEND) vEndCard(v - VEND, { title: 'CDN Edge Cache', line: `${EDGES.length} edges  ·  1 origin  ·  hit, miss, TTL`,
+    ink: C.paper, dim: 'rgba(238,243,247,0.72)', accent: C.hit, scrim: C.bgRGB, a: 0.9 });
+  vReset();
+}
+
+const TT = TLL.S.tot;
+window.__motion = {
+  title: 'CDN Edge Cache: Hit, Miss, TTL',
+  description: `A simulated CDN on a dotted world map: ${TT.N} requests reach ${EDGES.length} edge caches; ${TT.H} are hits answered at the edge, ${TT.M} are misses fetched from one origin in Virginia, ${TT.EXP} of them because a copy's TTL had run out. Latency is modelled from great-circle distance: ${Math.round(TT.hitMs)} ms on a hit, ${Math.round(TT.missMs)} ms on a miss.`,
+  fps: FPS, width: W, height: H, frames: FRAMES,
+  poster: 560,
+  gifStart: 2,
+  seek(i) { draw(Math.max(0, Math.min(FRAMES - 1, Math.floor(i)))); },
+  audio: () => renderAudio(TLL, FRAMES),
+  variants: {
+    vertical: {
+      width: VW, height: VH, frames: VFR, canvas: vcv,
+      poster: 330, gifStart: 2,
+      seek(i) { vSeek(vDraw, i, VFR); },
+      audio: () => renderAudio(TLV, VFR),
+    },
+  },
+};
+
+/* ==========================================================================
+   PLAYER — identical in every piece; keep as is.
+   Autoplays and loops, starts sound on the first click, ?frame=N pauses on a
+   frame, ?variant=vertical plays the vertical cut (if the piece has one).
+   When the renderer sets window.__MOTION_RENDER__ it stays out of the way.
+   ========================================================================== */
+(function player() {
+  const btn = document.getElementById('sound'), q = new URLSearchParams(location.search);
+  let M = window.__motion;
+  const V = !window.__MOTION_RENDER__ && M.variants && M.variants[q.get('variant')];
+  if (V) {                                                // show the variant's own canvas instead
+    M = Object.assign({}, M, V);
+    V.canvas.style.cssText = `width:min(100vw,calc(100vh*${V.width}/${V.height}));height:auto;aspect-ratio:${V.width}/${V.height}`;
+    document.querySelector('canvas').replaceWith(V.canvas);
+  }
+  const dur = M.frames / M.fps;
+  if (window.__MOTION_RENDER__) { btn.hidden = true; M.seek(0); return; }
+  if (q.has('frame')) { btn.hidden = true; M.seek(+q.get('frame') || 0); return; }
+  let t0 = performance.now(), ac = null, src = null, buf = null, paused = false, pausedAt = 0;
+  const clock = () => ac && src ? (ac.currentTime - t0) : (performance.now() - t0) / 1000;
+  function loop() {
+    if (!paused) M.seek(Math.floor(((clock() % dur) + dur) % dur * M.fps));
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+  btn.addEventListener('click', async () => {
+    if (src) { src.stop(); src = null; btn.textContent = 'Click for sound'; t0 = performance.now(); return; }
+    btn.textContent = 'Loading sound…';
+    ac = ac || new AudioContext({ sampleRate: 48000 });
+    buf = buf || await M.audio();
+    await ac.resume();
+    src = ac.createBufferSource(); src.buffer = buf; src.loop = true; src.connect(ac.destination);
+    t0 = ac.currentTime + 0.05; src.start(t0);        // picture restarts from frame 0 in sync with the sound
+    btn.textContent = 'Sound on — click to mute';
+  });
+  addEventListener('keydown', e => {
+    if (e.code !== 'Space') return;
+    e.preventDefault(); paused = !paused;
+    if (ac) paused ? ac.suspend() : ac.resume();
+    if (!ac) { if (paused) pausedAt = performance.now(); else t0 += performance.now() - pausedAt; }
+  });
+})();
+</script>
+</body>
+</html>

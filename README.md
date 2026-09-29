@@ -468,6 +468,45 @@ Click a preview to open the piece live in your browser (click once more there fo
 </tr>
 <tr>
 <td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/36-quicksort-partition/"><img src="out/36-quicksort-partition.gif" width="100%" alt="Quick Sort: The Partition Dance — animated preview"></a>
+<br><b>36 · Quick Sort: The Partition Dance</b> <sub>30 s</sub>
+<br>A real quick sort of 16 numbers with the Lomuto partition, danced out: the last number of each range is the pivot, every smaller number hops to the left of a moving wall, and the pivot jumps into its final place. 11 pivots, 42 comparisons and 24 swaps, one tick per swap.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/36-quicksort-partition/">open in browser</a> · <a href="out/36-quicksort-partition.png">still</a> · <a href="projects/36-quicksort-partition/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/36-quicksort-partition/?variant=vertical"><img src="out/36-quicksort-partition.vertical.gif" width="100%" alt="Quick Sort: The Partition Dance — vertical cut, animated preview"></a>
+<br><sub>9:16 · 19 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/36-quicksort-partition/?variant=vertical">open</a> · <a href="out/36-quicksort-partition.vertical.png">still</a></sub>
+</td>
+</tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/37-cdn-edge-cache/"><img src="out/37-cdn-edge-cache.gif" width="100%" alt="CDN Edge Cache: Hit, Miss, TTL — animated preview"></a>
+<br><b>37 · CDN Edge Cache: Hit, Miss, TTL</b> <sub>29 s</sub>
+<br>A simulated CDN on a dotted world map: 217 requests reach 7 edge caches; 130 are hits answered at the edge, 87 are misses fetched from one origin in Virginia, 44 of them because a copy's TTL had run out. Latency is modelled from great-circle distance: 7 ms on a hit, 129 ms on a miss.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/37-cdn-edge-cache/">open in browser</a> · <a href="out/37-cdn-edge-cache.png">still</a> · <a href="projects/37-cdn-edge-cache/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/37-cdn-edge-cache/?variant=vertical"><img src="out/37-cdn-edge-cache.vertical.gif" width="100%" alt="CDN Edge Cache: Hit, Miss, TTL — vertical cut, animated preview"></a>
+<br><sub>9:16 · 19 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/37-cdn-edge-cache/?variant=vertical">open</a> · <a href="out/37-cdn-edge-cache.vertical.png">still</a></sub>
+</td>
+</tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/38-recursion/"><img src="out/38-recursion.gif" width="100%" alt="Recursion, Written in Itself — animated preview"></a>
+<br><b>38 · Recursion, Written in Itself</b> <sub>26 s</sub>
+<br>Kinetic type: the word RECURSION writes itself again inside its own O, 9.1 times smaller each time, 7 calls deep; the camera dives through every O while the call stack grows to depth 6, hits the base case and unwinds, innermost first.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/38-recursion/">open in browser</a> · <a href="out/38-recursion.png">still</a> · <a href="projects/38-recursion/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/38-recursion/?variant=vertical"><img src="out/38-recursion.vertical.gif" width="100%" alt="Recursion, Written in Itself — vertical cut, animated preview"></a>
+<br><sub>9:16 · 19 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/38-recursion/?variant=vertical">open</a> · <a href="out/38-recursion.vertical.png">still</a></sub>
+</td>
+</tr>
+<tr>
+<td width="72%" valign="top">
 <a href="https://bytepatterns.github.io/motion-lab/projects/39-lloyd-relaxation/"><img src="out/39-lloyd-relaxation.gif" width="100%" alt="Lloyd's Relaxation — animated preview"></a>
 <br><b>39 · Lloyd's Relaxation</b> <sub>26 s</sub>
 <br>Generative geometry: 150 clumped random dots own the Voronoi cells around them; 100 times over, every dot moves to the centroid of its own cell and the cells are rebuilt, until the cell sizes, which varied by ±137%, vary by only ±11%. Each cell is clipped exactly from the frame by its neighbours' bisectors.
