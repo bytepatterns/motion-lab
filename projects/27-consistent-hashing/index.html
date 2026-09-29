@@ -1,0 +1,758 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="author" content="teambytepatterns">
+<meta name="description" content="Four servers and twelve keys hashed onto one ring with 32-bit FNV-1a: virtual points even out the ring shares, and when one server goes down only its own keys move, while hash mod N would reshuffle most of them.">
+<title>Consistent Hashing — motion-lab</title>
+<style>
+  /* Player chrome. The piece itself lives entirely in the canvas. */
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  body { display: grid; place-items: center; font: 500 15px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #fff; }
+  canvas { display: block; width: min(100vw, calc(100vh * 16 / 9)); height: auto; aspect-ratio: 16 / 9; }
+  #sound { position: fixed; left: 16px; bottom: 16px; padding: 8px 14px; border: 1px solid rgba(255,255,255,.35); border-radius: 999px;
+           background: rgba(0,0,0,.55); color: #fff; font: inherit; cursor: pointer; }
+  #sound[hidden] { display: none; }
+</style>
+</head>
+<body>
+<canvas id="stage" width="1920" height="1080" aria-label="A hash ring with four servers and twelve keys; each key walks clockwise to the next server, virtual points even out the shares, and when one server goes down only its keys move"></canvas>
+<button id="sound" type="button">Click for sound</button>
+<script>
+'use strict';
+/* ==========================================================================
+   PIECE — Consistent Hashing.
+   One ring of 32-bit hash values, 0 at the top and 2^32 back at the top.
+   Servers and keys are hashed onto it with the same 32-bit FNV-1a; a key
+   belongs to the first server point clockwise from it.
+   1. One point per server: the ring shares (arc lengths) and key counts
+      are whatever the hash gives, usually far from even.
+   2. Virtual points: every server is hashed 32 more times ("vn0-alpha",
+      "vn1-alpha", ...); the shares come close to a quarter each.
+   3. A server goes down: its points leave the ring and only its keys walk
+      on to the next point. The same twelve keys under hash mod N, with N
+      going from 4 to 3, are counted for comparison.
+   Everything on screen (shares, counts, moves) is computed once, at load,
+   from the hashes; seek(i) only reads it.
+   ========================================================================== */
+const W = 1920, H = 1080, FPS = 30;
+const cv = document.getElementById('stage');
+const ctx = cv.getContext('2d', { willReadFrequently: true });   // CPU raster: identical pixels on every redraw
+const FONT = 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
+const MONO = 'ui-monospace, "Cascadia Code", Consolas, Menlo, monospace';
+
+// ---- helpers -------------------------------------------------------------
+// ---- helpers -------------------------------------------------------------
+function mulberry32(a) { return function () { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a);
+  t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const lerp = (a, b, t) => a + (b - a) * t;
+const prog = (f, a, b) => clamp((f - a) / (b - a));
+const smooth = t => t * t * (3 - 2 * t);
+const E = {
+  inCubic: t => t * t * t,
+  outCubic: t => 1 - Math.pow(1 - t, 3),
+  inOutCubic: t => t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2,
+  outExpo: t => t === 1 ? 1 : 1 - Math.pow(2, -10 * t),
+  inExpo: t => t === 0 ? 0 : Math.pow(2, 10 * t - 10),
+  inOutExpo: t => t === 0 ? 0 : t === 1 ? 1 : t < .5 ? Math.pow(2, 20 * t - 10) / 2 : (2 - Math.pow(2, -20 * t + 10)) / 2,
+  outBack: t => 1 + 2.70158 * Math.pow(t - 1, 3) + 1.70158 * Math.pow(t - 1, 2),
+};
+function text(g, str, x, y, { size = 40, weight = 600, color = '#fff', alpha = 1, spacing = 0, align = 'left', fam = FONT, base = 'alphabetic' } = {}) {
+  if (alpha <= 0.002 || !str) return 0;
+  g.font = `${weight} ${size}px ${fam}`; g.letterSpacing = spacing + 'px';
+  g.textAlign = align; g.textBaseline = base;
+  const a0 = g.globalAlpha; g.globalAlpha = a0 * alpha; g.fillStyle = color;
+  g.fillText(str, x, y);
+  const w = g.measureText(str).width;
+  g.globalAlpha = a0; g.letterSpacing = '0px';
+  return w;
+}
+const env = (f, a, b, fin = 12, fout = 10) => {
+  const i = E.outCubic(prog(f, a, a + fin)), o = 1 - E.inCubic(prog(f, b - fout, b));
+  return [Math.min(i, o), (1 - i) * 24 - (1 - o) * 10];
+};
+
+// ---- palette -------------------------------------------------------------
+const C = {
+  bg: '#0E0D15', bgRGB: '14,13,21', paper: '#F1ECE3', dim: 'rgba(241,236,227,0.62)', faint: 'rgba(241,236,227,0.22)',
+  hot: '#FF5E57', ok: '#9BE36D',
+  srv: ['#F5B83D', '#58C4B8', '#8FA2FF', '#E88FB8'],          // alpha (warm), beta (cool), gamma, delta
+};
+
+// ---- the ring, computed once ---------------------------------------------------------
+function fnv1a(s) {                                          // 32-bit FNV-1a
+  let h = 0x811C9DC5;
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+  return h >>> 0;
+}
+const TWO32 = 4294967296;
+const SERVERS = ['alpha', 'beta', 'gamma', 'delta'];
+const KEYS = ['user:314', 'user:128', 'user:64', 'cart:17', 'post:3', 'page:faq', 'cart:314', 'cart:777', 'user:101', 'sess:k2', 'order:404', 'cart:9'];
+const V = 32, DEAD = 0;                                      // virtual points per server; alpha goes down
+const vLabel = (s, i) => `vn${i}-${SERVERS[s]}`;
+const KH = KEYS.map(fnv1a), KU = KH.map(h => h / TWO32);    // key hashes, as turns of the ring
+/** A ring: points sorted by hash, the arc each one owns (from the previous point), shares, and where every key lands. */
+function buildRing(points) {
+  const P = points.map(p => Object.assign({}, p, { u: p.h / TWO32 })).sort((a, b) => a.h - b.h);
+  const share = SERVERS.map(() => 0);
+  P.forEach((p, k) => {
+    const prev = P[(k - 1 + P.length) % P.length];
+    p.prevU = prev.u; p.len = ((p.h - prev.h + TWO32) % TWO32) / TWO32;
+    share[p.s] += p.len;
+  });
+  const own = KH.map(h => {
+    const k = P.findIndex(p => p.h >= h), p = P[k < 0 ? 0 : k];
+    return { p, s: p.s, d: ((p.h - h + TWO32) % TWO32) / TWO32 };
+  });
+  // lanes: keys that walk to the same point nest, the longest walk innermost
+  own.forEach((o, k) => { o.lane = own.filter((q, j) => q.p === o.p && (q.d < o.d || (q.d === o.d && j < k))).length; });
+  const count = SERVERS.map((_, s) => own.filter(o => o.s === s).length);
+  const live = share.filter((_, s) => points.some(p => p.s === s));
+  return { P, share, own, count, max: Math.max(...live), min: Math.min(...live) };
+}
+const R1 = buildRing(SERVERS.map((name, s) => ({ s, h: fnv1a(name) })));
+const VPTS = SERVERS.flatMap((_, s) => Array.from({ length: V }, (_, i) => ({ s, i, h: fnv1a(vLabel(s, i)) })));
+const R2 = buildRing(VPTS);
+const R3 = buildRing(VPTS.filter(p => p.s !== DEAD));
+const MOVED = KEYS.map((_, k) => k).filter(k => R2.own[k].s !== R3.own[k].s);        // keys whose server changes
+const REST = SERVERS.map((_, s) => s).filter(s => s !== DEAD);
+const MODN = KH.map(h => ({ a: h % 4, b: REST[h % 3] }));    // naive: server index = hash mod N
+const MODN_MOVED = MODN.filter(m => m.a !== m.b).length;
+const pct = x => (x * 100).toFixed(1) + '%';
+// arcs of the dead server's points and who takes them over (the next surviving point clockwise)
+const TAKE = R2.P.filter(p => p.s === DEAD).map(p => {
+  const k = R2.P.indexOf(p); let j = k; do j = (j + 1) % R2.P.length; while (R2.P[j].s === DEAD);
+  return { p, to: R2.P[j] };
+});
+
+// ---- timeline (frames) ---------------------------------------------------------------
+const BEAT = 16;                                             // 112.5 BPM
+const T = { hookOut: 56, ring: 48, srv: 78 };
+T.arc1 = T.srv + 32;
+T.key1 = T.arc1 + 22;
+const K1 = KEYS.map((_, k) => { const drop = T.key1 + 6 * k, o = R1.own[k]; return { drop, go: drop + 5, land: drop + 11 + Math.round(16 * o.d) }; });
+T.res1 = Math.max(...K1.map(k => k.land)) + 8;
+T.a2 = T.res1 + 64;
+T.bloom = T.a2 + 8;
+const tV = p => T.bloom + p.s * 8 + p.i * 0.9;               // when a virtual point appears
+T.rec2 = Math.round(T.bloom + 3 * 8 + (V - 1) * 0.9 + 8);
+T.key2 = T.rec2 + 22;
+const K2 = KEYS.map((_, k) => { const go = T.key2 + 3 * k; return { go, land: go + 6 + Math.round(16 * R2.own[k].d) }; });
+T.res2 = Math.max(...K2.map(k => k.land)) + 8;
+T.a3 = T.res2 + 56;
+T.down = T.a3 + 10;
+T.rec3 = T.down + 18;
+T.travel = T.rec3 + 20;
+const K3 = {}; MOVED.forEach((k, m) => { const go = T.travel + 10 * m; K3[k] = { m, go, land: go + 18 }; });
+T.modN = Math.max(T.travel + 20, ...Object.values(K3).map(k => k.land)) + 6;
+T.chips = T.modN + 10;                                       // chip k flips at T.chips + 4k
+T.outro = T.chips + 4 * (KEYS.length - 1) + 26;
+T.end = T.outro + 44;
+const FRAMES = T.end + 66;
+const at = fr => fr / FPS;
+
+// ---- geometry ---------------------------------------------------------------------------
+const ANG = u => -Math.PI / 2 + u * Math.PI * 2;             // 0 at the top, clockwise
+const onRing = (G, u, r) => [G.cx + r * Math.cos(ANG(u)), G.cy + r * Math.sin(ANG(u))];
+const panOf = u => Math.sin(u * Math.PI * 2) * 0.8;          // left of the ring pans left
+function arcPath(g, G, r, u0, u1) { g.beginPath(); g.arc(G.cx, G.cy, r, ANG(u0), ANG(u1)); }
+function strokeArc(g, G, r, u0, u1, col, w, alpha) {
+  if (alpha <= 0.01 || u1 - u0 <= 1e-5) return;
+  g.save(); g.globalAlpha = alpha; g.strokeStyle = col; g.lineWidth = w; g.lineCap = 'butt';
+  arcPath(g, G, r, u0, u1); g.stroke(); g.restore();
+}
+function dot(g, x, y, r, col, alpha = 1, ring = 0) {
+  if (alpha <= 0.01 || r <= 0) return;
+  g.save(); g.globalAlpha = alpha;
+  if (ring) { g.fillStyle = C.bg; g.beginPath(); g.arc(x, y, r + ring, 0, Math.PI * 2); g.fill(); }
+  g.fillStyle = col; g.beginPath(); g.arc(x, y, r, 0, Math.PI * 2); g.fill(); g.restore();
+}
+
+// ---- what is true at frame f --------------------------------------------------------------
+/** The server key k is with at frame f (-1: none yet, or orphaned). */
+function keyOwner(k, f) {
+  if (f < K1[k].land) return -1;
+  if (f < T.rec2 - 4) return R1.own[k].s;
+  if (f < K2[k].land) return -1;
+  if (K3[k] && f >= T.down + 4) return f >= K3[k].land ? R3.own[k].s : -1;
+  return R2.own[k].s;
+}
+/** Share of server s shown at frame f. */
+function shareAt(s, f) {
+  const a1 = E.inOutCubic(prog(f, T.arc1, T.arc1 + 20)), x2 = E.inOutCubic(prog(f, T.rec2, T.rec2 + 20)), x3 = E.inOutCubic(prog(f, T.rec3, T.rec3 + 18));
+  return lerp(lerp(R1.share[s] * a1, R2.share[s], x2), R3.share[s], x3);
+}
+
+// ---- drawing ------------------------------------------------------------------------
+/** The headline of a scene: words fall in one after another. Several lines, or one when G.capOne. */
+function headline(g, G, f, lines, t0, t1, color = C.paper) {
+  if (f < t0 - 1 || f > t1) return;
+  if (G.capOne) lines = [lines.join(' ')];
+  let n = 0;
+  lines.forEach((ln, li) => {
+    let size = G.cap;
+    g.font = `850 ${size}px ${FONT}`; g.letterSpacing = '-1px';
+    const full = g.measureText(ln).width; if (full > G.pw) { size *= G.pw / full; g.font = `850 ${size}px ${FONT}`; }
+    const words = ln.split(' '); let x = G.px;
+    words.forEach(w => {
+      const a = E.outBack(prog(f, t0 + n * 3, t0 + n * 3 + 12)), o = 1 - E.inCubic(prog(f, t1 - 10, t1)); n++;
+      text(g, w, x, G.capY + li * G.capLh + (1 - a) * 36 - (1 - o) * 18, { size, weight: 850, color, spacing: -1, alpha: clamp(a) * o });
+      g.font = `850 ${size}px ${FONT}`; g.letterSpacing = '-1px'; x += g.measureText(w + ' ').width;
+    });
+  });
+  g.letterSpacing = '0px';
+  return G.capY + (lines.length - 1) * G.capLh;
+}
+function subline(g, G, f, str, y, t0, t1, color = C.dim, fam = FONT) {
+  const [a, dy] = env(f, t0, t1, 12, 10);
+  text(g, str, G.px, y + dy, { size: G.sub, weight: 600, color, alpha: a, fam });
+}
+/** The ring: the circle, the owned arcs, the server points, the keys and their walks. */
+function drawRing(g, G, f) {
+  const draw = E.inOutCubic(prog(f, T.ring, T.ring + 28));
+  if (draw <= 0) return;
+  // the circle and the 0 / 2^32 mark at the top
+  strokeArc(g, G, G.R, 0, draw, C.faint, 2, 1);
+  const mk = E.outCubic(prog(f, T.ring + 14, T.ring + 30));
+  g.save(); g.globalAlpha = mk; g.strokeStyle = C.dim; g.lineWidth = 2; g.beginPath(); g.moveTo(G.cx, G.cy - G.R - 12); g.lineTo(G.cx, G.cy - G.R + 12); g.stroke(); g.restore();
+  text(g, '0 = 2³²', G.cx, G.cy - G.R - 24, { size: G.small, weight: 600, color: C.dim, align: 'center', alpha: mk });
+
+  // owned arcs: act 1 sweeps in, act 2 crossfades, act 3 hands the dead arcs on
+  const a1 = E.inOutCubic(prog(f, T.arc1, T.arc1 + 20)), x2 = E.inOutCubic(prog(f, T.rec2, T.rec2 + 20));
+  const gone = prog(f, T.down, T.down + 18), x3 = E.inOutCubic(prog(f, T.rec3, T.rec3 + 18));
+  if (x2 < 1) R1.P.forEach(p => strokeArc(g, G, G.R, p.u - p.len * a1, p.u, C.srv[p.s], G.band, 0.62 * (1 - x2)));
+  if (x2 > 0) R2.P.forEach(p => {
+    if (p.s !== DEAD) { strokeArc(g, G, G.R, p.u - p.len, p.u, C.srv[p.s], G.band, 0.62 * x2); return; }
+    strokeArc(g, G, G.R, p.u - p.len, p.u, C.srv[p.s], G.band, 0.62 * x2 * (1 - gone));
+  });
+  if (x3 > 0) TAKE.forEach(({ p, to }) => strokeArc(g, G, G.R, p.u - p.len * x3, p.u, C.srv[to.s], G.band, 0.62));
+
+  // act 1: one point per server
+  const out1 = E.inCubic(prog(f, T.a2 + 4, T.a2 + 16));
+  R1.P.forEach(p => {
+    const t = T.srv + 8 * p.s, a = E.outBack(prog(f, t, t + 12));
+    if (f < t || out1 >= 1) return;
+    const [x, y] = onRing(G, p.u, G.R);
+    const fl = 1 - prog(f, t, t + 14);                       // pop ring
+    if (fl > 0) { g.save(); g.globalAlpha = fl * 0.7; g.strokeStyle = C.srv[p.s]; g.lineWidth = 3; g.beginPath(); g.arc(x, y, G.dot + (1 - fl) * 40, 0, Math.PI * 2); g.stroke(); g.restore(); }
+    dot(g, x, y, G.dot * Math.max(0, a), C.srv[p.s], 1 - out1, 4);
+    const [lx, ly] = onRing(G, p.u, G.R - G.srvIn);
+    text(g, SERVERS[p.s], lx, ly + G.srvSize * 0.35, { size: G.srvSize, weight: 800, color: C.srv[p.s], align: 'center', alpha: clamp(a) * (1 - out1) });
+  });
+
+  // act 2: virtual points bloom
+  R2.P.forEach(p => {
+    const t = tV(p); if (f < t) return;
+    const a = E.outBack(prog(f, t, t + 10));
+    let col = C.srv[p.s], alpha = 1, len = G.tick * Math.max(0, a);
+    if (p.s === DEAD && f >= T.down) {                       // alpha goes down: flash, then fade
+      const u = prog(f, T.down, T.down + 18);
+      col = u < 0.3 ? C.hot : C.srv[p.s]; alpha = 1 - E.inCubic(u); len *= 1 + 0.4 * Math.sin(Math.PI * Math.min(1, u * 2));
+    }
+    if (alpha <= 0.01) return;
+    const [x0, y0] = onRing(G, p.u, G.R - len), [x1, y1] = onRing(G, p.u, G.R + len);
+    g.save(); g.globalAlpha = alpha; g.strokeStyle = col; g.lineWidth = G.tickW; g.lineCap = 'round';
+    g.beginPath(); g.moveTo(x0, y0); g.lineTo(x1, y1); g.stroke(); g.restore();
+    const fl = 1 - prog(f, t, t + 12);
+    if (fl > 0) { const [x, y] = onRing(G, p.u, G.R); g.save(); g.globalAlpha = fl * 0.5; g.strokeStyle = col; g.lineWidth = 2; g.beginPath(); g.arc(x, y, 4 + (1 - fl) * 22, 0, Math.PI * 2); g.stroke(); g.restore(); }
+  });
+
+  // the keys: walks (inside the ring), dots on it, labels outside
+  const fade1 = 1 - prog(f, T.rec2 - 8, T.rec2 + 4);
+  KEYS.forEach((key, k) => {
+    const d0 = K1[k].drop; if (f < d0) return;
+    const ku = KU[k], a = E.outBack(prog(f, d0, d0 + 10));
+    // act 1 walk
+    const o1 = R1.own[k], w1 = E.inOutCubic(prog(f, K1[k].go, K1[k].land));
+    if (fade1 > 0) walk(g, G, ku, o1.d * w1, o1.lane, C.srv[o1.s], fade1, w1 < 1);
+    // act 2 walk (and act 3 extension for the keys that move)
+    const o2 = R2.own[k], w2 = E.inOutCubic(prog(f, K2[k].go, K2[k].land));
+    if (f >= K2[k].go) {
+      let d = o2.d * w2, col = C.srv[o2.s], head = w2 < 1;
+      if (K3[k]) {
+        const o3 = R3.own[k], w3 = E.inOutCubic(prog(f, K3[k].go, K3[k].land)), orphan = prog(f, T.down, T.down + 10);
+        if (f >= T.down) col = C.hot;
+        if (f >= K3[k].go) { d = lerp(o2.d, o3.d, w3); head = w3 < 1; if (w3 >= 1) col = C.srv[o3.s]; }
+        if (f >= T.down && f < K3[k].go) col = orphan > 0.5 ? C.hot : C.srv[o2.s];
+      }
+      walk(g, G, ku, d, o2.lane, col, 1, head);
+    }
+    const own = keyOwner(k, f), col = own < 0 ? (K3[k] && f >= T.down ? C.hot : C.paper) : C.srv[own];
+    const [x, y] = onRing(G, ku, G.R);
+    let bump = 1;
+    for (const t of [K1[k].land, K2[k].land, K3[k] ? K3[k].land : -99]) bump += 0.5 * Math.sin(Math.PI * prog(f, t, t + 8));
+    if (K3[k] && f >= K3[k].land) { g.save(); g.globalAlpha = E.outCubic(prog(f, K3[k].land, K3[k].land + 10)); g.strokeStyle = C.hot; g.lineWidth = 3; g.beginPath(); g.arc(x, y, G.kdot * 2.2, 0, Math.PI * 2); g.stroke(); g.restore(); }
+    dot(g, x, y, G.kdot * Math.max(0, a) * bump, col, 1, 3);
+    keyLabel(g, G, key, ku, col === C.paper ? C.paper : col, clamp(a * 1.5), own < 0 && !(K3[k] && f >= T.down));
+  });
+}
+/** A key's walk: an arc just inside the ring from the key clockwise by d turns; a bright head while it moves. */
+function walk(g, G, ku, d, lane, col, alpha, head) {
+  if (d <= 1e-4 || alpha <= 0.01) return;
+  const r = G.R - G.lane0 - lane * G.laneW;
+  strokeArc(g, G, r, ku, ku + d, col, G.walkW, 0.9 * alpha);
+  if (head) { const [x, y] = onRing(G, ku + d, r); dot(g, x, y, G.walkW * 1.6, col, alpha); }
+}
+function keyLabel(g, G, str, u, col, alpha, pale) {
+  const s = Math.sin(u * Math.PI * 2), c = Math.cos(u * Math.PI * 2);
+  let [x, y] = onRing(G, u, G.R + G.klbl);
+  const align = s > 0.3 ? 'left' : s < -0.3 ? 'right' : 'center';
+  if (align === 'center') y -= c * G.kSize * 0.45;
+  text(g, str, x, y + G.kSize * 0.36, { size: G.kSize, weight: 700, color: col, align, alpha: alpha * (pale ? 0.75 : 1), fam: MONO });
+}
+/** The big number in the middle of the ring, with a caption. */
+function center(g, G, f, num, cap, t0, t1, col = C.paper) {
+  const [a, dy] = env(f, t0, t1, 12, 10);
+  if (a <= 0) return;
+  text(g, num, G.cx, G.cy + G.cBig * 0.18 + dy, { size: G.cBig, weight: 900, color: col, spacing: -3, align: 'center', alpha: a });
+  cap.forEach((ln, i) => text(g, ln, G.cx, G.cy + G.cBig * 0.18 + G.cCap * 1.5 + i * G.cCap * 1.2 + dy, { size: G.cCap, weight: 650, color: C.dim, align: 'center', alpha: a }));
+}
+function drawCenter(g, G, f) {
+  center(g, G, f, '4', G.capShort ? ['points'] : ['points', 'on the ring'], T.srv + 30, T.a2 + 10);
+  const shown = VPTS.reduce((n, p) => n + (f >= tV(p) ? 1 : 0), 0);
+  const left = VPTS.reduce((n, p) => n + (p.s === DEAD && f >= T.down + 9 ? 0 : 1), 0);
+  center(g, G, f, String(Math.min(shown, left)), G.capShort ? ['points'] : ['points', 'on the ring'], T.bloom, T.down + 20);
+  const moved = MOVED.filter(k => f >= K3[k].land).length;
+  center(g, G, f, `${moved}`, [`of ${KEYS.length} keys`, 'moved'], T.down + 22, 1e9, moved ? C.ok : C.paper);
+}
+/** The panel: one row per server (name, key pips, share, bar with the fair-share mark). */
+function drawPanel(g, G, f) {
+  const a0 = E.outCubic(prog(f, T.srv, T.srv + 24));
+  if (a0 <= 0) return;
+  const bw = G.pw, scale = bw / 0.6;                         // the bar spans 0..60 %
+  SERVERS.forEach((name, s) => {
+    const y = G.rowY + s * G.rowH, ra = E.outBack(prog(f, T.srv + 8 * s, T.srv + 8 * s + 14));
+    const dead = s === DEAD ? prog(f, T.down, T.down + 14) : 0, al = clamp(ra) * (1 - 0.6 * dead);
+    const dx = (1 - clamp(ra)) * 30;
+    text(g, name, G.px + dx, y, { size: G.rowSize, weight: 800, color: C.srv[s], alpha: al });
+    if (dead > 0) { g.save(); g.globalAlpha = dead; g.fillStyle = C.hot; g.font = `800 ${G.rowSize}px ${FONT}`; g.fillRect(G.px - 6, y - G.rowSize * 0.34, (g.measureText(name).width + 12) * dead, 4); g.restore(); }
+    const sh = shareAt(s, f);
+    text(g, pct(sh), G.px + bw, y, { size: G.rowSize, weight: 700, color: C.paper, align: 'right', alpha: al, fam: MONO });
+    // key pips
+    const n = KEYS.reduce((c, _, k) => c + (keyOwner(k, f) === s ? 1 : 0), 0);
+    for (let q = 0; q < n; q++) dot(g, G.px + G.nameW + 10 + q * G.pip * 2.8, y - G.rowSize * 0.34, G.pip, C.srv[s], al);
+    // bar
+    g.save(); g.globalAlpha = al * 0.25; g.fillStyle = C.paper; g.fillRect(G.px, y + G.barDy, bw, G.barH); g.restore();
+    g.save(); g.globalAlpha = al; g.fillStyle = C.srv[s]; g.fillRect(G.px, y + G.barDy, Math.min(bw, sh * scale), G.barH); g.restore();
+  });
+  // the fair-share mark, 25 %
+  const fx = G.px + 0.25 * scale, y0 = G.rowY - G.rowSize, y1 = G.rowY + 3 * G.rowH + G.barDy + G.barH + 8;
+  g.save(); g.globalAlpha = a0 * 0.7; g.strokeStyle = C.paper; g.lineWidth = 2; g.setLineDash([6, 6]);
+  g.beginPath(); g.moveTo(fx, y0 + G.rowSize * 0.6); g.lineTo(fx, y1); g.stroke(); g.restore();
+  text(g, '25% each', fx + 10, y1 + G.small * 0.9, { size: G.small, weight: 600, color: C.dim, alpha: a0 });
+  g.setLineDash([]);
+}
+/** The results: max / min share after act 1 and act 2, then hash mod N in act 3. */
+function drawResults(g, G, f) {
+  const y = G.resY;
+  let [a, dy] = env(f, T.res1, T.rec2, 12, 10);
+  if (a > 0) {
+    text(g, 'max / min ring share', G.px, y + dy, { size: G.small, weight: 600, color: C.dim, alpha: a });
+    const w = text(g, `${pct(R1.max)} / ${pct(R1.min)}`, G.px, y + G.resBig + 6 + dy, { size: G.resBig, weight: 800, color: C.hot, alpha: a, fam: MONO });
+    text(g, `${(R1.max / R1.min).toFixed(1)}× apart`, G.px + w + 20, y + G.resBig + 6 + dy, { size: G.small, weight: 700, color: C.dim, alpha: a });
+  }
+  [a, dy] = env(f, T.res2, T.down, 12, 10);
+  if (a > 0) {
+    text(g, 'max / min ring share', G.px, y + dy, { size: G.small, weight: 600, color: C.dim, alpha: a });
+    const w = text(g, `${pct(R2.max)} / ${pct(R2.min)}`, G.px, y + G.resBig + 6 + dy, { size: G.resBig, weight: 800, color: C.ok, alpha: a, fam: MONO });
+    text(g, `was ${pct(R1.max)} / ${pct(R1.min)}`, G.px + w + 20, y + G.resBig + 6 + dy, { size: G.small, weight: 600, color: C.dim, alpha: a });
+  }
+  [a, dy] = env(f, T.modN, 1e9, 12, 10);
+  if (a > 0) {
+    text(g, 'naive: hash(key) mod N,  N 4 → 3', G.px, y + dy, { size: G.small, weight: 600, color: C.dim, alpha: a });
+    const cy = y + 18 + dy, cs = G.chip, gap = (G.pw - 12 * cs) / 11;
+    let n = 0;
+    MODN.forEach((m, k) => {
+      const t = T.chips + 4 * k, flip = prog(f, t, t + 6), moved = m.a !== m.b;
+      if (flip >= 1 && moved) n++;
+      const x = G.px + k * (cs + gap), lift = moved ? Math.sin(Math.PI * prog(f, t, t + 10)) * 8 : 0;
+      g.save(); g.globalAlpha = a; g.fillStyle = C.srv[flip >= 0.5 ? m.b : m.a];
+      g.fillRect(x, cy - lift, cs, cs);
+      if (moved && flip > 0) { g.globalAlpha = a * flip; g.strokeStyle = C.hot; g.lineWidth = 3; g.strokeRect(x - 4, cy - lift - 4, cs + 8, cs + 8); }
+      g.restore();
+    });
+    text(g, `${n} of ${KEYS.length} keys move`, G.px, cy + cs + G.resBig * 0.84 + G.countDy, { size: G.resBig * 0.84, weight: 800, color: C.hot, alpha: a });
+  }
+}
+/** Everything but the hook and the closing card. */
+function scene(g, G, f) {
+  drawRing(g, G, f);
+  drawCenter(g, G, f);
+  drawPanel(g, G, f);
+  drawResults(g, G, f);
+  const hy = G.capY + (G.capOne ? 0 : G.capLh) + G.subDy;
+  headline(g, G, f, ['Servers and keys', 'share one ring.'], T.ring + 6, T.a2);
+  subline(g, G, f, 'each key walks clockwise to the next server', hy, T.key1 - 10, T.a2);
+  headline(g, G, f, ['Give each server', `${V} virtual points.`], T.a2 + 2, T.a3);
+  subline(g, G, f, `vn0-alpha  …  vn${V - 1}-alpha`, hy, T.bloom + 8, T.a3, C.dim, MONO);
+  headline(g, G, f, ['alpha goes down.'], T.a3 + 2, T.outro, C.paper);
+  subline(g, G, f, 'its keys walk on to the next point', G.capY + G.subDy, T.rec3, T.outro);
+  headline(g, G, f, ['Only alpha’s keys', 'had to move.'], T.outro + 2, 1e9);
+}
+function backdrop(g, w, h) {
+  g.fillStyle = C.bg; g.fillRect(0, 0, w, h);
+  g.fillStyle = 'rgba(241,236,227,0.03)';                    // a quiet dot grid
+  for (let y = 24; y < h; y += 48) for (let x = 24; x < w; x += 48) g.fillRect(x, y, 2, 2);
+}
+
+// ---- landscape picture ------------------------------------------------------------------
+const GL = { cx: 620, cy: 585, R: 330, band: 12, dot: 13, srvIn: 138, srvSize: 34, tick: 15, tickW: 3, kdot: 7, klbl: 26, kSize: 30,
+  lane0: 22, laneW: 9, walkW: 4, small: 30, cBig: 120, cCap: 32,
+  px: 1180, pw: 640, capY: 250, cap: 64, capLh: 74, capOne: false, sub: 30, subDy: 56,
+  rowY: 470, rowH: 98, rowSize: 38, nameW: 150, pip: 8, barDy: 22, barH: 9, resY: 872, resBig: 56, chip: 40, countDy: 14 };
+function hookL(f) {
+  const o = 1 - E.inCubic(prog(f, T.hookOut - 12, T.hookOut));
+  if (o <= 0) return;
+  const k1 = E.outExpo(prog(f, -8, 10)), k2 = E.outExpo(prog(f, -4, 14)), k3 = E.outCubic(prog(f, 14, 28));
+  text(ctx, 'A server dies.', 120, 480 + (1 - k1) * 30, { size: 150, weight: 900, color: C.hot, spacing: -4, alpha: o * Math.max(0.3, k1) });
+  text(ctx, 'How many keys move?', 120, 630 + (1 - k2) * 30, { size: 112, weight: 850, color: C.paper, spacing: -3, alpha: o * Math.max(0.3, k2) });
+  text(ctx, `${SERVERS.length} servers  ·  ${KEYS.length} keys  ·  one hash ring`, 124, 740 + (1 - k3) * 16, { size: 40, weight: 600, color: C.dim, alpha: o * k3 });
+}
+function draw(f) {
+  if (ctx.reset) ctx.reset();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; ctx.filter = 'none'; ctx.shadowBlur = 0;
+  backdrop(ctx, W, H);
+  const endK = E.inOutCubic(prog(f, T.end, T.end + 20)), a = 1 - endK;
+  text(ctx, 'SYSTEMS  ·  CONSISTENT HASHING', 120, 104, { size: 26, weight: 600, color: C.dim, spacing: 5, alpha: a });
+  text(ctx, 'BYTEPATTERNS', 1800, 104, { size: 26, weight: 600, color: C.dim, spacing: 5, align: 'right', alpha: a });
+  hookL(f);
+  scene(ctx, GL, f);
+  if (endK > 0) {
+    ctx.fillStyle = `rgba(${C.bgRGB},${0.9 * endK})`; ctx.fillRect(0, 0, W, H);
+    const k1 = E.outCubic(prog(f, T.end + 6, T.end + 28)), k2 = E.outCubic(prog(f, T.end + 16, T.end + 38)), k3 = E.outCubic(prog(f, T.end + 26, T.end + 48));
+    text(ctx, 'Consistent Hashing', W / 2, 500 + (1 - k1) * 30, { size: 140, weight: 850, color: C.paper, spacing: -3, align: 'center', alpha: k1 });
+    text(ctx, `one server down: ${MOVED.length} of ${KEYS.length} keys move on the ring  ·  ${MODN_MOVED} of ${KEYS.length} with hash mod N`, W / 2, 580 + (1 - k2) * 20, { size: 42, weight: 500, color: C.srv[0], align: 'center', alpha: k2 });
+    text(ctx, 'drawn in code  ·  bytepatterns.com', W / 2, 1000, { size: 32, weight: 600, color: C.paper, spacing: 3, align: 'center', alpha: k3 * 0.8 });
+  }
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.letterSpacing = '0px'; ctx.setLineDash([]);
+}
+
+// ---- sound: a 112.5 BPM pulse; every point pops, every key lands with a tick panned by its place on the ring --------
+async function renderAudio() {
+  const SR = 48000, dur = FRAMES / FPS, LEN = Math.round(SR * dur);
+  const ac = new OfflineAudioContext(2, LEN, SR);
+  const comp = ac.createDynamicsCompressor();
+  comp.threshold.value = -14; comp.ratio.value = 3.5; comp.attack.value = 0.003; comp.release.value = 0.18;
+  const master = ac.createGain(); master.gain.value = 0.95; master.connect(comp).connect(ac.destination);
+  master.gain.setValueAtTime(0.95, dur - 0.8); master.gain.linearRampToValueAtTime(0.0001, dur - 0.02);
+  const rnd = mulberry32(0x27C4);
+  const ir = ac.createBuffer(2, SR * 1.8, SR);
+  for (let c = 0; c < 2; c++) { const d = ir.getChannelData(c); for (let k = 0; k < d.length; k++) d[k] = (rnd() * 2 - 1) * Math.pow(1 - k / d.length, 3.6); }
+  const verb = ac.createConvolver(); verb.buffer = ir; const vg = ac.createGain(); vg.gain.value = 0.26; verb.connect(vg).connect(master);
+  const noise = ac.createBuffer(1, SR * 2, SR); { const d = noise.getChannelData(0); for (let k = 0; k < d.length; k++) d[k] = rnd() * 2 - 1; }
+  const hz = m => 440 * Math.pow(2, (m - 69) / 12);
+  const out = (node, pan, wet = true) => { const p = ac.createStereoPanner(); p.pan.value = pan; node.connect(p); p.connect(master); if (wet) p.connect(verb); };
+  const kick = (t0, amp = 0.4) => { const o = ac.createOscillator(), g = ac.createGain();
+    o.frequency.setValueAtTime(130, t0); o.frequency.exponentialRampToValueAtTime(44, t0 + 0.13);
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(amp, t0 + 0.004); g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.28);
+    o.connect(g).connect(master); o.start(t0); o.stop(t0 + 0.3); };
+  const hat = (t0, amp = 0.04) => { const s = ac.createBufferSource(); s.buffer = noise; const hp = ac.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 7500;
+    const g = ac.createGain(); g.gain.setValueAtTime(amp, t0); g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.045);
+    s.connect(hp).connect(g).connect(master); s.start(t0, (t0 * 3.1) % 1.8, 0.06); };
+  const tick = (t0, m, pan, amp = 0.16) => { const o = ac.createOscillator(), g = ac.createGain(), bp = ac.createBiquadFilter();
+    o.type = 'triangle'; o.frequency.value = hz(m); bp.type = 'bandpass'; bp.frequency.value = hz(m) * 2; bp.Q.value = 1.4;
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(amp, t0 + 0.002); g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.09);
+    o.connect(bp).connect(g); out(g, pan); o.start(t0); o.stop(t0 + 0.12); };
+  const pluck = (t0, m, pan, amp = 0.16, dec = 0.5) => { for (const [r, a2] of [[1, 1], [2, 0.35], [3, 0.12]]) {
+    const o = ac.createOscillator(), g = ac.createGain(), lp = ac.createBiquadFilter(); o.type = 'sawtooth'; o.frequency.value = hz(m) * r;
+    lp.type = 'lowpass'; lp.frequency.setValueAtTime(hz(m) * 6, t0); lp.frequency.exponentialRampToValueAtTime(hz(m) * 1.2, t0 + dec);
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(amp * a2 * 0.5, t0 + 0.003); g.gain.exponentialRampToValueAtTime(0.0001, t0 + dec);
+    o.connect(lp).connect(g); out(g, pan); o.start(t0); o.stop(t0 + dec + 0.05); } };
+  const bell = (t0, m, amp, pn) => { for (const [r2, a2, d2] of [[1, 1, 1.6], [2.76, 0.3, 0.6], [5.4, 0.1, 0.25]]) {
+    const o = ac.createOscillator(); o.frequency.value = hz(m) * r2; const g = ac.createGain();
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(amp * a2, t0 + 0.004); g.gain.exponentialRampToValueAtTime(0.0001, t0 + d2);
+    o.connect(g); out(g, pn); o.start(t0); o.stop(t0 + d2 + 0.05); } };
+  const sweep = (t0, d, f0, f1, amp = 0.1, pan0 = 0, pan1 = 0, type = 'bandpass') => { const s = ac.createBufferSource(); s.buffer = noise; const bp = ac.createBiquadFilter(); bp.type = type; bp.Q.value = type === 'bandpass' ? 3 : 0.7;
+    bp.frequency.setValueAtTime(f0, t0); bp.frequency.exponentialRampToValueAtTime(f1, t0 + d);
+    const g = ac.createGain(), p = ac.createStereoPanner(); p.pan.setValueAtTime(pan0, t0); p.pan.linearRampToValueAtTime(pan1, t0 + d);
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(amp, t0 + Math.min(0.05, d * 0.3)); g.gain.exponentialRampToValueAtTime(0.0001, t0 + d);
+    s.connect(bp).connect(g).connect(p).connect(master); s.start(t0, (t0 * 1.7) % 0.8, d + 0.05); };
+  const thud = (t0, amp = 0.8) => { const o = ac.createOscillator(), g = ac.createGain();
+    o.frequency.setValueAtTime(88, t0); o.frequency.exponentialRampToValueAtTime(26, t0 + 0.7);
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(amp, t0 + 0.006); g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.9);
+    o.connect(g).connect(master); o.start(t0); o.stop(t0 + 0.95); };
+  const blip = (t0, m, pan, amp = 0.12) => { const o = ac.createOscillator(), g = ac.createGain();
+    o.type = 'sine'; o.frequency.setValueAtTime(hz(m), t0); o.frequency.exponentialRampToValueAtTime(hz(m + 12), t0 + 0.5);
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(amp, t0 + 0.03); g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.6);
+    o.connect(g); out(g, pan); o.start(t0); o.stop(t0 + 0.65); };
+  const NOTE = [72, 76, 79, 83];                            // a note per server: alpha, beta, gamma, delta
+  // the pulse and a bass line, from the ring to the closing card
+  const BASS = [38, 38, 41, 43, 38, 36, 34, 36];
+  for (let bar = 0; bar * BEAT * 4 < T.end + 10; bar++) {
+    const f0 = T.ring + bar * BEAT * 4, t0 = at(f0), o = ac.createOscillator(), g = ac.createGain(), lp = ac.createBiquadFilter();
+    const down = f0 >= T.down && f0 < T.modN;
+    o.type = 'sawtooth'; o.frequency.value = hz(BASS[bar % BASS.length] - (down ? 2 : 0)); lp.type = 'lowpass'; lp.frequency.value = 300;
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(0.09, t0 + 0.02); g.gain.exponentialRampToValueAtTime(0.0001, t0 + BEAT * 4 / FPS);
+    o.connect(lp).connect(g).connect(master); o.start(t0); o.stop(t0 + BEAT * 4 / FPS + 0.05);
+  }
+  for (let b = 0; T.ring + b * BEAT < T.end + 8; b++) { const t0 = at(T.ring + b * BEAT); kick(t0, b % 4 === 0 ? 0.5 : 0.34); hat(t0 + BEAT / 2 / FPS); }
+  // hook: a hit on "dies"
+  thud(0.02, 0.55); sweep(0.02, 0.8, 900, 160, 0.08, 0, 0, 'lowpass'); tick(at(14), 84, 0, 0.1);
+  sweep(at(T.ring), 28 / FPS, 500, 3000, 0.08, -0.7, 0.7);
+  // servers: one pluck each
+  R1.P.forEach(p => pluck(at(T.srv + 8 * p.s), NOTE[p.s] - 12, panOf(p.u), 0.2, 0.7));
+  // act 1 keys: a soft drop, then the landing tick on the owner's note, panned by where the key sits
+  KEYS.forEach((_, k) => { tick(at(K1[k].drop), 96, panOf(KU[k]), 0.05); tick(at(K1[k].land), NOTE[R1.own[k].s] + 12, panOf(KU[k]), 0.2); });
+  [0, 3, 6].forEach((d, i) => bell(at(T.res1) + i * 0.08, 60 + d, 0.06, -0.2 + i * 0.2));
+  // act 2: every fourth virtual point plucks, quietly, as the ring fills
+  VPTS.forEach(p => { if (p.i % 4 === 0) pluck(at(tV(p)), NOTE[p.s], panOf(p.h / TWO32), 0.07, 0.3); });
+  sweep(at(T.rec2), 0.7, 400, 2400, 0.06, 0.6, -0.6);
+  KEYS.forEach((_, k) => tick(at(K2[k].land), NOTE[R2.own[k].s] + 12, panOf(KU[k]), 0.18));
+  [0, 4, 7, 12].forEach((d, i) => bell(at(T.res2) + i * 0.07, 72 + d, 0.07, -0.3 + i * 0.2));
+  // act 3: the server goes down; its keys rise and land further on
+  thud(at(T.down), 0.9); sweep(at(T.down), 1.3, 2400, 120, 0.14, 0, 0, 'lowpass');
+  MOVED.forEach(k => { blip(at(K3[k].go), 67 + 3 * K3[k].m, panOf(KU[k]), 0.13); tick(at(K3[k].land), NOTE[R3.own[k].s] + 12, panOf(KU[k]), 0.22); });
+  // hash mod N: every chip flips; the ones that move buzz
+  MODN.forEach((m, k) => { const t0 = at(T.chips + 4 * k), pan = -0.7 + 1.4 * k / 11;
+    if (m.a !== m.b) { const o = ac.createOscillator(), g = ac.createGain(); o.type = 'square'; o.frequency.value = hz(50 + (k % 3));
+      const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 1400;
+      g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(0.06, t0 + 0.004); g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.12);
+      o.connect(lp).connect(g); out(g, pan, false); o.start(t0); o.stop(t0 + 0.14); }
+    else tick(t0, 88, pan, 0.06); });
+  kick(at(T.outro), 0.6);
+  // the closing chord
+  [62, 69, 74, 78, 81].forEach((m, i) => bell(at(T.end + 8 + i * 5), m, 0.08, -0.5 + i * 0.25));
+  const buf = await ac.startRendering();
+  let peak = 0; for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let k = 0; k < d.length; k++) peak = Math.max(peak, Math.abs(d[k])); }
+  if (peak > 0.89) for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let k = 0; k < d.length; k++) d[k] *= 0.89 / peak; }
+  return buf;
+}
+
+/* ==========================================================================
+   VERTICAL CUT — shared block, identical in every piece.
+   1080x1920 for Reels, Shorts and TikTok (__motion.variants.vertical). The
+   piece's own scene code is re-used and recomposed for a phone: everything a
+   viewer must read stays inside the area no platform covers (x 60..900,
+   y 230..1400); outside it there is only dimmed texture.
+   ========================================================================== */
+const VW = 1080, VH = 1920, SAFE = { x: 60, y: 230, w: 840, h: 1170, r: 900, b: 1400 };
+const vcv = document.createElement('canvas'); vcv.width = VW; vcv.height = VH;
+const vx = vcv.getContext('2d', { willReadFrequently: true });   // CPU raster: identical pixels on every redraw
+const VL = 96, VR = 864;                                          // text column inside the safe area
+
+function vReset() {
+  vx.setTransform(1, 0, 0, 1, 0, 0); vx.globalAlpha = 1; vx.globalCompositeOperation = 'source-over';
+  vx.filter = 'none'; vx.shadowBlur = 0; vx.shadowColor = 'transparent'; vx.letterSpacing = '0px'; vx.setLineDash([]);
+  vx.textAlign = 'left'; vx.textBaseline = 'alphabetic'; vx.lineCap = 'butt'; vx.lineJoin = 'miter';
+}
+/** Canvas text on the vertical frame; `max` shrinks the size until the line fits. */
+function vText(str, x, y, { size = 40, weight = 700, color = '#FFFFFF', align = 'left', spacing = 0, alpha = 1, fam = FONT, max = 0 } = {}) {
+  if (alpha <= 0.002 || !str) return size;
+  vx.font = `${weight} ${size}px ${fam}`; vx.letterSpacing = spacing + 'px';
+  if (max) { const w = vx.measureText(str).width; if (w > max) { size = size * max / w; vx.font = `${weight} ${size}px ${fam}`; } }
+  vx.textAlign = align; vx.textBaseline = 'alphabetic';
+  const a0 = vx.globalAlpha; vx.globalAlpha = a0 * alpha; vx.fillStyle = color;
+  vx.fillText(str, x + (align === 'center' ? spacing / 2 : align === 'right' ? spacing : 0), y);   // tracking is added after the last glyph too
+  vx.globalAlpha = a0; vx.letterSpacing = '0px';
+  return size;
+}
+/** Word-wraps with the given font; returns the lines. */
+function vWrap(str, maxW, size, weight = 700, fam = FONT) {
+  vx.font = `${weight} ${size}px ${fam}`; vx.letterSpacing = '0px';
+  const words = str.split(' '), lines = []; let cur = '';
+  for (const w of words) { const t = cur ? cur + ' ' + w : w; if (vx.measureText(t).width > maxW && cur) { lines.push(cur); cur = w; } else cur = t; }
+  if (cur) lines.push(cur);
+  return lines;
+}
+/** Fade envelope with a small rise: [alpha, dy]. */
+function vEnv(v, a, b, fin = 8, fout = 8) {
+  const i = E.outCubic(prog(v, a, a + fin)), o = 1 - E.inCubic(prog(v, b - fout, b));
+  return [Math.min(i, o), (1 - i) * 22 - (1 - o) * 10];
+}
+/** Which segment of a cut list a vertical frame is in: segs = [{ at, src, len }] in frames. */
+function vSeg(segs, v) {
+  let k = 0; while (k < segs.length - 1 && v >= segs[k + 1].at) k++;
+  const s = segs[k];
+  return { k, s, local: v - s.at, src: s.src + (v - s.at) };
+}
+/** Dims everything outside the safe area to a quiet texture (brightness x 0.2), with a soft inner edge. */
+function vShade(rgb, a = 0.8, feather = 40) {
+  vx.save(); vx.setTransform(1, 0, 0, 1, 0, 0); vx.globalAlpha = 1; vx.globalCompositeOperation = 'source-over';
+  vx.fillStyle = `rgba(${rgb},${a})`;
+  vx.beginPath(); vx.rect(0, 0, VW, VH); vx.rect(SAFE.x, SAFE.y, SAFE.w, SAFE.h); vx.fill('evenodd');
+  const strip = (x0, y0, x1, y1, rx, ry, rw, rh) => {
+    const g = vx.createLinearGradient(x0, y0, x1, y1);
+    g.addColorStop(0, `rgba(${rgb},${a})`); g.addColorStop(1, `rgba(${rgb},0)`);
+    vx.fillStyle = g; vx.fillRect(rx, ry, rw, rh);
+  };
+  strip(SAFE.x, 0, SAFE.x + feather, 0, SAFE.x, SAFE.y, feather, SAFE.h);
+  strip(SAFE.r, 0, SAFE.r - feather, 0, SAFE.r - feather, SAFE.y, feather, SAFE.h);
+  strip(0, SAFE.y, 0, SAFE.y + feather, SAFE.x, SAFE.y, SAFE.w, feather);
+  strip(0, SAFE.b, 0, SAFE.b - feather, SAFE.x, SAFE.b - feather, SAFE.w, feather);
+  vx.restore();
+}
+/** Series tag at the top of the safe area, e.g. MADE IN CODE · 04. */
+function vTag(label, color, alpha = 1) {
+  vText('MADE IN CODE', VL, 292, { size: 28, weight: 800, color, spacing: 5, alpha });
+  vx.font = `800 28px ${FONT}`; vx.letterSpacing = '5px';
+  const w = vx.measureText('MADE IN CODE').width; vx.letterSpacing = '0px';
+  vText('·  ' + label, VL + w + 14, 292, { size: 28, weight: 600, color: 'rgba(255,255,255,0.72)', spacing: 3, alpha, max: VR - VL - w - 14 });
+}
+/** Big hook lines, left-aligned from y0; visible from frame 0, settles in a few frames. */
+function vHook(v, lines, y0, { size = 84, lh = 1.08, color = '#FFFFFF', accent = null, weight = 800, spacing = -1.5, alpha = 1 } = {}) {
+  const k = E.outExpo(prog(v, -6, 12));
+  lines.forEach((ln, i) => {
+    const kk = E.outExpo(prog(v, -12 + i * 2, 8 + i * 2));
+    vText(ln, VL, y0 + i * size * lh + (1 - kk) * 30, { size, weight, spacing, color: accent && i === lines.length - 1 ? accent : color, alpha: alpha * Math.max(0.25, kk), max: VR - VL });
+  });
+  return k;
+}
+/** Closing card, the last 60 frames: piece title, "drawn in code · bytepatterns.com". l = frames into the card. */
+function vEndCard(l, { title, line = '', ink = '#FFFFFF', dim = 'rgba(255,255,255,0.66)', accent = '#FFFFFF', scrim = '0,0,0', a = 0.84 }) {
+  const k = E.outCubic(prog(l, 0, 12));
+  vx.save(); vx.setTransform(1, 0, 0, 1, 0, 0);
+  vx.fillStyle = `rgba(${scrim},${a * k})`; vx.fillRect(0, 0, VW, VH);
+  vx.restore();
+  const t1 = E.outExpo(prog(l, 3, 19)), t2 = E.outExpo(prog(l, 11, 27)), t3 = E.outExpo(prog(l, 19, 35));
+  vx.fillStyle = accent; vx.globalAlpha = t1; vx.fillRect(VL, 742, 88 * t1, 7); vx.globalAlpha = 1;
+  const size = vText(title, VL, 850 + (1 - t1) * 40, { size: 92, weight: 800, color: ink, spacing: -2, alpha: t1, max: VR - VL });
+  const y2 = 850 + Math.max(size, 60) * 0.25 + 70;
+  vx.font = `600 44px ${FONT}`;
+  const lead = 'drawn in code  ·  ', lw = vx.measureText(lead).width;
+  vText(lead, VL, y2 + (1 - t2) * 24, { size: 44, weight: 600, color: dim, alpha: t2 });
+  vText('bytepatterns.com', VL + lw, y2 + (1 - t2) * 24, { size: 44, weight: 800, color: accent, alpha: t2 });
+  if (line) vText(line, VL, y2 + 72 + (1 - t3) * 18, { size: 32, weight: 500, color: dim, alpha: t3, max: VR - VL });
+}
+/** Seeks a cut. The first frame a page draws is drawn twice: the very first read of a
+ *  GPU-backed source canvas can come out a shade different from every later one. */
+let vWarm = false;
+function vSeek(draw, i, frames) {
+  const f = Math.max(0, Math.min(frames - 1, Math.floor(i)));
+  if (!vWarm) { vWarm = true; draw(f); }
+  draw(f);
+}
+/** The soundtrack of a cut: the piece's own audio() spliced to the same segments as the picture. */
+async function vAudio(segs, frames, { xf = 0.025, fadeOut = 0.6, extra = null } = {}) {
+  const src = await renderAudio();
+  const SR = 48000, dur = frames / FPS, ac = new OfflineAudioContext(2, Math.round(SR * dur), SR);
+  const out = ac.createGain(); out.connect(ac.destination);
+  out.gain.setValueAtTime(1, 0); out.gain.setValueAtTime(1, dur - fadeOut); out.gain.linearRampToValueAtTime(0, dur - 0.01);
+  segs.forEach((s, k) => {
+    const at = s.at / FPS, off = s.src / FPS, d = s.len / FPS;
+    const pre = k === 0 ? 0 : Math.min(xf, off), post = k === segs.length - 1 ? 0 : xf;
+    const b = ac.createBufferSource(), g = ac.createGain(); b.buffer = src;
+    g.gain.setValueAtTime(pre ? 0 : 1, at - pre);
+    if (pre) g.gain.linearRampToValueAtTime(1, at + pre);
+    if (post) { g.gain.setValueAtTime(1, at + d - post); g.gain.linearRampToValueAtTime(0, at + d + post); }
+    b.connect(g).connect(out); b.start(at - pre, off - pre, d + pre + post);
+  });
+  if (extra) extra(ac, out);
+  const buf = await ac.startRendering();
+  let peak = 0; for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) peak = Math.max(peak, Math.abs(d[i])); }
+  if (peak > 0.9) for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) d[i] *= 0.9 / peak; }
+  return buf;
+}
+/** A soft three-partial bell, for the closing card. */
+function vChime(ac, dest, at, freq, vol = 0.08) {
+  for (const [mul, v, dec] of [[1, 1, 1.8], [2.01, 0.35, 0.8], [3.02, 0.12, 0.4]]) {
+    const o = ac.createOscillator(), g = ac.createGain(); o.type = 'sine'; o.frequency.value = freq * mul;
+    g.gain.setValueAtTime(0.0001, at); g.gain.exponentialRampToValueAtTime(vol * v, at + 0.006); g.gain.exponentialRampToValueAtTime(0.0001, at + dec);
+    o.connect(g).connect(dest); o.start(at); o.stop(at + dec + 0.05);
+  }
+}
+
+/* VERTICAL CUT — this piece */
+// The same ring and panel, laid out again for a phone: the ring smaller and
+// centred, the rows and the results stacked under it. The holds between the
+// acts are cut, so the soundtrack is spliced from the same frames.
+const VHOOK = 40;
+const VSEG = [
+  { at: 0, src: 0, len: VHOOK },                             // hook: a server dies
+];
+[[T.ring + 24, T.res1 + 16], [T.a2 + 2, T.res2 + 20], [T.a3, T.chips + 4 * (KEYS.length - 1) + 22]].forEach(([a, b]) => {
+  const last = VSEG[VSEG.length - 1];
+  VSEG.push({ at: last.at + last.len, src: a, len: b - a });
+});
+{ const last = VSEG[VSEG.length - 1]; VSEG.push({ at: last.at + last.len, src: T.end + 2, len: 60 }); }   // closing card
+const VFR = VSEG[VSEG.length - 1].at + 60, VEND = VFR - 60;
+const GV = { cx: 480, cy: 720, R: 205, band: 9, dot: 10, srvIn: 76, srvSize: 28, tick: 11, tickW: 3, kdot: 6, klbl: 22, kSize: 28,
+  lane0: 16, laneW: 6, walkW: 3, small: 28, cBig: 84, cCap: 28,
+  px: VL, pw: VR - VL, capY: 390, cap: 52, capLh: 60, capOne: true, sub: 28, subDy: 44,
+  rowY: 1018, rowH: 52, rowSize: 30, nameW: 118, pip: 6, barDy: 14, barH: 7, resY: 1264, resBig: 44, chip: 32, countDy: 4, capShort: true };
+function hookV(v) {
+  const o = 1 - E.inCubic(prog(v, VHOOK - 10, VHOOK));
+  vHook(v, ['A server dies.'], 640, { size: 112, color: C.hot, weight: 900, spacing: -3, alpha: o });
+  vHook(v, ['How many keys', 'move?'], 790, { size: 96, color: C.paper, weight: 850, spacing: -2, alpha: o });
+  const k3 = E.outCubic(prog(v, 10, 22));
+  vText(`${SERVERS.length} servers  ·  ${KEYS.length} keys  ·  one ring`, VL, 1040 + (1 - k3) * 16, { size: 36, weight: 600, color: C.dim, alpha: o * k3, max: VR - VL });
+}
+function vDraw(v) {
+  const { k: seg, src } = vSeg(VSEG, v), f = Math.min(FRAMES - 1, src);
+  vReset();
+  backdrop(vx, VW, VH);
+  if (seg === 0) hookV(v);
+  else scene(vx, GV, f);
+  vReset();
+  vShade(C.bgRGB, 0.84);
+  vTag('CONSISTENT HASHING', C.srv[0]);
+  if (v >= VEND) vEndCard(v - VEND, { title: 'Consistent Hashing', line: `one server down: ${MOVED.length} of ${KEYS.length} keys move  ·  mod N: ${MODN_MOVED}`,
+    ink: C.paper, dim: 'rgba(241,236,227,0.72)', accent: C.srv[0], scrim: C.bgRGB, a: 0.9 });
+  vReset();
+}
+
+window.__motion = {
+  title: 'Consistent Hashing',
+  description: `Four servers and ${KEYS.length} keys hashed onto one ring with 32-bit FNV-1a: one point per server gives shares from ${pct(R1.min)} to ${pct(R1.max)}, ${V} virtual points each bring them to ${pct(R2.min)}..${pct(R2.max)}, and when one server goes down ${MOVED.length} of ${KEYS.length} keys move, against ${MODN_MOVED} with hash mod N.`,
+  fps: FPS, width: W, height: H, frames: FRAMES,
+  poster: T.chips + 60,
+  gifStart: 10,
+  seek(i) { draw(Math.max(0, Math.min(FRAMES - 1, Math.floor(i)))); },
+  audio: renderAudio,
+  variants: {
+    vertical: {
+      width: VW, height: VH, frames: VFR, canvas: vcv,
+      poster: VEND - 12, gifStart: 8,
+      seek(i) { vSeek(vDraw, i, VFR); },
+      audio: () => vAudio(VSEG, VFR),
+    },
+  },
+};
+
+/* ==========================================================================
+   PLAYER — identical in every piece; keep as is.
+   Autoplays and loops, starts sound on the first click, ?frame=N pauses on a
+   frame, ?variant=vertical plays the vertical cut (if the piece has one).
+   When the renderer sets window.__MOTION_RENDER__ it stays out of the way.
+   ========================================================================== */
+(function player() {
+  const btn = document.getElementById('sound'), q = new URLSearchParams(location.search);
+  let M = window.__motion;
+  const V = !window.__MOTION_RENDER__ && M.variants && M.variants[q.get('variant')];
+  if (V) {                                                // show the variant's own canvas instead
+    M = Object.assign({}, M, V);
+    V.canvas.style.cssText = `width:min(100vw,calc(100vh*${V.width}/${V.height}));height:auto;aspect-ratio:${V.width}/${V.height}`;
+    document.querySelector('canvas').replaceWith(V.canvas);
+  }
+  const dur = M.frames / M.fps;
+  if (window.__MOTION_RENDER__) { btn.hidden = true; M.seek(0); return; }
+  if (q.has('frame')) { btn.hidden = true; M.seek(+q.get('frame') || 0); return; }
+  let t0 = performance.now(), ac = null, src = null, buf = null, paused = false, pausedAt = 0;
+  const clock = () => ac && src ? (ac.currentTime - t0) : (performance.now() - t0) / 1000;
+  function loop() {
+    if (!paused) M.seek(Math.floor(((clock() % dur) + dur) % dur * M.fps));
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+  btn.addEventListener('click', async () => {
+    if (src) { src.stop(); src = null; btn.textContent = 'Click for sound'; t0 = performance.now(); return; }
+    btn.textContent = 'Loading sound…';
+    ac = ac || new AudioContext({ sampleRate: 48000 });
+    buf = buf || await M.audio();
+    await ac.resume();
+    src = ac.createBufferSource(); src.buffer = buf; src.loop = true; src.connect(ac.destination);
+    t0 = ac.currentTime + 0.05; src.start(t0);        // picture restarts from frame 0 in sync with the sound
+    btn.textContent = 'Sound on — click to mute';
+  });
+  addEventListener('keydown', e => {
+    if (e.code !== 'Space') return;
+    e.preventDefault(); paused = !paused;
+    if (ac) paused ? ac.suspend() : ac.resume();
+    if (!ac) { if (paused) pausedAt = performance.now(); else t0 += performance.now() - pausedAt; }
+  });
+})();
+</script>
+</body>
+</html>

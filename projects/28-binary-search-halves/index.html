@@ -1,0 +1,672 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="author" content="teambytepatterns">
+<meta name="description" content="Kinetic type: binary search finds a hidden number between 1 and 1,000,000 in 20 guesses, halving what is left with every guess while the number line zooms in to keep up.">
+<title>Binary Search Halves It — motion-lab</title>
+<style>
+  /* Player chrome. The piece itself lives entirely in the canvas. */
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  body { display: grid; place-items: center; font: 500 15px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #fff; }
+  canvas { display: block; width: min(100vw, calc(100vh * 16 / 9)); height: auto; aspect-ratio: 16 / 9; }
+  #sound { position: fixed; left: 16px; bottom: 16px; padding: 8px 14px; border: 1px solid rgba(255,255,255,.35); border-radius: 999px;
+           background: rgba(0,0,0,.55); color: #fff; font: inherit; cursor: pointer; }
+  #sound[hidden] { display: none; }
+</style>
+</head>
+<body>
+<canvas id="stage" width="1920" height="1080" aria-label="Kinetic type: a huge count of the numbers still possible halves from 1,000,000 to 1 while a number line zooms in on a hidden number, guess by guess"></canvas>
+<button id="sound" type="button">Click for sound</button>
+<script>
+'use strict';
+/* ==========================================================================
+   PIECE — Binary Search Halves It.
+   "I'm thinking of a number between 1 and 1,000,000." A hidden target is
+   picked at load by a seeded PRNG among the targets that the textbook search
+   (lo, hi, mid = floor((lo + hi) / 2)) needs its full worst case of guesses
+   for. The search is run once, at load, and every probe is recorded.
+   Per probe: the guess drops onto the number line, "higher" or "lower"
+   throws half of the range away, the camera zooms so the half that is left
+   fills the bar again, and the huge count of numbers still possible slams
+   down to its new value (scale-slam with squash, a ghost of the old value).
+   The tempo speeds up in the middle and slows for the last three guesses.
+   Sound: 120 BPM; every halving is a kick plus a tick one step up a scale,
+   every zoom a whoosh, and the find a bell chord.
+   ========================================================================== */
+const W = 1920, H = 1080, FPS = 30;
+const cv = document.getElementById('stage');
+const ctx = cv.getContext('2d', { willReadFrequently: true });   // CPU raster: identical pixels on every redraw
+const FONT = 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
+const MONO = 'ui-monospace, "Cascadia Code", Consolas, Menlo, monospace';
+
+// ---- helpers -------------------------------------------------------------
+function mulberry32(a) { return function () { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a);
+  t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const lerp = (a, b, t) => a + (b - a) * t;
+const prog = (f, a, b) => clamp((f - a) / (b - a));
+const smooth = t => t * t * (3 - 2 * t);
+const E = {
+  inCubic: t => t * t * t,
+  outCubic: t => 1 - Math.pow(1 - t, 3),
+  inOutCubic: t => t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2,
+  outExpo: t => t === 1 ? 1 : 1 - Math.pow(2, -10 * t),
+  inExpo: t => t === 0 ? 0 : Math.pow(2, 10 * t - 10),
+  inOutExpo: t => t === 0 ? 0 : t === 1 ? 1 : t < .5 ? Math.pow(2, 20 * t - 10) / 2 : (2 - Math.pow(2, -20 * t + 10)) / 2,
+  outBack: t => 1 + 2.70158 * Math.pow(t - 1, 3) + 1.70158 * Math.pow(t - 1, 2),
+};
+function text(g, str, x, y, { size = 40, weight = 600, color = '#fff', alpha = 1, spacing = 0, align = 'left', fam = FONT, base = 'alphabetic' } = {}) {
+  if (alpha <= 0.002 || !str) return 0;
+  g.font = `${weight} ${size}px ${fam}`; g.letterSpacing = spacing + 'px';
+  g.textAlign = align; g.textBaseline = base;
+  const a0 = g.globalAlpha; g.globalAlpha = a0 * alpha; g.fillStyle = color;
+  g.fillText(str, x, y);
+  const w = g.measureText(str).width;
+  g.globalAlpha = a0; g.letterSpacing = '0px';
+  return w;
+}
+const env = (f, a, b, fin = 12, fout = 10) => {
+  const i = E.outCubic(prog(f, a, a + fin)), o = 1 - E.inCubic(prog(f, b - fout, b));
+  return [Math.min(i, o), (1 - i) * 24 - (1 - o) * 10];
+};
+/** Width of a string in a given font. */
+function mw(g, str, size, weight = 800, fam = FONT, spacing = 0) {
+  g.font = `${weight} ${size}px ${fam}`; g.letterSpacing = spacing + 'px';
+  const w = g.measureText(str).width; g.letterSpacing = '0px';
+  return w;
+}
+/** The largest size (<= size) at which str fits in maxW. */
+const fitSize = (g, str, size, maxW, weight = 800, fam = FONT, spacing = 0) => Math.min(size, size * maxW / Math.max(1, mw(g, str, size, weight, fam, spacing)));
+const fmt = n => String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+
+// ---- palette -------------------------------------------------------------
+const C = {
+  bg: '#0B1311', bgRGB: '11,19,17', paper: '#EEF1E8', dim: 'rgba(238,241,232,0.6)', faint: 'rgba(238,241,232,0.2)',
+  track: '#18231F', warm: '#FFB23E', cool: '#57D9C4',
+};
+
+// ---- the search, run once ------------------------------------------------------------
+const N = 1000000;
+const LOG2N = Math.log2(N), CEIL = Math.ceil(LOG2N), POW = Math.pow(2, CEIL);     // 19.93.., 20, 1,048,576
+/** Worst case of the search below: after a miss the larger half left has floor(n / 2) numbers. */
+const WORST = (() => { let n = N, k = 0; while (n > 0) { k++; n = Math.floor(n / 2); } return k; })();
+function runSearch(t) {
+  const s = []; let lo = 1, hi = N;
+  while (lo <= hi) {
+    const mid = Math.floor((lo + hi) / 2), size = hi - lo + 1;
+    if (mid === t) { s.push({ lo, hi, mid, size, dir: 'found', nlo: mid, nhi: mid }); break; }
+    if (t > mid) { s.push({ lo, hi, mid, size, dir: 'higher', nlo: mid + 1, nhi: hi }); lo = mid + 1; }
+    else { s.push({ lo, hi, mid, size, dir: 'lower', nlo: lo, nhi: mid - 1 }); hi = mid - 1; }
+  }
+  return s;
+}
+// The hidden number: scan a seeded PRNG until a target needs every one of the WORST guesses
+// (and the guesses go both ways, 7..12 of them "higher").
+const { TARGET, STEPS } = (() => {
+  const rnd = mulberry32(0x28B5EA);
+  let t = 1, s = runSearch(1);
+  for (let k = 0; k < 100000; k++) {
+    t = 1 + Math.floor(rnd() * N); s = runSearch(t);
+    const up = s.filter(x => x.dir === 'higher').length;
+    if (s.length === WORST && s[s.length - 1].size === 1 && up >= 7 && up <= 12) break;
+  }
+  return { TARGET: t, STEPS: s };
+})();
+const NS = STEPS.length;                                     // guesses it took (= WORST)
+const UPS = STEPS.filter(s => s.dir === 'higher').length, DOWNS = STEPS.filter(s => s.dir === 'lower').length;
+
+// ---- timeline (frames) ---------------------------------------------------------------
+const BEAT = 15;                                             // frames per beat (120 BPM)
+// beats per guess: slow, faster, a run of half beats in the middle, slow again for the last three
+const PB = [2, 2, 1, 1, 1, .5, .5, .5, .5, .5, .5, .5, .5, .5, .5, .5, .5, 2, 2, 2];
+const T = { slam: 30, hookOut: 72, setup: 66, bar: 75, num: 90, cnt: 96, s0: 120 };
+const PC = [], PH = [], PZ = [];                             // guess drops, halving (verdict), zoom done
+{ let acc = T.s0;
+  STEPS.forEach((s, k) => { const d = (PB[Math.min(k, PB.length - 1)]) * BEAT; PC.push(acc); PH.push(acc + d / 2); PZ.push(acc + d / 2 + Math.min(12, d / 2)); acc += d; }); }
+T.found = PH[NS - 1];
+T.outro = Math.round(T.found + 90);
+T.end = T.outro + 120;
+const FRAMES = T.end + 72;
+const curStep = f => { let k = -1; for (let j = 0; j < NS; j++) if (f >= PC[j]) k = j; return k; };
+const lastHalf = f => { let k = -1; for (let j = 0; j < NS; j++) if (f >= PH[j]) k = j; return k; };
+/** The camera: the part of the number line the bar shows at frame f (eased zoom per halving). */
+function view(f) {
+  const k = lastHalf(f);
+  if (k < 0) return [0.5, N + 0.5];
+  const s = STEPS[k], u = E.inOutCubic(prog(f, PH[k], PZ[k]));
+  if (s.dir === 'found') { const r = lerp(0.5, 4.5, E.inOutCubic(prog(f, T.found + 18, T.found + 42))); return [TARGET - r, TARGET + r]; }   // found: step back, one cell among its neighbours
+  return [lerp(s.lo - 0.5, s.nlo - 0.5, u), lerp(s.hi + 0.5, s.nhi + 0.5, u)];
+}
+
+// ---- drawing ------------------------------------------------------------------------
+/** The setup line, word by word; numbers in it are warm. */
+function caption(g, G, f, alpha) {
+  const dim = lerp(1, 0.62, prog(f, PC[0], PC[0] + 20)) * (1 - E.inCubic(prog(f, T.found, T.found + 10)));
+  let n = 0;
+  G.capLines.forEach((ln, li) => {
+    const words = ln.split(' '), ws = words.map(w => mw(g, w + ' ', G.cap, 800, FONT, -1));
+    let x = G.capX;
+    words.forEach((w, k) => {
+      const t0 = T.setup + n++ * 2.5, a = E.outBack(prog(f, t0, t0 + 12));
+      text(g, w, x, G.capY + li * G.capLH + (1 - clamp(a)) * 36, { size: G.cap, weight: 800, color: /\d/.test(w) ? C.warm : C.paper, spacing: -1, alpha: clamp(a) * alpha * dim });
+      x += ws[k];
+    });
+  });
+}
+/** GUESS 07 / 20: the step counter, bumps on every guess. */
+function counter(g, G, f, alpha) {
+  const a = E.outCubic(prog(f, T.cnt, T.cnt + 10)) * alpha;
+  if (a <= 0.01) return;
+  const k = curStep(f), num = String(k + 1).padStart(2, '0'), tot = ` / ${NS}`;
+  const e = k >= 0 ? f - PC[k] : 99, bump = 1 + 0.28 * Math.exp(-Math.max(0, e) / 3);
+  const wl = mw(g, 'GUESS', 28, 700, FONT, 4), wn = mw(g, num, G.cnt, 900, FONT, -2), wt = mw(g, tot, G.cnt * 0.46, 700);
+  const total = wl + 20 + wn + wt, x0 = G.cntAlign === 'right' ? G.cntX - total : G.cntX;
+  text(g, 'GUESS', x0, G.cntY, { size: 28, weight: 700, color: C.dim, spacing: 4, alpha: a });
+  g.save(); g.translate(x0 + wl + 20 + wn / 2, G.cntY); g.scale(bump, 2 - bump);
+  text(g, num, 0, 0, { size: G.cnt, weight: 900, color: C.warm, spacing: -2, align: 'center', alpha: a });
+  g.restore();
+  text(g, tot, x0 + wl + 20 + wn, G.cntY, { size: G.cnt * 0.46, weight: 700, color: C.dim, alpha: a });
+}
+/** What the big number shows at frame f, and when it last changed. */
+function heroState(f) {
+  const h = lastHalf(f);
+  if (h < 0) return { val: N, t0: T.num, prev: null, found: false };
+  const s = STEPS[h];
+  if (s.dir === 'found') return { val: TARGET, t0: PH[h], prev: s.size, found: true };
+  return { val: s.nhi - s.nlo + 1, t0: PH[h], prev: s.size, found: false };
+}
+/** A number drawn about its baseline centre, scaled (sx, sy). */
+function bigNum(g, G, str, size, sx, sy, color, alpha) {
+  if (alpha <= 0.01) return;
+  g.save(); g.translate(G.cx, G.heroY); g.scale(sx, sy);
+  text(g, str, 0, 0, { size, weight: 900, color, spacing: -size * 0.02, align: 'center', alpha });
+  g.restore();
+}
+/** The hero: how many numbers are still possible. Scale-slam with squash; a ghost of the old value blows out. */
+function hero(g, G, f, alpha) {
+  if (f < T.num) return;
+  const st = heroState(f), e = f - st.t0;
+  const fit = v => fitSize(g, fmt(v), G.heroMax, G.heroW, 900, FONT, -G.heroMax * 0.02);
+  if (st.prev !== null && e < 9) {
+    const u = E.outCubic(prog(e, 0, 9));
+    bigNum(g, G, fmt(st.prev), fit(st.prev), 1 + 0.3 * u, 1 + 0.3 * u, C.paper, alpha * 0.32 * (1 - u));
+  }
+  const d = E.inCubic(prog(e, 0, 3)), sc = lerp(G.slam, 1, d);
+  const q = e >= 3 ? Math.exp(-(e - 3) / 3.2) * Math.cos((e - 3) * 0.75) : 0;
+  const col = st.found ? C.warm : C.paper;
+  bigNum(g, G, fmt(st.val), fit(st.val), sc * (1 + 0.13 * q), sc * (1 - 0.15 * q), col, alpha * lerp(0.25, 1, d));
+  const size = fit(st.val);
+  if (!st.found) {
+    const [la] = env(f, T.num + 4, 1e9, 10, 1);
+    text(g, st.val === 1 ? 'number still possible' : 'numbers still possible', G.cx, G.heroY + G.labDY, { size: G.lab, weight: 700, color: C.dim, align: 'center', alpha: alpha * la });
+  } else {
+    const a1 = E.outBack(prog(f, T.found + 3, T.found + 15)), a2 = E.outBack(prog(f, T.found + 9, T.found + 21));
+    text(g, 'found it:', G.cx, G.heroY - size * 0.74 - G.fndGap + (1 - clamp(a1)) * 30, { size: G.fnd, weight: 900, color: C.warm, spacing: -1, align: 'center', alpha: alpha * clamp(a1) });
+    text(g, `in ${NS} guesses`, G.cx, G.heroY + G.fndDY + (1 - clamp(a2)) * 30, { size: G.fnd, weight: 900, color: C.paper, spacing: -1, align: 'center', alpha: alpha * clamp(a2) });
+  }
+}
+/** The number line: the bar is the camera's view; the live range is lit, the thrown-away half goes dark. */
+function numberLine(g, G, f, alpha) {
+  const on = E.outExpo(prog(f, T.bar, T.bar + 20)) * alpha;
+  if (on <= 0.01) return;
+  const [v0, v1] = view(f), bw = G.bx1 - G.bx0, X = n => G.bx0 + (n - v0) / (v1 - v0) * bw, bc = (G.bx0 + G.bx1) / 2;
+  const { by, bh } = G, k = curStep(f), s = k >= 0 ? STEPS[k] : null;
+  const half = bw / 2 * E.outExpo(prog(f, T.bar, T.bar + 20));
+  g.save(); g.globalAlpha = on;
+  g.beginPath(); g.rect(bc - half, by - 24, half * 2, bh + 60); g.clip();
+  g.fillStyle = C.track; g.fillRect(G.bx0, by, bw, bh);
+  const lo = s ? s.lo : 1, hi = s ? s.hi : N;
+  g.fillStyle = C.cool; g.fillRect(X(lo - 0.5), by, X(hi + 0.5) - X(lo - 0.5), bh);
+  if (s && f >= PH[k]) {
+    const u = E.outCubic(prog(f, PH[k], PH[k] + Math.min(5, PZ[k] - PH[k])));
+    g.fillStyle = s.dir === 'found' ? C.warm : C.track;
+    if (s.dir === 'higher') { const x1 = X(s.mid + 0.5), x0 = lerp(x1, X(s.lo - 0.5), u); g.fillRect(x0, by, x1 - x0, bh); }
+    else if (s.dir === 'lower') { const x0 = X(s.mid - 0.5), x1 = lerp(x0, X(s.hi + 0.5), u); g.fillRect(x0, by, x1 - x0, bh); }
+    else { const c = X(s.mid), hw = (X(s.mid + 0.5) - c) * u; g.fillRect(c - hw, by, hw * 2, bh); }
+  }
+  // the scale under the bar: ticks at 10^k, the finer ones fade out as the camera zooms in; single numbers become cells
+  const w = v1 - v0;
+  if (w < 60) {
+    g.fillStyle = C.bg;
+    for (let n = Math.ceil(v0 - 0.5) + 0.5; n < v1; n++) g.fillRect(X(n) - 2, by, 4, bh);
+  } else {
+    const lg = Math.log10(w / 5), st = Math.pow(10, Math.floor(lg)), fr = lg - Math.floor(lg);
+    g.fillStyle = C.paper;
+    for (let n = Math.ceil(v0 / st) * st; n <= v1; n += st) {
+      const major = Math.round(n / st) % 10 === 0;
+      g.globalAlpha = on * (major ? 0.55 : 0.4 * (1 - fr));
+      g.fillRect(X(n) - 1.5, by + bh + 6, 3, major ? 20 : 11);
+    }
+    g.globalAlpha = on;
+  }
+  // the guess marker rides with the zoom out of the bar
+  for (const j of [k - 1, k]) {
+    if (j < 0) continue;
+    const sj = STEPS[j], d = PC[j] + (PB[j] || 1) * BEAT - PC[j];
+    const a = E.outBack(prog(f, PC[j], PC[j] + Math.min(8, d / 2))), o = sj.dir === 'found' ? 1 : 1 - E.outCubic(prog(f, PH[j], PH[j] + (PZ[j] - PH[j]) * 0.7));
+    if (a * o <= 0.01) continue;
+    g.globalAlpha = on * o * clamp(a); g.fillStyle = C.warm;
+    g.fillRect(X(sj.mid) - 3, by - 14 - (1 - clamp(a)) * 30, 6, bh + 28);
+  }
+  g.restore();
+  for (const j of [k - 1, k]) {
+    if (j < 0) continue;
+    const sj = STEPS[j], d = (PB[j] || 1) * BEAT;
+    const a = E.outBack(prog(f, PC[j], PC[j] + Math.min(8, d / 2))), o = sj.dir === 'found' ? 1 - E.inCubic(prog(f, T.found + 2, T.found + 10)) : 1 - E.outCubic(prog(f, PH[j], PH[j] + (PZ[j] - PH[j]) * 0.7));
+    if (a * o <= 0.01) continue;
+    const str = fmt(sj.mid), tw = mw(g, str, G.gs, 800, FONT, -1);
+    const x = clamp(X(sj.mid), G.bx0 + tw / 2, G.bx1 - tw / 2);
+    g.save(); g.translate(x, by - 30 - (1 - clamp(a)) * 24); g.scale(lerp(0.6, 1, clamp(a)), lerp(0.6, 1, clamp(a)));
+    text(g, str, 0, 0, { size: G.gs, weight: 800, color: C.warm, spacing: -1, align: 'center', alpha: alpha * o * clamp(a * 1.5) });
+    g.restore();
+  }
+  // the ends of what is still possible ride to the ends of the bar
+  let elo = 1, ehi = N;
+  if (s) { if (f >= PH[k]) { elo = s.nlo; ehi = s.nhi; } else { elo = s.lo; ehi = s.hi; } }
+  if (elo !== ehi) {
+    const la = on * E.outCubic(prog(f, T.bar + 8, T.bar + 20));
+    text(g, fmt(elo), clamp(X(elo - 0.5), G.bx0, G.bx1), G.labY, { size: G.labS, weight: 700, color: C.dim, alpha: la });
+    text(g, fmt(ehi), clamp(X(ehi + 0.5), G.bx0, G.bx1), G.labY, { size: G.labS, weight: 700, color: C.dim, align: 'right', alpha: la });
+  }
+  // higher / lower
+  const h = lastHalf(f);
+  if (h >= 0 && STEPS[h].dir !== 'found') {
+    const up = STEPS[h].dir === 'higher', nc = h + 1 < NS ? PC[h + 1] : 1e9;
+    const a = E.outBack(prog(f, PH[h], PH[h] + 6)), o = 1 - E.inCubic(prog(f, nc + 1, nc + 6));
+    const dx = (up ? 1 : -1) * ((1 - clamp(a)) * -40 + (1 - o) * 70);
+    g.save(); g.translate(G.cx + dx, G.vy); g.scale(lerp(0.7, 1, clamp(a)), lerp(0.7, 1, clamp(a)));
+    text(g, up ? 'higher  →' : '←  lower', 0, 0, { size: G.vs, weight: 900, color: C.cool, spacing: -2, align: 'center', alpha: alpha * clamp(a * 1.6) * o });
+    g.restore();
+  }
+}
+/** Everything of the search itself, at frame f of the landscape clock. */
+function searchScene(g, G, f) {
+  if (f < T.setup - 1 || f > T.outro + 4) return;
+  const a = E.outCubic(prog(f, T.setup, T.setup + 10)) * (1 - E.inCubic(prog(f, T.outro - 14, T.outro + 2)));
+  if (a <= 0.005) return;
+  caption(g, G, f, a);
+  counter(g, G, f, a);
+  hero(g, G, f, a);
+  numberLine(g, G, f, a);
+}
+/** The closing lines: [str, size, color, fam, weight, y]; each falls in on the beat. */
+function outro(g, f, lines, x, align, maxW, stag = 8) {
+  lines.forEach(([str, size, col, fam, weight, y], k) => {
+    const a = E.outBack(prog(f, T.outro + k * stag, T.outro + k * stag + 14)), o = 1 - E.inCubic(prog(f, T.end + 2, T.end + 16));
+    if (a <= 0 || o <= 0) return;
+    const sz = fitSize(g, str, size, maxW, weight, fam, fam === FONT ? -size * 0.02 : 0);
+    text(g, str, x, y + (1 - clamp(a)) * 40, { size: sz, weight, color: col, fam, spacing: fam === FONT ? -sz * 0.02 : 0, align, alpha: clamp(a) * o });
+  });
+}
+function backdrop(g, w, h) {
+  g.fillStyle = C.bg; g.fillRect(0, 0, w, h);
+  g.fillStyle = 'rgba(238,241,232,0.03)';
+  for (let x = 0; x < w; x += 48) g.fillRect(x, 0, 1, h);
+}
+
+// ---- landscape picture ------------------------------------------------------------------
+const L2 = LOG2N.toFixed(2);
+const GL = { cx: 960, capX: 120, capY: 206, cap: 48, capLH: 60, capLines: [`I'm thinking of a number between 1 and ${fmt(N)}.`],
+  cntX: 1800, cntY: 262, cnt: 92, cntAlign: 'right',
+  heroY: 600, heroW: 1500, heroMax: 320, slam: 1.2, labDY: 86, lab: 40, fnd: 64, fndGap: 44, fndDY: 96,
+  bx0: 160, bx1: 1760, by: 800, bh: 40, gs: 52, labY: 890, labS: 32, vy: 988, vs: 72 };
+const OUT_L = [
+  [`log₂(${fmt(N)}) ≈ ${L2} → ${CEIL}`, 96, C.paper, MONO, 700, 420],
+  [`2^${CEIL} = ${fmt(POW)} ≥ ${fmt(N)}`, 44, C.dim, MONO, 600, 500],
+  [`at most ${WORST} guesses, every time.`, 92, C.warm, FONT, 900, 660],
+  [`one by one: up to ${fmt(N)} guesses.`, 52, C.paper, FONT, 700, 770],
+];
+function hookL(f) {
+  const o = 1 - E.inCubic(prog(f, T.hookOut - 12, T.hookOut));
+  if (o <= 0) return;
+  const k1 = E.outExpo(prog(f, -8, 10)), k2 = E.outExpo(prog(f, -4, 14)), up = E.inCubic(prog(f, T.hookOut - 12, T.hookOut)) * 40;
+  text(ctx, `${fmt(N)} numbers.`, W / 2, 480 + (1 - k1) * 30 - up, { size: 150, weight: 900, color: C.paper, spacing: -4, align: 'center', alpha: o * Math.max(0.3, k1) });
+  const e = f - T.slam, q = e >= 0 ? Math.exp(-e / 4) * Math.cos(e * 0.8) : 0;
+  ctx.save(); ctx.translate(W / 2, 660 + (1 - k2) * 30 - up); ctx.scale(1 + 0.14 * q, 1 - 0.16 * q);
+  text(ctx, `${WORST} guesses.`, 0, 0, { size: 150, weight: 900, color: C.warm, spacing: -4, align: 'center', alpha: o * Math.max(0.3, k2) });
+  ctx.restore();
+  const k3 = E.outCubic(prog(f, T.slam + 2, T.slam + 12));
+  text(ctx, 'every guess throws half of them away', W / 2, 780 + (1 - k3) * 20 - up, { size: 44, weight: 700, color: C.dim, align: 'center', alpha: o * k3 });
+}
+function draw(f) {
+  if (ctx.reset) ctx.reset();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; ctx.filter = 'none'; ctx.shadowBlur = 0;
+  backdrop(ctx, W, H);
+  const endK = E.inOutCubic(prog(f, T.end, T.end + 20)), a = 1 - endK;
+  text(ctx, 'ALGORITHMS  ·  BINARY SEARCH', 120, 104, { size: 26, weight: 600, color: C.dim, spacing: 5, alpha: a });
+  text(ctx, 'BYTEPATTERNS', 1800, 104, { size: 26, weight: 600, color: C.dim, spacing: 5, align: 'right', alpha: a });
+  hookL(f);
+  searchScene(ctx, GL, f);
+  outro(ctx, f, OUT_L, W / 2, 'center', 1600);
+  if (endK > 0) {
+    ctx.fillStyle = `rgba(${C.bgRGB},${0.9 * endK})`; ctx.fillRect(0, 0, W, H);
+    const k1 = E.outCubic(prog(f, T.end + 6, T.end + 28)), k2 = E.outCubic(prog(f, T.end + 16, T.end + 38)), k3 = E.outCubic(prog(f, T.end + 26, T.end + 48));
+    const ts = fitSize(ctx, 'Binary Search Halves It', 140, 1600, 850, FONT, -3);
+    text(ctx, 'Binary Search Halves It', W / 2, 500 + (1 - k1) * 30, { size: ts, weight: 850, color: C.paper, spacing: -3, align: 'center', alpha: k1 });
+    text(ctx, `${fmt(N)} numbers  ·  ${NS} guesses  ·  each one halves what is left`, W / 2, 580 + (1 - k2) * 20, { size: 42, weight: 500, color: C.warm, align: 'center', alpha: k2 });
+    text(ctx, 'drawn in code  ·  bytepatterns.com', W / 2, 1000, { size: 32, weight: 600, color: C.paper, spacing: 3, align: 'center', alpha: k3 * 0.8 });
+  }
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.letterSpacing = '0px';
+}
+
+// ---- sound: 120 BPM; each halving is a kick and a tick one step up the scale, each zoom a whoosh -------
+async function renderAudio() {
+  const SR = 48000, dur = FRAMES / FPS, LEN = Math.round(SR * dur);
+  const ac = new OfflineAudioContext(2, LEN, SR);
+  const at = fr => fr / FPS;
+  const comp = ac.createDynamicsCompressor();
+  comp.threshold.value = -14; comp.ratio.value = 3.5; comp.attack.value = 0.003; comp.release.value = 0.18;
+  const master = ac.createGain(); master.gain.value = 0.95; master.connect(comp).connect(ac.destination);
+  master.gain.setValueAtTime(0.95, dur - 0.8); master.gain.linearRampToValueAtTime(0.0001, dur - 0.02);
+  const rnd = mulberry32(0x28A0D1);
+  const ir = ac.createBuffer(2, SR * 1.6, SR);
+  for (let c = 0; c < 2; c++) { const d = ir.getChannelData(c); for (let k = 0; k < d.length; k++) d[k] = (rnd() * 2 - 1) * Math.pow(1 - k / d.length, 3.8); }
+  const verb = ac.createConvolver(); verb.buffer = ir; const vg = ac.createGain(); vg.gain.value = 0.24; verb.connect(vg).connect(master);
+  const noise = ac.createBuffer(1, SR, SR); { const d = noise.getChannelData(0); for (let k = 0; k < d.length; k++) d[k] = rnd() * 2 - 1; }
+  const hz = m => 440 * Math.pow(2, (m - 69) / 12);
+  const kick = (t0, amp = 0.5) => { const o = ac.createOscillator(), g = ac.createGain();
+    o.frequency.setValueAtTime(150, t0); o.frequency.exponentialRampToValueAtTime(44, t0 + 0.12);
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(amp, t0 + 0.004); g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.26);
+    o.connect(g).connect(master); o.start(t0); o.stop(t0 + 0.28); };
+  const hat = (t0, amp = 0.05) => { const s = ac.createBufferSource(); s.buffer = noise; const hp = ac.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 7500;
+    const g = ac.createGain(); g.gain.setValueAtTime(amp, t0); g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.045);
+    s.connect(hp).connect(g).connect(master); s.start(t0, (t0 * 3.1) % 0.9, 0.06); };
+  const pluck = (t0, m, pan, amp = 0.2) => { for (const [mul, a2, typ] of [[1, 1, 'triangle'], [2, 0.35, 'sine']]) {
+    const o = ac.createOscillator(), g = ac.createGain(), p = ac.createStereoPanner(); o.type = typ; o.frequency.value = hz(m) * mul; p.pan.value = pan;
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(amp * a2, t0 + 0.003); g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.22);
+    o.connect(g).connect(p); p.connect(master); p.connect(verb); o.start(t0); o.stop(t0 + 0.25); } };
+  const click = (t0, amp = 0.06) => { const o = ac.createOscillator(), g = ac.createGain(); o.type = 'square'; o.frequency.value = 2400;
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(amp, t0 + 0.001); g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.025);
+    o.connect(g).connect(master); o.start(t0); o.stop(t0 + 0.03); };
+  const bell = (t0, m, amp, pn) => { for (const [r2, a2, d2] of [[1, 1, 1.6], [2.76, 0.3, 0.6], [5.4, 0.1, 0.25]]) {
+    const o = ac.createOscillator(); o.frequency.value = hz(m) * r2; const g = ac.createGain(), p = ac.createStereoPanner();
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(amp * a2, t0 + 0.004); g.gain.exponentialRampToValueAtTime(0.0001, t0 + d2);
+    p.pan.value = pn; o.connect(g).connect(p); p.connect(master); p.connect(verb); o.start(t0); o.stop(t0 + d2 + 0.05); } };
+  const whoosh = (t0, d, pan0, pan1, amp = 0.1) => { const s = ac.createBufferSource(); s.buffer = noise; const bp = ac.createBiquadFilter(); bp.type = 'bandpass'; bp.Q.value = 2.5;
+    bp.frequency.setValueAtTime(700, t0); bp.frequency.exponentialRampToValueAtTime(3600, t0 + d);
+    const g = ac.createGain(), p = ac.createStereoPanner(); p.pan.setValueAtTime(pan0, t0); p.pan.linearRampToValueAtTime(pan1, t0 + d);
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(amp, t0 + d * 0.5); g.gain.exponentialRampToValueAtTime(0.0001, t0 + d);
+    s.connect(bp).connect(g).connect(p).connect(master); s.start(t0, (t0 * 1.7) % 0.5, d + 0.05); };
+  // bass: one note per bar (C major), under everything up to the closing card
+  const BASS = [36, 36, 41, 43, 36, 33, 41, 43, 36, 36, 41, 43];
+  for (let bar = 0; bar * BEAT * 4 < T.end; bar++) {
+    const t0 = at(bar * BEAT * 4), o = ac.createOscillator(), g = ac.createGain(), lp = ac.createBiquadFilter();
+    o.type = 'sawtooth'; o.frequency.value = hz(BASS[bar % BASS.length]); lp.type = 'lowpass'; lp.frequency.value = 300;
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(0.1, t0 + 0.02); g.gain.exponentialRampToValueAtTime(0.0001, t0 + BEAT * 4 / FPS);
+    o.connect(lp).connect(g).connect(master); o.start(t0); o.stop(t0 + BEAT * 4 / FPS + 0.05);
+  }
+  // hats on the eighths; a steady kick until the search takes the kick over
+  for (let e = 0; e * BEAT / 2 < T.end; e++) hat(at(e * BEAT / 2), e % 2 ? 0.03 : 0.045);
+  for (let b = 0; b * BEAT < T.s0; b += 2) if (b * BEAT !== T.num) kick(at(b * BEAT), b * BEAT === T.slam ? 0.85 : 0.45);
+  kick(at(T.num), 0.7); whoosh(at(T.bar), 0.5, 0, 0, 0.08);
+  // the search: a click when a guess drops, a kick and a rising tick when half is thrown away, a whoosh as the camera zooms
+  const DEG = [0, 2, 4, 5, 7, 9, 11], note = k => 48 + DEG[(k + 2) % 7] + 12 * Math.floor((k + 2) / 7);   // E3 .. C6 over 20 steps
+  STEPS.forEach((s, k) => {
+    click(at(PC[k]));
+    if (s.dir === 'found') { kick(at(PH[k]), 0.85); pluck(at(PH[k]), note(k), 0, 0.24);
+      [72, 76, 79, 84, 88].forEach((m, i) => bell(at(PH[k]) + 0.02 + i * 0.045, m, 0.075, -0.4 + i * 0.2)); return; }
+    const pan = s.dir === 'higher' ? 0.35 : -0.35, dz = (PZ[k] - PH[k]) / FPS;
+    kick(at(PH[k]), 0.55); pluck(at(PH[k]), note(k), pan, 0.2);
+    whoosh(at(PH[k]), Math.max(0.1, dz), -pan, pan, dz > 0.3 ? 0.11 : 0.06);
+  });
+  // closing lines, then the card
+  OUT_L.forEach((_, k) => { kick(at(T.outro + k * 8), k ? 0.4 : 0.7); bell(at(T.outro + k * 8), [72, 79, 76, 84][k], 0.06, -0.3 + k * 0.2); });
+  [69, 72, 76, 81].forEach((m, i) => bell(at(T.end + 8 + i * 6), m, 0.08, -0.45 + i * 0.3));
+  const buf = await ac.startRendering();
+  let peak = 0; for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let k = 0; k < d.length; k++) peak = Math.max(peak, Math.abs(d[k])); }
+  if (peak > 0.89) for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let k = 0; k < d.length; k++) d[k] *= 0.89 / peak; }
+  return buf;
+}
+
+/* ==========================================================================
+   VERTICAL CUT — shared block, identical in every piece.
+   1080x1920 for Reels, Shorts and TikTok (__motion.variants.vertical). The
+   piece's own scene code is re-used and recomposed for a phone: everything a
+   viewer must read stays inside the area no platform covers (x 60..900,
+   y 230..1400); outside it there is only dimmed texture.
+   ========================================================================== */
+const VW = 1080, VH = 1920, SAFE = { x: 60, y: 230, w: 840, h: 1170, r: 900, b: 1400 };
+const vcv = document.createElement('canvas'); vcv.width = VW; vcv.height = VH;
+const vx = vcv.getContext('2d', { willReadFrequently: true });   // CPU raster: identical pixels on every redraw
+const VL = 96, VR = 864;                                          // text column inside the safe area
+
+function vReset() {
+  vx.setTransform(1, 0, 0, 1, 0, 0); vx.globalAlpha = 1; vx.globalCompositeOperation = 'source-over';
+  vx.filter = 'none'; vx.shadowBlur = 0; vx.shadowColor = 'transparent'; vx.letterSpacing = '0px'; vx.setLineDash([]);
+  vx.textAlign = 'left'; vx.textBaseline = 'alphabetic'; vx.lineCap = 'butt'; vx.lineJoin = 'miter';
+}
+/** Canvas text on the vertical frame; `max` shrinks the size until the line fits. */
+function vText(str, x, y, { size = 40, weight = 700, color = '#FFFFFF', align = 'left', spacing = 0, alpha = 1, fam = FONT, max = 0 } = {}) {
+  if (alpha <= 0.002 || !str) return size;
+  vx.font = `${weight} ${size}px ${fam}`; vx.letterSpacing = spacing + 'px';
+  if (max) { const w = vx.measureText(str).width; if (w > max) { size = size * max / w; vx.font = `${weight} ${size}px ${fam}`; } }
+  vx.textAlign = align; vx.textBaseline = 'alphabetic';
+  const a0 = vx.globalAlpha; vx.globalAlpha = a0 * alpha; vx.fillStyle = color;
+  vx.fillText(str, x + (align === 'center' ? spacing / 2 : align === 'right' ? spacing : 0), y);   // tracking is added after the last glyph too
+  vx.globalAlpha = a0; vx.letterSpacing = '0px';
+  return size;
+}
+/** Word-wraps with the given font; returns the lines. */
+function vWrap(str, maxW, size, weight = 700, fam = FONT) {
+  vx.font = `${weight} ${size}px ${fam}`; vx.letterSpacing = '0px';
+  const words = str.split(' '), lines = []; let cur = '';
+  for (const w of words) { const t = cur ? cur + ' ' + w : w; if (vx.measureText(t).width > maxW && cur) { lines.push(cur); cur = w; } else cur = t; }
+  if (cur) lines.push(cur);
+  return lines;
+}
+/** Fade envelope with a small rise: [alpha, dy]. */
+function vEnv(v, a, b, fin = 8, fout = 8) {
+  const i = E.outCubic(prog(v, a, a + fin)), o = 1 - E.inCubic(prog(v, b - fout, b));
+  return [Math.min(i, o), (1 - i) * 22 - (1 - o) * 10];
+}
+/** Which segment of a cut list a vertical frame is in: segs = [{ at, src, len }] in frames. */
+function vSeg(segs, v) {
+  let k = 0; while (k < segs.length - 1 && v >= segs[k + 1].at) k++;
+  const s = segs[k];
+  return { k, s, local: v - s.at, src: s.src + (v - s.at) };
+}
+/** Dims everything outside the safe area to a quiet texture (brightness x 0.2), with a soft inner edge. */
+function vShade(rgb, a = 0.8, feather = 40) {
+  vx.save(); vx.setTransform(1, 0, 0, 1, 0, 0); vx.globalAlpha = 1; vx.globalCompositeOperation = 'source-over';
+  vx.fillStyle = `rgba(${rgb},${a})`;
+  vx.beginPath(); vx.rect(0, 0, VW, VH); vx.rect(SAFE.x, SAFE.y, SAFE.w, SAFE.h); vx.fill('evenodd');
+  const strip = (x0, y0, x1, y1, rx, ry, rw, rh) => {
+    const g = vx.createLinearGradient(x0, y0, x1, y1);
+    g.addColorStop(0, `rgba(${rgb},${a})`); g.addColorStop(1, `rgba(${rgb},0)`);
+    vx.fillStyle = g; vx.fillRect(rx, ry, rw, rh);
+  };
+  strip(SAFE.x, 0, SAFE.x + feather, 0, SAFE.x, SAFE.y, feather, SAFE.h);
+  strip(SAFE.r, 0, SAFE.r - feather, 0, SAFE.r - feather, SAFE.y, feather, SAFE.h);
+  strip(0, SAFE.y, 0, SAFE.y + feather, SAFE.x, SAFE.y, SAFE.w, feather);
+  strip(0, SAFE.b, 0, SAFE.b - feather, SAFE.x, SAFE.b - feather, SAFE.w, feather);
+  vx.restore();
+}
+/** Series tag at the top of the safe area, e.g. MADE IN CODE · 04. */
+function vTag(label, color, alpha = 1) {
+  vText('MADE IN CODE', VL, 292, { size: 28, weight: 800, color, spacing: 5, alpha });
+  vx.font = `800 28px ${FONT}`; vx.letterSpacing = '5px';
+  const w = vx.measureText('MADE IN CODE').width; vx.letterSpacing = '0px';
+  vText('·  ' + label, VL + w + 14, 292, { size: 28, weight: 600, color: 'rgba(255,255,255,0.72)', spacing: 3, alpha, max: VR - VL - w - 14 });
+}
+/** Big hook lines, left-aligned from y0; visible from frame 0, settles in a few frames. */
+function vHook(v, lines, y0, { size = 84, lh = 1.08, color = '#FFFFFF', accent = null, weight = 800, spacing = -1.5, alpha = 1 } = {}) {
+  const k = E.outExpo(prog(v, -6, 12));
+  lines.forEach((ln, i) => {
+    const kk = E.outExpo(prog(v, -12 + i * 2, 8 + i * 2));
+    vText(ln, VL, y0 + i * size * lh + (1 - kk) * 30, { size, weight, spacing, color: accent && i === lines.length - 1 ? accent : color, alpha: alpha * Math.max(0.25, kk), max: VR - VL });
+  });
+  return k;
+}
+/** Closing card, the last 60 frames: piece title, "drawn in code · bytepatterns.com". l = frames into the card. */
+function vEndCard(l, { title, line = '', ink = '#FFFFFF', dim = 'rgba(255,255,255,0.66)', accent = '#FFFFFF', scrim = '0,0,0', a = 0.84 }) {
+  const k = E.outCubic(prog(l, 0, 12));
+  vx.save(); vx.setTransform(1, 0, 0, 1, 0, 0);
+  vx.fillStyle = `rgba(${scrim},${a * k})`; vx.fillRect(0, 0, VW, VH);
+  vx.restore();
+  const t1 = E.outExpo(prog(l, 3, 19)), t2 = E.outExpo(prog(l, 11, 27)), t3 = E.outExpo(prog(l, 19, 35));
+  vx.fillStyle = accent; vx.globalAlpha = t1; vx.fillRect(VL, 742, 88 * t1, 7); vx.globalAlpha = 1;
+  const size = vText(title, VL, 850 + (1 - t1) * 40, { size: 92, weight: 800, color: ink, spacing: -2, alpha: t1, max: VR - VL });
+  const y2 = 850 + Math.max(size, 60) * 0.25 + 70;
+  vx.font = `600 44px ${FONT}`;
+  const lead = 'drawn in code  ·  ', lw = vx.measureText(lead).width;
+  vText(lead, VL, y2 + (1 - t2) * 24, { size: 44, weight: 600, color: dim, alpha: t2 });
+  vText('bytepatterns.com', VL + lw, y2 + (1 - t2) * 24, { size: 44, weight: 800, color: accent, alpha: t2 });
+  if (line) vText(line, VL, y2 + 72 + (1 - t3) * 18, { size: 32, weight: 500, color: dim, alpha: t3, max: VR - VL });
+}
+/** Seeks a cut. The first frame a page draws is drawn twice: the very first read of a
+ *  GPU-backed source canvas can come out a shade different from every later one. */
+let vWarm = false;
+function vSeek(draw, i, frames) {
+  const f = Math.max(0, Math.min(frames - 1, Math.floor(i)));
+  if (!vWarm) { vWarm = true; draw(f); }
+  draw(f);
+}
+/** The soundtrack of a cut: the piece's own audio() spliced to the same segments as the picture. */
+async function vAudio(segs, frames, { xf = 0.025, fadeOut = 0.6, extra = null } = {}) {
+  const src = await renderAudio();
+  const SR = 48000, dur = frames / FPS, ac = new OfflineAudioContext(2, Math.round(SR * dur), SR);
+  const out = ac.createGain(); out.connect(ac.destination);
+  out.gain.setValueAtTime(1, 0); out.gain.setValueAtTime(1, dur - fadeOut); out.gain.linearRampToValueAtTime(0, dur - 0.01);
+  segs.forEach((s, k) => {
+    const at = s.at / FPS, off = s.src / FPS, d = s.len / FPS;
+    const pre = k === 0 ? 0 : Math.min(xf, off), post = k === segs.length - 1 ? 0 : xf;
+    const b = ac.createBufferSource(), g = ac.createGain(); b.buffer = src;
+    g.gain.setValueAtTime(pre ? 0 : 1, at - pre);
+    if (pre) g.gain.linearRampToValueAtTime(1, at + pre);
+    if (post) { g.gain.setValueAtTime(1, at + d - post); g.gain.linearRampToValueAtTime(0, at + d + post); }
+    b.connect(g).connect(out); b.start(at - pre, off - pre, d + pre + post);
+  });
+  if (extra) extra(ac, out);
+  const buf = await ac.startRendering();
+  let peak = 0; for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) peak = Math.max(peak, Math.abs(d[i])); }
+  if (peak > 0.9) for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) d[i] *= 0.9 / peak; }
+  return buf;
+}
+/** A soft three-partial bell, for the closing card. */
+function vChime(ac, dest, at, freq, vol = 0.08) {
+  for (const [mul, v, dec] of [[1, 1, 1.8], [2.01, 0.35, 0.8], [3.02, 0.12, 0.4]]) {
+    const o = ac.createOscillator(), g = ac.createGain(); o.type = 'sine'; o.frequency.value = freq * mul;
+    g.gain.setValueAtTime(0.0001, at); g.gain.exponentialRampToValueAtTime(vol * v, at + 0.006); g.gain.exponentialRampToValueAtTime(0.0001, at + dec);
+    o.connect(g).connect(dest); o.start(at); o.stop(at + dec + 0.05);
+  }
+}
+
+/* VERTICAL CUT — this piece */
+// The same search, laid out again for a phone: the setup line on two lines,
+// the counter under it, the count of numbers still possible stacked above the
+// number line (it grows as it shrinks: fewer digits fit bigger). Cut on the
+// beat, so the soundtrack splices cleanly.
+const VSEG = [
+  { at: 0, src: 0, len: 60 },                                // hook: 1,000,000 numbers, 20 guesses
+  { at: 60, src: 75, len: 375 },                             // setup, the twenty guesses, found it
+  { at: 435, src: T.outro - 15, len: 90 },                   // log2
+  { at: 525, src: T.end, len: 60 },                          // closing card
+];
+const VFR = 585, VEND = VFR - 60;
+const GV = { cx: 480, capX: VL, capY: 400, cap: 46, capLH: 58, capLines: ["I'm thinking of a number", `between 1 and ${fmt(N)}.`],
+  cntX: VL, cntY: 560, cnt: 80, cntAlign: 'left',
+  heroY: 870, heroW: VR - VL, heroMax: 300, slam: 1.12, labDY: 80, lab: 40, fnd: 60, fndGap: 40, fndDY: 90,
+  bx0: VL, bx1: VR, by: 1060, bh: 36, gs: 48, labY: 1144, labS: 32, vy: 1262, vs: 68 };
+const OUT_V = [
+  [`log₂(${fmt(N)})`, 84, C.paper, MONO, 700, 560],
+  [`≈ ${L2} → ${CEIL}`, 84, C.paper, MONO, 700, 660],
+  [`2^${CEIL} = ${fmt(POW)}`, 40, C.dim, MONO, 600, 730],
+  [`at most ${WORST}`, 130, C.warm, FONT, 900, 900],
+  ['guesses, every time.', 64, C.warm, FONT, 900, 980],
+  ['one by one: up to', 44, C.paper, FONT, 700, 1100],
+  [`${fmt(N)} guesses.`, 44, C.paper, FONT, 700, 1156],
+];
+function hookV(v) {
+  const o = 1 - E.inCubic(prog(v, 50, 60));
+  const k1 = E.outExpo(prog(v, -8, 10)), k2 = E.outExpo(prog(v, -4, 14));
+  vText(fmt(N), VL, 640 + (1 - k1) * 30, { size: 150, weight: 900, color: C.paper, spacing: -4, alpha: o * Math.max(0.3, k1), max: VR - VL });
+  vText('numbers.', VL, 800 + (1 - k1) * 30, { size: 150, weight: 900, color: C.paper, spacing: -4, alpha: o * Math.max(0.3, k1), max: VR - VL });
+  const e = v - T.slam, q = e >= 0 ? Math.exp(-e / 4) * Math.cos(e * 0.8) : 0;
+  vx.save(); vx.translate(VL, 990 + (1 - k2) * 30); vx.scale(1 + 0.1 * q, 1 - 0.14 * q);
+  vText(`${WORST} guesses.`, 0, 0, { size: 150, weight: 900, color: C.warm, spacing: -4, alpha: o * Math.max(0.3, k2), max: (VR - VL) / 1.12 });
+  vx.restore();
+  const k3 = E.outCubic(prog(v, T.slam + 2, T.slam + 12));
+  vText('every guess throws', VL, 1110 + (1 - k3) * 20, { size: 46, weight: 700, color: C.dim, alpha: o * k3 });
+  vText('half of them away', VL, 1166 + (1 - k3) * 20, { size: 46, weight: 700, color: C.dim, alpha: o * k3 });
+}
+function vDraw(v) {
+  const { k: seg, src } = vSeg(VSEG, v), f = Math.min(FRAMES - 1, src);
+  vReset();
+  backdrop(vx, VW, VH);
+  if (seg === 0) hookV(v);
+  else if (seg === 1) searchScene(vx, GV, f);
+  else outro(vx, f, OUT_V, VL, 'left', VR - VL, 5);
+  vReset();
+  vShade(C.bgRGB, 0.84);
+  vTag('BINARY SEARCH', C.warm);
+  if (v >= VEND) vEndCard(v - VEND, { title: 'Binary Search Halves It', line: `${fmt(N)} numbers · ${NS} guesses · halve each time`,
+    ink: C.paper, dim: 'rgba(238,241,232,0.72)', accent: C.warm, scrim: C.bgRGB, a: 0.9 });
+  vReset();
+}
+
+window.__motion = {
+  title: 'Binary Search Halves It',
+  description: `Kinetic type: binary search finds the hidden number ${fmt(TARGET)} between 1 and ${fmt(N)} in ${NS} guesses (${UPS} higher, ${DOWNS} lower, then found); the count of numbers still possible halves from ${fmt(N)} to 1 as the number line zooms in, and log2 of ${fmt(N)} is ${L2}.`,
+  fps: FPS, width: W, height: H, frames: FRAMES,
+  poster: Math.round(PH[5] + 2),
+  gifStart: 4,
+  seek(i) { draw(Math.max(0, Math.min(FRAMES - 1, Math.floor(i)))); },
+  audio: renderAudio,
+  variants: {
+    vertical: {
+      width: VW, height: VH, frames: VFR, canvas: vcv,
+      poster: 150, gifStart: 3,
+      seek(i) { vSeek(vDraw, i, VFR); },
+      audio: () => vAudio(VSEG, VFR),
+    },
+  },
+};
+
+/* ==========================================================================
+   PLAYER — identical in every piece; keep as is.
+   Autoplays and loops, starts sound on the first click, ?frame=N pauses on a
+   frame, ?variant=vertical plays the vertical cut (if the piece has one).
+   When the renderer sets window.__MOTION_RENDER__ it stays out of the way.
+   ========================================================================== */
+(function player() {
+  const btn = document.getElementById('sound'), q = new URLSearchParams(location.search);
+  let M = window.__motion;
+  const V = !window.__MOTION_RENDER__ && M.variants && M.variants[q.get('variant')];
+  if (V) {                                                // show the variant's own canvas instead
+    M = Object.assign({}, M, V);
+    V.canvas.style.cssText = `width:min(100vw,calc(100vh*${V.width}/${V.height}));height:auto;aspect-ratio:${V.width}/${V.height}`;
+    document.querySelector('canvas').replaceWith(V.canvas);
+  }
+  const dur = M.frames / M.fps;
+  if (window.__MOTION_RENDER__) { btn.hidden = true; M.seek(0); return; }
+  if (q.has('frame')) { btn.hidden = true; M.seek(+q.get('frame') || 0); return; }
+  let t0 = performance.now(), ac = null, src = null, buf = null, paused = false, pausedAt = 0;
+  const clock = () => ac && src ? (ac.currentTime - t0) : (performance.now() - t0) / 1000;
+  function loop() {
+    if (!paused) M.seek(Math.floor(((clock() % dur) + dur) % dur * M.fps));
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+  btn.addEventListener('click', async () => {
+    if (src) { src.stop(); src = null; btn.textContent = 'Click for sound'; t0 = performance.now(); return; }
+    btn.textContent = 'Loading sound…';
+    ac = ac || new AudioContext({ sampleRate: 48000 });
+    buf = buf || await M.audio();
+    await ac.resume();
+    src = ac.createBufferSource(); src.buffer = buf; src.loop = true; src.connect(ac.destination);
+    t0 = ac.currentTime + 0.05; src.start(t0);        // picture restarts from frame 0 in sync with the sound
+    btn.textContent = 'Sound on — click to mute';
+  });
+  addEventListener('keydown', e => {
+    if (e.code !== 'Space') return;
+    e.preventDefault(); paused = !paused;
+    if (ac) paused ? ac.suspend() : ac.resume();
+    if (!ac) { if (paused) pausedAt = performance.now(); else t0 += performance.now() - pausedAt; }
+  });
+})();
+</script>
+</body>
+</html>

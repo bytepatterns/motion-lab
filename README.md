@@ -336,6 +336,71 @@ Click a preview to open the piece live in your browser (click once more there fo
 <br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/25-liquid-letters/?variant=vertical">open</a> · <a href="out/25-liquid-letters.vertical.png">still</a></sub>
 </td>
 </tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/26-merge-sort-tree/"><img src="out/26-merge-sort-tree.gif" width="100%" alt="Merge Sort, Drawn as a Tree — animated preview"></a>
+<br><b>26 · Merge Sort, Drawn as a Tree</b> <sub>26 s</sub>
+<br>A real merge sort of 16 numbers drawn as its recursion tree: the row halves 4 times down to single tiles, then merges back up level by level in 45 comparisons, one tick each.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/26-merge-sort-tree/">open in browser</a> · <a href="out/26-merge-sort-tree.png">still</a> · <a href="projects/26-merge-sort-tree/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/26-merge-sort-tree/?variant=vertical"><img src="out/26-merge-sort-tree.vertical.gif" width="100%" alt="Merge Sort, Drawn as a Tree — vertical cut, animated preview"></a>
+<br><sub>9:16 · 19 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/26-merge-sort-tree/?variant=vertical">open</a> · <a href="out/26-merge-sort-tree.vertical.png">still</a></sub>
+</td>
+</tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/27-consistent-hashing/"><img src="out/27-consistent-hashing.gif" width="100%" alt="Consistent Hashing — animated preview"></a>
+<br><b>27 · Consistent Hashing</b> <sub>25 s</sub>
+<br>Four servers and 12 keys hashed onto one ring with 32-bit FNV-1a: one point per server gives shares from 5.3% to 55.2%, 32 virtual points each bring them to 23.7%..26.2%, and when one server goes down 3 of 12 keys move, against 10 with hash mod N.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/27-consistent-hashing/">open in browser</a> · <a href="out/27-consistent-hashing.png">still</a> · <a href="projects/27-consistent-hashing/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/27-consistent-hashing/?variant=vertical"><img src="out/27-consistent-hashing.vertical.gif" width="100%" alt="Consistent Hashing — vertical cut, animated preview"></a>
+<br><sub>9:16 · 20 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/27-consistent-hashing/?variant=vertical">open</a> · <a href="out/27-consistent-hashing.vertical.png">still</a></sub>
+</td>
+</tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/28-binary-search-halves/"><img src="out/28-binary-search-halves.gif" width="100%" alt="Binary Search Halves It — animated preview"></a>
+<br><b>28 · Binary Search Halves It</b> <sub>22 s</sub>
+<br>Kinetic type: binary search finds the hidden number 95,321 between 1 and 1,000,000 in 20 guesses (7 higher, 12 lower, then found); the count of numbers still possible halves from 1,000,000 to 1 as the number line zooms in, and log2 of 1,000,000 is 19.93.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/28-binary-search-halves/">open in browser</a> · <a href="out/28-binary-search-halves.png">still</a> · <a href="projects/28-binary-search-halves/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/28-binary-search-halves/?variant=vertical"><img src="out/28-binary-search-halves.vertical.gif" width="100%" alt="Binary Search Halves It — vertical cut, animated preview"></a>
+<br><sub>9:16 · 20 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/28-binary-search-halves/?variant=vertical">open</a> · <a href="out/28-binary-search-halves.vertical.png">still</a></sub>
+</td>
+</tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/29-harmonograph/"><img src="out/29-harmonograph.gif" width="100%" alt="Harmonograph — animated preview"></a>
+<br><b>29 · Harmonograph</b> <sub>27 s</sub>
+<br>Two damped pendulums steer one pen through 2:3, 3:4, 1:2, a fifth, a fourth and an octave: each figure is 20 turns of the same sum, drawn until the swing has decayed to 11-14%, and the soundtrack plays that sum as two decaying tones.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/29-harmonograph/">open in browser</a> · <a href="out/29-harmonograph.png">still</a> · <a href="projects/29-harmonograph/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/29-harmonograph/?variant=vertical"><img src="out/29-harmonograph.vertical.gif" width="100%" alt="Harmonograph — vertical cut, animated preview"></a>
+<br><sub>9:16 · 20 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/29-harmonograph/?variant=vertical">open</a> · <a href="out/29-harmonograph.vertical.png">still</a></sub>
+</td>
+</tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/30-rule-30/"><img src="out/30-rule-30.gif" width="100%" alt="One Row at a Time — animated preview"></a>
+<br><b>30 · One Row at a Time</b> <sub>27 s</sub>
+<br>Elementary cellular automata drawn one row at a time: the eight cases of rule 30 (00011110), its chaotic triangle grown from one live cell over 105 rows (5,720 live cells) with a click per row pitched by its centre column, rule 110 from 85 random cells, and a last rule-30 cascade whose rows are then steered cell by cell onto a 5x7 bitmap of the word &quot;code&quot; (6,088 cells changed).
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/30-rule-30/">open in browser</a> · <a href="out/30-rule-30.png">still</a> · <a href="projects/30-rule-30/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/30-rule-30/?variant=vertical"><img src="out/30-rule-30.vertical.gif" width="100%" alt="One Row at a Time — vertical cut, animated preview"></a>
+<br><sub>9:16 · 20 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/30-rule-30/?variant=vertical">open</a> · <a href="out/30-rule-30.vertical.png">still</a></sub>
+</td>
+</tr>
 </table>
 <!-- gallery:end -->
 
