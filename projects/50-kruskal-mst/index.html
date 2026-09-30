@@ -1,0 +1,611 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="author" content="teambytepatterns">
+<meta name="description" content="Forty points and every link to their nearest neighbours: Kruskal's algorithm takes the links shortest first, keeps one only when union-find says it joins two groups, and stops when a single tree connects all forty.">
+<title>Kruskal’s Spanning Tree — motion-lab</title>
+<style>
+  /* Player chrome. The piece itself lives entirely in the canvas. */
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  body { display: grid; place-items: center; font: 500 15px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #fff; }
+  canvas { display: block; width: min(100vw, calc(100vh * 16 / 9)); height: auto; aspect-ratio: 16 / 9; }
+  #sound { position: fixed; left: 16px; bottom: 16px; padding: 8px 14px; border: 1px solid rgba(255,255,255,.35); border-radius: 999px;
+           background: rgba(0,0,0,.55); color: #fff; font: inherit; cursor: pointer; }
+  #sound[hidden] { display: none; }
+</style>
+</head>
+<body>
+<canvas id="stage" width="1920" height="1080" aria-label="Forty dots scattered on a dark field, joined by faint grey lines; a row of bars sorted by height runs along the bottom; one by one the lines light up in colour or flash red and vanish, coloured groups of dots grow and merge until one coloured tree joins every dot"></canvas>
+<button id="sound" type="button">Click for sound</button>
+<script>
+'use strict';
+/* ==========================================================================
+   PIECE — Kruskal's Spanning Tree.
+   Forty points, each linked to its five nearest neighbours: those are the
+   candidate edges, weighted by length. Kruskal's algorithm sorts them,
+   shortest first, and walks the list: an edge whose two ends are in
+   different groups is kept and the groups are merged; an edge whose ends
+   are already in the same group would close a loop and is skipped. A
+   union-find (disjoint-set) structure answers "same group?" with union by
+   size and path halving. After n - 1 kept edges every point is in one group
+   and the walk stops: the kept edges are a minimum spanning tree.
+   Points, edges, the sort, every step, group colours and all totals are
+   computed once at load (per stage); a frame only reads the step it is in,
+   so seek(i) is pure in i.
+   ========================================================================== */
+const W = 1920, H = 1080, FPS = 30;
+const cv = document.getElementById('stage');
+const ctx = cv.getContext('2d', { willReadFrequently: true });   // CPU raster: identical pixels on every redraw
+const FONT = 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
+const MONO = 'ui-monospace, "Cascadia Code", Consolas, Menlo, monospace';
+
+// ---- helpers -------------------------------------------------------------
+function mulberry32(a) { return function () { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a);
+  t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const lerp = (a, b, t) => a + (b - a) * t;
+const prog = (f, a, b) => clamp((f - a) / (b - a));
+const smooth = t => t * t * (3 - 2 * t);
+const E = {
+  inCubic: t => t * t * t,
+  outCubic: t => 1 - Math.pow(1 - t, 3),
+  inOutCubic: t => t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2,
+  outExpo: t => t === 1 ? 1 : 1 - Math.pow(2, -10 * t),
+  inExpo: t => t === 0 ? 0 : Math.pow(2, 10 * t - 10),
+  inOutExpo: t => t === 0 ? 0 : t === 1 ? 1 : t < .5 ? Math.pow(2, 20 * t - 10) / 2 : (2 - Math.pow(2, -20 * t + 10)) / 2,
+  outBack: t => 1 + 2.70158 * Math.pow(t - 1, 3) + 1.70158 * Math.pow(t - 1, 2),
+};
+/** Canvas text; `max` shrinks the size until the line fits. Returns the width drawn. */
+function text(g, str, x, y, { size = 40, weight = 600, color = '#fff', alpha = 1, spacing = 0, align = 'left', fam = FONT, base = 'alphabetic', max = 0 } = {}) {
+  if (alpha <= 0.002 || !str) return 0;
+  g.font = `${weight} ${size}px ${fam}`; g.letterSpacing = spacing + 'px';
+  if (max) { const w0 = g.measureText(str).width; if (w0 > max) { size *= max / w0; g.font = `${weight} ${size}px ${fam}`; } }
+  g.textAlign = align; g.textBaseline = base;
+  const a0 = g.globalAlpha; g.globalAlpha = a0 * alpha; g.fillStyle = color;
+  g.fillText(str, x, y);
+  const w = g.measureText(str).width;
+  g.globalAlpha = a0; g.letterSpacing = '0px';
+  return w;
+}
+const measure = (g, str, size, weight = 800, fam = FONT, spacing = 0) => { g.font = `${weight} ${size}px ${fam}`; g.letterSpacing = spacing + 'px'; const w = g.measureText(str).width; g.letterSpacing = '0px'; return w; };
+const env = (f, a, b, fin = 12, fout = 10) => {
+  const i = E.outCubic(prog(f, a, a + fin)), o = 1 - E.inCubic(prog(f, b - fout, b));
+  return [Math.min(i, o), (1 - i) * 24 - (1 - o) * 10];
+};
+
+// ---- palette -------------------------------------------------------------
+const C = {
+  bg: '#0A0D12', bgRGB: '10,13,18', paper: '#F1EEE6', dim: 'rgba(241,238,230,0.62)', faint: 'rgba(241,238,230,0.16)',
+  accent: '#FFC857', accentRGB: '255,200,87', keep: '#4BE38A', keepRGB: '75,227,138', skip: '#FF5E6C', skipRGB: '255,94,108',
+  groups: ['#5CD6CB', '#FFC857', '#8FA8FF', '#FF8FA3', '#B8F07A', '#C49BFF', '#FF9F6B', '#7FD1FF'],
+};
+const fmt = n => Math.round(n).toLocaleString('en-US');
+
+// ---- the graph and the walk, computed once per stage ----------------------------------------
+const NPTS = 40, K = 5;
+function makeGraph(G) {
+  const r = mulberry32(G.seed), P = [];
+  for (let guard = 0; P.length < NPTS && guard < 40000; guard++) {
+    const x = lerp(G.bx0, G.bx1, r()), y = lerp(G.by0, G.by1, r());
+    if (P.every(p => Math.hypot(p[0] - x, p[1] - y) >= G.dmin)) P.push([x, y]);
+  }
+  const N = P.length, seen = new Set(), EDG = [];
+  const add = (a, b) => { if (a > b) [a, b] = [b, a]; const key = a * 1000 + b; if (seen.has(key)) return;
+    seen.add(key); EDG.push({ a, b, len: Math.hypot(P[a][0] - P[b][0], P[a][1] - P[b][1]) }); };
+  for (let i = 0; i < N; i++) {
+    const d = P.map((p, j) => [Math.hypot(p[0] - P[i][0], p[1] - P[i][1]), j]).filter(q => q[1] !== i).sort((u, v) => u[0] - v[0] || u[1] - v[1]);
+    for (let q = 0; q < K; q++) add(i, d[q][1]);
+  }
+  // union-find with union by size and path halving
+  const UF = n => { const par = Int16Array.from({ length: n }, (_, i) => i), size = new Int16Array(n).fill(1);
+    const find = x => { while (par[x] !== x) { par[x] = par[par[x]]; x = par[x]; } return x; };
+    return { par, size, find, union(a, b) { a = find(a); b = find(b); if (a === b) return -1; if (size[a] < size[b]) [a, b] = [b, a]; par[b] = a; size[a] += size[b]; return a; } }; };
+  // the candidate graph must be connected: join any stray group by its shortest link
+  for (;;) {
+    const u = UF(N); for (const e of EDG) u.union(e.a, e.b);
+    const r0 = u.find(0), out = []; for (let i = 0; i < N; i++) if (u.find(i) !== r0) out.push(i);
+    if (!out.length) break;
+    let best = null; for (let i = 0; i < N; i++) if (u.find(i) === r0) for (const j of out) { const d = Math.hypot(P[i][0] - P[j][0], P[i][1] - P[j][1]); if (!best || d < best[0]) best = [d, i, j]; }
+    add(best[1], best[2]);
+  }
+  for (const e of EDG) e.w = Math.round(e.len / G.unit);
+  EDG.sort((u, v) => u.w - v.w || u.len - v.len || u.a - v.a || u.b - v.b);
+  const NE = EDG.length, ALL = EDG.reduce((s, e) => s + e.w, 0), WMAX = EDG[NE - 1].w, WMIN = EDG[0].w;
+  // Kruskal: one step per edge looked at; after each step, the colour of every point's group
+  const u = UF(N), gcol = new Int8Array(N).fill(-1);
+  let nextCol = 0, acc = 0, rej = 0, total = 0, comps = N;
+  const steps = [], PC0 = new Int8Array(N).fill(-1);
+  for (let k = 0; k < NE && acc < N - 1; k++) {
+    const e = EDG[k], ra = u.find(e.a), rb = u.find(e.b), keep = ra !== rb;
+    if (keep) {
+      const ca = gcol[ra], cb = gcol[rb], big = u.size[ra] >= u.size[rb] ? ra : rb, small = big === ra ? rb : ra;
+      const col = gcol[big] >= 0 ? gcol[big] : gcol[small] >= 0 ? gcol[small] : (nextCol++ % C.groups.length);
+      const root = u.union(ra, rb); gcol[root] = col; void ca; void cb;
+      acc++; total += e.w; comps--;
+    } else rej++;
+    const pc = new Int8Array(N); for (let i = 0; i < N; i++) { const q = u.find(i); pc[i] = u.size[q] > 1 ? gcol[q] : -1; }
+    steps.push({ k, keep, acc, rej, total, comps, pc, size: keep ? u.size[u.find(e.a)] : 0 });
+  }
+  const S = steps.length, firstSkip = steps.findIndex(s => !s.keep);
+  return { P, N, EDG, NE, ALL, WMAX, WMIN, steps, S, PC0, total, rej, firstSkip };
+}
+
+// ---- timeline -------------------------------------------------------------------------------
+// pop0: the points appear; lines0: the candidate links; bars0: the sorted list; scan0..scan1: the walk
+// (the first slowN steps at slowD frames each, the rest share what is left); calm: the verdict; end: the card.
+function buildTL(o, Gr) {
+  const TL = Object.assign({}, o);
+  TL.fastD = (TL.scan1 - TL.scan0 - TL.slowN * TL.slowD) / (Gr.S - TL.slowN);
+  TL.start = k => TL.scan0 + (k < TL.slowN ? k * TL.slowD : TL.slowN * TL.slowD + (k - TL.slowN) * TL.fastD);
+  const s = TL.start, fs = Gr.firstSkip, fsAt = Math.max(s(fs), s(TL.slowN) + 4);
+  TL.caps = [
+    [TL.lines0 - 4, TL.scan0 - 2, 'Every link to a near neighbour,|sorted shortest first.'],
+    [TL.scan0, fsAt - 2, 'Take the shortest one left.|Keep it if it joins two groups.'],
+    [fsAt, fsAt + TL.skipCap, 'Both ends in one group already?|Skip it: it would close a loop.'],
+    [fsAt + TL.skipCap + 2, TL.scan1 + 2, 'Union-find answers “same group?”|in near-constant time.'],
+    [TL.scan1 + 4, TL.calm - 2, `${Gr.N - 1} links join all ${Gr.N} points.|The last ${Gr.NE - Gr.S} are never checked.`],
+  ];
+  return TL;
+}
+/** The step in progress at frame f (-1 before the walk) and how far through it (0..1). */
+function stepAt(TL, Gr, f) {
+  if (f < TL.scan0) return { k: -1, p: 1 };
+  if (f >= TL.scan1) return { k: Gr.S - 1, p: 1 };
+  const b = TL.start(TL.slowN);
+  let k = f < b ? Math.floor((f - TL.scan0) / TL.slowD) : TL.slowN + Math.floor((f - b) / TL.fastD);
+  k = Math.min(Gr.S - 1, k);
+  return { k, p: clamp((f - TL.start(k)) / (TL.start(k + 1) - TL.start(k))) };
+}
+const DEC = 0.4;                                          // fraction of a step at which the decision lands
+
+// ---- drawing ------------------------------------------------------------------------------
+function graph(g, G, f) {
+  const TL = G.TL, Gr = G.Gr, { P, N, EDG, steps } = Gr, { k, p } = stepAt(TL, Gr, f);
+  const decided = k >= 0 && p >= DEC, cur = k >= 0 ? steps[k] : null;
+  const snap = k < 0 ? null : decided ? steps[k] : (k > 0 ? steps[k - 1] : null);
+  const pc = snap ? snap.pc : Gr.PC0;
+  const linesA = E.outCubic(prog(f, TL.lines0, TL.lines0 + 24));
+  const rest = 1 - E.inOutCubic(prog(f, TL.scan1, TL.scan1 + 26));          // unchecked links fade once the tree is done
+  g.save(); g.lineCap = 'round';
+  // candidate links: faint until looked at; skipped ones flash red and are gone
+  for (let q = 0; q < EDG.length; q++) {
+    const e = EDG[q], [ax, ay] = P[e.a], [bx, by] = P[e.b];
+    if (k >= 0 && q < k) { if (!steps[q].keep) continue; }
+    else if (k >= 0 && q === k) continue;
+    else { g.globalAlpha = linesA * 0.2 * (q >= Gr.S ? rest : 1); if (g.globalAlpha < 0.01) continue; g.strokeStyle = C.paper; g.lineWidth = 1.6;
+      g.beginPath(); g.moveTo(ax, ay); g.lineTo(bx, by); g.stroke(); continue; }
+    // a kept link, coloured by its group now
+    const col = pc[e.a] >= 0 ? C.groups[pc[e.a]] : C.keep;
+    g.globalAlpha = 1; g.strokeStyle = col; g.lineWidth = G.lw; g.beginPath(); g.moveTo(ax, ay); g.lineTo(bx, by); g.stroke();
+  }
+  // the link being looked at
+  if (cur && f < TL.scan1) {
+    const e = EDG[cur.k], [ax, ay] = P[e.a], [bx, by] = P[e.b], grow = E.outCubic(prog(p, 0, DEC));
+    const mx = lerp(ax, bx, 0.5), my = lerp(ay, by, 0.5), hx = (bx - ax) / 2 * grow, hy = (by - ay) / 2 * grow;
+    if (!decided) {
+      g.globalAlpha = 1; g.strokeStyle = C.accent; g.lineWidth = G.lw + 1;
+      g.beginPath(); g.moveTo(mx - hx, my - hy); g.lineTo(mx + hx, my + hy); g.stroke();
+    } else if (cur.keep) {
+      const q = prog(p, DEC, 1), col = pc[e.a] >= 0 ? C.groups[pc[e.a]] : C.keep;
+      g.globalAlpha = 1 - q * 0.7; g.strokeStyle = `rgba(${C.keepRGB},0.5)`; g.lineWidth = G.lw + 12 * (1 - q); g.beginPath(); g.moveTo(ax, ay); g.lineTo(bx, by); g.stroke();
+      g.globalAlpha = 1; g.strokeStyle = col; g.lineWidth = G.lw; g.beginPath(); g.moveTo(ax, ay); g.lineTo(bx, by); g.stroke();
+    } else {
+      const q = prog(p, DEC, 1);
+      g.globalAlpha = 1 - E.inCubic(q); g.strokeStyle = C.skip; g.lineWidth = G.lw; g.setLineDash([10, 8]);
+      g.beginPath(); g.moveTo(ax, ay); g.lineTo(bx, by); g.stroke(); g.setLineDash([]);
+      // an x at the middle
+      const s = 11 * (1 + 0.4 * (1 - q)); g.lineWidth = 4; g.beginPath(); g.moveTo(mx - s, my - s); g.lineTo(mx + s, my + s); g.moveTo(mx + s, my - s); g.lineTo(mx - s, my + s); g.stroke();
+    }
+  }
+  g.restore();
+  // points
+  for (let i = 0; i < N; i++) {
+    const t0 = TL.pop0 + i * TL.popD, s = clamp(E.outBack(prog(f, t0, t0 + 10)), 0, 1.3);
+    if (s <= 0.01) continue;
+    const [x, y] = P[i], col = pc[i] >= 0 ? C.groups[pc[i]] : C.paper;
+    let ring = 0;
+    if (cur && f < TL.scan1) { const e = EDG[cur.k]; if (i === e.a || i === e.b) ring = decided ? 1 - prog(p, DEC, 1) : E.outCubic(prog(p, 0, 0.2)); }
+    g.save();
+    if (ring > 0.01) { g.globalAlpha = ring; g.strokeStyle = decided && !cur.keep ? C.skip : C.accent; g.lineWidth = 3; g.beginPath(); g.arc(x, y, G.pr + 9, 0, Math.PI * 2); g.stroke(); }
+    g.globalAlpha = 1; g.fillStyle = C.bg; g.beginPath(); g.arc(x, y, G.pr * s + 3, 0, Math.PI * 2); g.fill();
+    g.fillStyle = col; g.beginPath(); g.arc(x, y, G.pr * s, 0, Math.PI * 2); g.fill();
+    g.restore();
+  }
+  return { k, p, decided, snap };
+}
+/** The sorted list as bars, shortest first; a cursor walks it. */
+function bars(g, G, f, st) {
+  const TL = G.TL, Gr = G.Gr, { EDG, NE, WMAX, WMIN, steps } = Gr, [a] = env(f, TL.bars0, TL.end + 10, 14, 12);
+  if (a <= 0) return;
+  const bw = G.barW / NE, rest = 1 - E.inOutCubic(prog(f, TL.scan1, TL.scan1 + 26));
+  g.save();
+  for (let q = 0; q < NE; q++) {
+    const h = G.barH * (0.14 + 0.86 * (EDG[q].w - WMIN) / Math.max(1, WMAX - WMIN)) * E.outCubic(prog(f, TL.bars0 + q * 0.2, TL.bars0 + q * 0.2 + 14));
+    if (h <= 0.5) continue;
+    let col = 'rgba(241,238,230,0.3)', al = a;
+    if (st.k >= 0 && (q < st.k || (q === st.k && st.decided))) { col = steps[q].keep ? C.keep : C.skip; al = a * (steps[q].keep ? 1 : 0.55); }
+    else if (st.k >= 0 && q === st.k && f < TL.scan1) col = C.accent;
+    else if (q >= Gr.S) al = a * lerp(0.3, 1, rest);
+    g.globalAlpha = al; g.fillStyle = col; g.fillRect(G.barX + q * bw + bw * 0.12, G.barY - h, Math.max(1, bw * 0.76), h);
+  }
+  // the cursor
+  if (st.k >= 0 && f < TL.scan1 + 10) {
+    const x = G.barX + (st.k + 0.5) * bw, ca = 1 - prog(f, TL.scan1, TL.scan1 + 10);
+    g.globalAlpha = a * ca; g.fillStyle = C.accent; g.beginPath(); g.moveTo(x, G.barY + 6); g.lineTo(x - 9, G.barY + 20); g.lineTo(x + 9, G.barY + 20); g.closePath(); g.fill();
+  }
+  // where the walk stopped
+  if (f >= TL.scan1) {
+    const k2 = E.outCubic(prog(f, TL.scan1 + 6, TL.scan1 + 26)), x = G.barX + Gr.S * bw;
+    g.globalAlpha = a * k2; g.strokeStyle = C.paper; g.lineWidth = 2; g.setLineDash([6, 6]);
+    g.beginPath(); g.moveTo(x, G.barY - G.barH - 10); g.lineTo(x, G.barY + 4); g.stroke(); g.setLineDash([]);
+    g.globalAlpha = 1;
+    text(g, 'never checked', x + 14, G.barY - G.barH + 18, { size: 28, weight: 700, color: C.dim, alpha: a * k2 });
+  }
+  g.restore();
+}
+function caption(g, G, f) {
+  for (const [t0, t1, str] of G.TL.caps) {
+    const [a, dy] = env(f, t0, t1, 12, 10); if (a <= 0) continue;
+    const [p1, p2] = str.split('|');
+    if (G.capTwo) {
+      text(g, p1, G.capX, G.capY + dy, { size: G.cap, weight: 850, color: C.paper, spacing: -1, alpha: a, max: G.capMax });
+      text(g, p2, G.capX, G.capY + G.cap * 1.14 + dy, { size: G.cap, weight: 850, color: C.accent, spacing: -1, alpha: a, max: G.capMax });
+    } else {
+      const w1 = text(g, p1 + ' ', G.capX, G.capY + dy, { size: G.cap, weight: 850, color: C.paper, spacing: -1, alpha: a });
+      text(g, p2, G.capX + w1, G.capY + dy, { size: G.cap, weight: 850, color: C.accent, spacing: -1, alpha: a });
+    }
+  }
+}
+function readout(g, G, f, st) {
+  const TL = G.TL, Gr = G.Gr, [a] = env(f, TL.lines0 - 4, TL.end + 10, 12, 12);
+  if (a <= 0) return;
+  const s = st.snap, acc = s ? s.acc : 0, rej = s ? s.rej : 0, comps = s ? s.comps : Gr.N, total = s ? s.total : 0;
+  const seen = st.k < 0 ? 0 : st.k + (st.decided ? 1 : 0);
+  const l1 = `link ${seen} of ${Gr.NE}  ·  kept ${acc}  ·  skipped ${rej}`;
+  const l2 = `${comps} group${comps === 1 ? '' : 's'}  ·  length ${fmt(total)}`;
+  text(g, l1, G.foX, G.foY, { size: G.fo, weight: 700, color: C.paper, fam: MONO, alpha: a, align: G.foAlign, max: G.foMax });
+  text(g, l2, G.foX2, G.foY2, { size: G.fo, weight: 700, color: C.dim, fam: MONO, alpha: a, align: G.foAlign2, max: G.foMax });
+}
+function finale(g, G, f) {
+  const TL = G.TL, Gr = G.Gr, k1 = E.outCubic(prog(f, TL.calm, TL.calm + 18)), k2 = E.outCubic(prog(f, TL.calm + 10, TL.calm + 28));
+  if (k1 <= 0) return;
+  const out = 1 - E.inCubic(prog(f, TL.end - 6, TL.end + 12));
+  g.save(); g.fillStyle = `rgba(${C.bgRGB},${0.8 * k1 * out})`; g.fillRect(0, G.fnY - G.fn * 1.2, G.w, G.fn * 2.9); g.restore();
+  text(g, `${Gr.N - 1} links, length ${fmt(Gr.total)}.`, G.fnX, G.fnY, { size: G.fn, weight: 900, color: C.paper, spacing: -2, align: G.fnAlign, alpha: k1 * out, max: G.fnMax });
+  text(g, `All ${Gr.NE} links: ${fmt(Gr.ALL)}.  The tree needs ${Math.round(100 * Gr.total / Gr.ALL)}%.`, G.fnX, G.fnY + G.fn * 1.05, { size: G.fn * 0.6, weight: 850, color: C.accent, spacing: -1, align: G.fnAlign, alpha: k2 * out, max: G.fnMax });
+}
+function scene(g, G, f) {
+  const st = graph(g, G, f);
+  bars(g, G, f, st);
+  caption(g, G, f); readout(g, G, f, st); finale(g, G, f);
+  return st;
+}
+
+// ---- landscape picture ------------------------------------------------------------------
+const GL = { w: W, h: H, seed: 0x50C0FE, bx0: 170, bx1: 1750, by0: 300, by1: 790, dmin: 118, unit: 10, lw: 5, pr: 11,
+  capX: 120, capY: 216, cap: 52, capTwo: false, capMax: 1680,
+  barX: 120, barW: 1680, barY: 942, barH: 92,
+  fo: 30, foX: 120, foY: 1004, foAlign: 'left', foX2: 1800, foY2: 1004, foAlign2: 'right', foMax: 900,
+  fn: 96, fnX: W / 2, fnY: 560, fnAlign: 'center', fnMax: 1680 };
+GL.Gr = makeGraph(GL);
+const TLL = GL.TL = buildTL({ pop0: 40, popD: 1, lines0: 84, bars0: 104, scan0: 146, slowN: 8, slowD: 22, scan1: 612, skipCap: 72, calm: 668, end: 736 }, GL.Gr);
+const FRAMES = TLL.end + 72;
+function hookL(f) {
+  const o = 1 - E.inCubic(prog(f, TLL.pop0 - 6, TLL.pop0 + 12));
+  if (o <= 0) return;
+  const k = E.outExpo(prog(f, -8, 10)), k2 = E.outBack(prog(f, -6, 12));
+  ctx.save(); ctx.fillStyle = `rgba(${C.bgRGB},${0.8 * o})`; ctx.fillRect(0, 400, W, 330); ctx.restore();
+  text(ctx, `${GL.Gr.N} points. Join them all.`, W / 2, 540 + (1 - k) * 30, { size: 108, weight: 900, color: C.paper, spacing: -3, align: 'center', alpha: o * Math.max(0.3, k) });
+  text(ctx, 'Use the least wire.', W / 2, 670 + (1 - clamp(k2)) * 30, { size: 108, weight: 900, color: C.accent, spacing: -3, align: 'center', alpha: o * Math.max(0.3, clamp(k2)) });
+}
+function draw(f) {
+  if (ctx.reset) ctx.reset();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; ctx.filter = 'none'; ctx.shadowBlur = 0;
+  ctx.fillStyle = C.bg; ctx.fillRect(0, 0, W, H);
+  const T = TLL, endK = E.inOutCubic(prog(f, T.end, T.end + 20)), a = 1 - endK;
+  scene(ctx, GL, f);
+  text(ctx, 'GRAPHS  ·  MINIMUM SPANNING TREE', 120, 104, { size: 26, weight: 600, color: C.dim, spacing: 5, alpha: a });
+  text(ctx, 'BYTEPATTERNS', 1800, 104, { size: 26, weight: 600, color: C.dim, spacing: 5, align: 'right', alpha: a });
+  hookL(f);
+  if (endK > 0) {
+    ctx.fillStyle = `rgba(${C.bgRGB},${0.86 * endK})`; ctx.fillRect(0, 0, W, H);
+    const k1 = E.outCubic(prog(f, T.end + 6, T.end + 28)), k2 = E.outCubic(prog(f, T.end + 16, T.end + 38)), k3 = E.outCubic(prog(f, T.end + 26, T.end + 48));
+    text(ctx, 'Kruskal’s Spanning Tree', W / 2, 500 + (1 - k1) * 30, { size: 132, weight: 850, color: C.paper, spacing: -3, align: 'center', alpha: k1, max: 1680 });
+    text(ctx, `${GL.Gr.N} points  ·  ${GL.Gr.NE} links sorted  ·  ${GL.Gr.S} checked  ·  ${GL.Gr.N - 1} kept`, W / 2, 580 + (1 - k2) * 20, { size: 42, weight: 500, color: C.accent, align: 'center', alpha: k2 });
+    text(ctx, 'drawn in code  ·  bytepatterns.com', W / 2, 1000, { size: 32, weight: 600, color: C.paper, spacing: 3, align: 'center', alpha: k3 * 0.8 });
+  }
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.letterSpacing = '0px';
+}
+
+// ---- sound: a plink per point, a rising note per kept link (higher as groups grow), a dull knock per skip ----
+async function renderAudio(G = GL, frames = FRAMES) {
+  const TL = G.TL, Gr = G.Gr;
+  const SR = 48000, dur = frames / FPS, LEN = Math.round(SR * dur);
+  const ac = new OfflineAudioContext(2, LEN, SR);
+  const at = fr => fr / FPS;
+  const comp = ac.createDynamicsCompressor();
+  comp.threshold.value = -16; comp.ratio.value = 3; comp.attack.value = 0.005; comp.release.value = 0.25;
+  const master = ac.createGain(); master.gain.value = 0.9; master.connect(comp).connect(ac.destination);
+  master.gain.setValueAtTime(0.9, dur - 1.0); master.gain.linearRampToValueAtTime(0.0001, dur - 0.02);
+  const rnd = mulberry32(0x50A0D1);
+  const ir = ac.createBuffer(2, SR * 2, SR);
+  for (let c = 0; c < 2; c++) { const d = ir.getChannelData(c); for (let k = 0; k < d.length; k++) d[k] = (rnd() * 2 - 1) * Math.pow(1 - k / d.length, 3); }
+  const verb = ac.createConvolver(); verb.buffer = ir; const vg = ac.createGain(); vg.gain.value = 0.3; verb.connect(vg).connect(master);
+  const noise = ac.createBuffer(1, SR, SR); { const d = noise.getChannelData(0); for (let k = 0; k < d.length; k++) d[k] = rnd() * 2 - 1; }
+  const hz = m => 440 * Math.pow(2, (m - 69) / 12);
+  const pluck = (t0, m, amp, pan, dec = 0.35, type = 'triangle') => {
+    const o = ac.createOscillator(), g = ac.createGain(), p = ac.createStereoPanner(); o.type = type; o.frequency.value = hz(m);
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(amp, t0 + 0.004); g.gain.exponentialRampToValueAtTime(0.0001, t0 + dec);
+    p.pan.value = pan; o.connect(g).connect(p); p.connect(master); p.connect(verb); o.start(t0); o.stop(t0 + dec + 0.05);
+  };
+  const pad = (t0, t1, notes, amp, cutoff) => {
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = cutoff; lp.Q.value = 1; lp.connect(master); lp.connect(verb);
+    notes.forEach((m, i) => { for (const det of [-6, 6]) {
+      const o = ac.createOscillator(), g = ac.createGain(), p = ac.createStereoPanner(); o.type = 'sawtooth'; o.frequency.value = hz(m); o.detune.value = det;
+      p.pan.value = (i / Math.max(1, notes.length - 1) - 0.5) * 0.8 * Math.sign(det);
+      g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(amp, t0 + 1.0); g.gain.setValueAtTime(amp, Math.max(t0 + 1.0, t1 - 0.8)); g.gain.exponentialRampToValueAtTime(0.0001, t1 + 0.4);
+      o.connect(g).connect(p).connect(lp); o.start(t0); o.stop(t1 + 0.45); } });
+  };
+  const PENTA = [0, 2, 4, 7, 9, 12, 14, 16, 19, 21, 24, 26, 28, 31, 33, 36];
+  pad(0, at(TL.scan0 + 4), [45, 52, 57, 60], 0.012, 850);
+  pad(at(TL.scan0), at(TL.scan1 + 6), [41, 48, 53, 57, 60], 0.012, 1100);
+  pad(at(TL.scan1), at(TL.end + 50), [45, 52, 57, 61, 64], 0.014, 1500);
+  const panX = x => (x / G.w - 0.5) * 1.2;
+  for (let i = 0; i < Gr.N; i += 2) pluck(at(TL.pop0 + i * TL.popD), 84 + PENTA[i % 6], 0.02, panX(Gr.P[i][0]), 0.12, 'sine');
+  { const s = ac.createBufferSource(); s.buffer = noise; const bp = ac.createBiquadFilter(); bp.type = 'bandpass'; bp.Q.value = 2.5;
+    bp.frequency.setValueAtTime(300, at(TL.bars0)); bp.frequency.exponentialRampToValueAtTime(2200, at(TL.bars0 + 34));
+    const g = ac.createGain(); g.gain.setValueAtTime(0.0001, at(TL.lines0)); g.gain.exponentialRampToValueAtTime(0.045, at(TL.bars0 + 28)); g.gain.exponentialRampToValueAtTime(0.0001, at(TL.bars0 + 40));
+    s.connect(bp).connect(g).connect(master); s.start(at(TL.lines0)); s.stop(at(TL.bars0 + 42)); }
+  Gr.steps.forEach((s, k) => {
+    const e = Gr.EDG[s.k], t0 = at(TL.start(k) + DEC * (TL.start(k + 1) - TL.start(k))), pan = panX((Gr.P[e.a][0] + Gr.P[e.b][0]) / 2);
+    if (s.keep) { const m = 60 + PENTA[Math.min(15, Math.round(Math.log2(s.size) * 3.2))]; pluck(t0, m, 0.06, pan, 0.45); pluck(t0 + 0.02, m + 12, 0.02, pan, 0.3, 'sine'); }
+    else {
+      const src = ac.createBufferSource(); src.buffer = noise; const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 500;
+      const g = ac.createGain(); g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(0.09, t0 + 0.005); g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.12);
+      const p = ac.createStereoPanner(); p.pan.value = pan; src.connect(lp).connect(g).connect(p).connect(master); src.start(t0, (k * 0.037) % 0.8); src.stop(t0 + 0.14);
+      pluck(t0, 43, 0.05, pan, 0.18, 'sine');
+    }
+  });
+  [57, 64, 69, 73, 76].forEach((m, i) => pluck(at(TL.scan1) + i * 0.08, m, 0.06, -0.4 + i * 0.2, 1.8, 'sine'));
+  [69, 73, 76, 81].forEach((m, i) => pluck(at(TL.calm) + i * 0.09, m, 0.05, -0.3 + i * 0.2, 1.6, 'sine'));
+  [76, 81, 85, 88].forEach((m, i) => pluck(at(TL.end + 10 + i * 6), m, 0.05, -0.45 + i * 0.3, 1.8, 'sine'));
+  const buf = await ac.startRendering();
+  let peak = 0; for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let k = 0; k < d.length; k++) peak = Math.max(peak, Math.abs(d[k])); }
+  const norm = 0.85 / Math.max(peak, 1e-6);                          // every piece peaks at the same level
+  for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let k = 0; k < d.length; k++) d[k] *= norm; }
+  return buf;
+}
+
+/* ==========================================================================
+   VERTICAL CUT — shared block, identical in every piece.
+   1080x1920 for Reels, Shorts and TikTok (__motion.variants.vertical). The
+   piece's own scene code is re-used and recomposed for a phone: everything a
+   viewer must read stays inside the area no platform covers (x 60..900,
+   y 230..1400); outside it there is only dimmed texture.
+   ========================================================================== */
+const VW = 1080, VH = 1920, SAFE = { x: 60, y: 230, w: 840, h: 1170, r: 900, b: 1400 };
+const vcv = document.createElement('canvas'); vcv.width = VW; vcv.height = VH;
+const vx = vcv.getContext('2d', { willReadFrequently: true });   // CPU raster: identical pixels on every redraw
+const VL = 96, VR = 864;                                          // text column inside the safe area
+
+function vReset() {
+  vx.setTransform(1, 0, 0, 1, 0, 0); vx.globalAlpha = 1; vx.globalCompositeOperation = 'source-over';
+  vx.filter = 'none'; vx.shadowBlur = 0; vx.shadowColor = 'transparent'; vx.letterSpacing = '0px'; vx.setLineDash([]);
+  vx.textAlign = 'left'; vx.textBaseline = 'alphabetic'; vx.lineCap = 'butt'; vx.lineJoin = 'miter';
+}
+/** Canvas text on the vertical frame; `max` shrinks the size until the line fits. */
+function vText(str, x, y, { size = 40, weight = 700, color = '#FFFFFF', align = 'left', spacing = 0, alpha = 1, fam = FONT, max = 0 } = {}) {
+  if (alpha <= 0.002 || !str) return size;
+  vx.font = `${weight} ${size}px ${fam}`; vx.letterSpacing = spacing + 'px';
+  if (max) { const w = vx.measureText(str).width; if (w > max) { size = size * max / w; vx.font = `${weight} ${size}px ${fam}`; } }
+  vx.textAlign = align; vx.textBaseline = 'alphabetic';
+  const a0 = vx.globalAlpha; vx.globalAlpha = a0 * alpha; vx.fillStyle = color;
+  vx.fillText(str, x + (align === 'center' ? spacing / 2 : align === 'right' ? spacing : 0), y);   // tracking is added after the last glyph too
+  vx.globalAlpha = a0; vx.letterSpacing = '0px';
+  return size;
+}
+/** Word-wraps with the given font; returns the lines. */
+function vWrap(str, maxW, size, weight = 700, fam = FONT) {
+  vx.font = `${weight} ${size}px ${fam}`; vx.letterSpacing = '0px';
+  const words = str.split(' '), lines = []; let cur = '';
+  for (const w of words) { const t = cur ? cur + ' ' + w : w; if (vx.measureText(t).width > maxW && cur) { lines.push(cur); cur = w; } else cur = t; }
+  if (cur) lines.push(cur);
+  return lines;
+}
+/** Fade envelope with a small rise: [alpha, dy]. */
+function vEnv(v, a, b, fin = 8, fout = 8) {
+  const i = E.outCubic(prog(v, a, a + fin)), o = 1 - E.inCubic(prog(v, b - fout, b));
+  return [Math.min(i, o), (1 - i) * 22 - (1 - o) * 10];
+}
+/** Which segment of a cut list a vertical frame is in: segs = [{ at, src, len }] in frames. */
+function vSeg(segs, v) {
+  let k = 0; while (k < segs.length - 1 && v >= segs[k + 1].at) k++;
+  const s = segs[k];
+  return { k, s, local: v - s.at, src: s.src + (v - s.at) };
+}
+/** Dims everything outside the safe area to a quiet texture (brightness x 0.2), with a soft inner edge. */
+function vShade(rgb, a = 0.8, feather = 40) {
+  vx.save(); vx.setTransform(1, 0, 0, 1, 0, 0); vx.globalAlpha = 1; vx.globalCompositeOperation = 'source-over';
+  vx.fillStyle = `rgba(${rgb},${a})`;
+  vx.beginPath(); vx.rect(0, 0, VW, VH); vx.rect(SAFE.x, SAFE.y, SAFE.w, SAFE.h); vx.fill('evenodd');
+  const strip = (x0, y0, x1, y1, rx, ry, rw, rh) => {
+    const g = vx.createLinearGradient(x0, y0, x1, y1);
+    g.addColorStop(0, `rgba(${rgb},${a})`); g.addColorStop(1, `rgba(${rgb},0)`);
+    vx.fillStyle = g; vx.fillRect(rx, ry, rw, rh);
+  };
+  strip(SAFE.x, 0, SAFE.x + feather, 0, SAFE.x, SAFE.y, feather, SAFE.h);
+  strip(SAFE.r, 0, SAFE.r - feather, 0, SAFE.r - feather, SAFE.y, feather, SAFE.h);
+  strip(0, SAFE.y, 0, SAFE.y + feather, SAFE.x, SAFE.y, SAFE.w, feather);
+  strip(0, SAFE.b, 0, SAFE.b - feather, SAFE.x, SAFE.b - feather, SAFE.w, feather);
+  vx.restore();
+}
+/** Series tag at the top of the safe area, e.g. MADE IN CODE · 04. */
+function vTag(label, color, alpha = 1) {
+  vText('MADE IN CODE', VL, 292, { size: 28, weight: 800, color, spacing: 5, alpha });
+  vx.font = `800 28px ${FONT}`; vx.letterSpacing = '5px';
+  const w = vx.measureText('MADE IN CODE').width; vx.letterSpacing = '0px';
+  vText('·  ' + label, VL + w + 14, 292, { size: 28, weight: 600, color: 'rgba(255,255,255,0.72)', spacing: 3, alpha, max: VR - VL - w - 14 });
+}
+/** Big hook lines, left-aligned from y0; visible from frame 0, settles in a few frames. */
+function vHook(v, lines, y0, { size = 84, lh = 1.08, color = '#FFFFFF', accent = null, weight = 800, spacing = -1.5, alpha = 1 } = {}) {
+  const k = E.outExpo(prog(v, -6, 12));
+  lines.forEach((ln, i) => {
+    const kk = E.outExpo(prog(v, -12 + i * 2, 8 + i * 2));
+    vText(ln, VL, y0 + i * size * lh + (1 - kk) * 30, { size, weight, spacing, color: accent && i === lines.length - 1 ? accent : color, alpha: alpha * Math.max(0.25, kk), max: VR - VL });
+  });
+  return k;
+}
+/** Closing card, the last 60 frames: piece title, "drawn in code · bytepatterns.com". l = frames into the card. */
+function vEndCard(l, { title, line = '', ink = '#FFFFFF', dim = 'rgba(255,255,255,0.66)', accent = '#FFFFFF', scrim = '0,0,0', a = 0.84 }) {
+  const k = E.outCubic(prog(l, 0, 12));
+  vx.save(); vx.setTransform(1, 0, 0, 1, 0, 0);
+  vx.fillStyle = `rgba(${scrim},${a * k})`; vx.fillRect(0, 0, VW, VH);
+  vx.restore();
+  const t1 = E.outExpo(prog(l, 3, 19)), t2 = E.outExpo(prog(l, 11, 27)), t3 = E.outExpo(prog(l, 19, 35));
+  vx.fillStyle = accent; vx.globalAlpha = t1; vx.fillRect(VL, 742, 88 * t1, 7); vx.globalAlpha = 1;
+  const size = vText(title, VL, 850 + (1 - t1) * 40, { size: 92, weight: 800, color: ink, spacing: -2, alpha: t1, max: VR - VL });
+  const y2 = 850 + Math.max(size, 60) * 0.25 + 70;
+  vx.font = `600 44px ${FONT}`;
+  const lead = 'drawn in code  ·  ', lw = vx.measureText(lead).width;
+  vText(lead, VL, y2 + (1 - t2) * 24, { size: 44, weight: 600, color: dim, alpha: t2 });
+  vText('bytepatterns.com', VL + lw, y2 + (1 - t2) * 24, { size: 44, weight: 800, color: accent, alpha: t2 });
+  if (line) vText(line, VL, y2 + 72 + (1 - t3) * 18, { size: 32, weight: 500, color: dim, alpha: t3, max: VR - VL });
+}
+/** Seeks a cut. The first frame a page draws is drawn twice: the very first read of a
+ *  GPU-backed source canvas can come out a shade different from every later one. */
+let vWarm = false;
+function vSeek(draw, i, frames) {
+  const f = Math.max(0, Math.min(frames - 1, Math.floor(i)));
+  if (!vWarm) { vWarm = true; draw(f); }
+  draw(f);
+}
+/** The soundtrack of a cut: the piece's own audio() spliced to the same segments as the picture. */
+async function vAudio(segs, frames, { xf = 0.025, fadeOut = 0.6, extra = null } = {}) {
+  const src = await renderAudio();
+  const SR = 48000, dur = frames / FPS, ac = new OfflineAudioContext(2, Math.round(SR * dur), SR);
+  const out = ac.createGain(); out.connect(ac.destination);
+  out.gain.setValueAtTime(1, 0); out.gain.setValueAtTime(1, dur - fadeOut); out.gain.linearRampToValueAtTime(0, dur - 0.01);
+  segs.forEach((s, k) => {
+    const at = s.at / FPS, off = s.src / FPS, d = s.len / FPS;
+    const pre = k === 0 ? 0 : Math.min(xf, off), post = k === segs.length - 1 ? 0 : xf;
+    const b = ac.createBufferSource(), g = ac.createGain(); b.buffer = src;
+    g.gain.setValueAtTime(pre ? 0 : 1, at - pre);
+    if (pre) g.gain.linearRampToValueAtTime(1, at + pre);
+    if (post) { g.gain.setValueAtTime(1, at + d - post); g.gain.linearRampToValueAtTime(0, at + d + post); }
+    b.connect(g).connect(out); b.start(at - pre, off - pre, d + pre + post);
+  });
+  if (extra) extra(ac, out);
+  const buf = await ac.startRendering();
+  let peak = 0; for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) peak = Math.max(peak, Math.abs(d[i])); }
+  if (peak > 0.9) for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) d[i] *= 0.9 / peak; }
+  return buf;
+}
+/** A soft three-partial bell, for the closing card. */
+function vChime(ac, dest, at, freq, vol = 0.08) {
+  for (const [mul, v, dec] of [[1, 1, 1.8], [2.01, 0.35, 0.8], [3.02, 0.12, 0.4]]) {
+    const o = ac.createOscillator(), g = ac.createGain(); o.type = 'sine'; o.frequency.value = freq * mul;
+    g.gain.setValueAtTime(0.0001, at); g.gain.exponentialRampToValueAtTime(vol * v, at + 0.006); g.gain.exponentialRampToValueAtTime(0.0001, at + dec);
+    o.connect(g).connect(dest); o.start(at); o.stop(at + dec + 0.05);
+  }
+}
+
+/* VERTICAL CUT — this piece */
+// Forty points of its own, scattered over a portrait field on a 1080 x 1920 stage, and a
+// faster clock; its links, sort, walk and totals are computed for it the same way.
+const GV = { w: VW, h: VH, seed: 0x50C0FE, bx0: 120, bx1: 840, by0: 560, by1: 1110, dmin: 76, unit: 10, lw: 4, pr: 9,
+  capX: VL, capY: 390, cap: 48, capTwo: true, capMax: VR - VL,
+  barX: VL, barW: VR - VL, barY: 1250, barH: 70,
+  fo: 30, foX: VL, foY: 1306, foAlign: 'left', foX2: VL, foY2: 1356, foAlign2: 'left', foMax: VR - VL,
+  fn: 80, fnX: VL, fnY: 800, fnAlign: 'left', fnMax: VR - VL };
+GV.Gr = makeGraph(GV);
+const TLV = GV.TL = buildTL({ pop0: 30, popD: 0.75, lines0: 62, bars0: 76, scan0: 104, slowN: 6, slowD: 18, scan1: 444, skipCap: 56, calm: 480, end: 534 }, GV.Gr);
+const VFR = TLV.end + 60, VEND = VFR - 60;
+function hookV(v) {
+  const o = 1 - E.inCubic(prog(v, TLV.pop0 - 4, TLV.pop0 + 10));
+  if (o <= 0) return;
+  vx.save(); vx.fillStyle = `rgba(${C.bgRGB},${0.84 * o})`; vx.fillRect(SAFE.x, 400, SAFE.w, 560); vx.restore();
+  vHook(v, [`${GV.Gr.N} points.`, 'Join them all', 'with the least', 'wire.'], 510, { size: 104, accent: C.accent, color: C.paper, weight: 900, spacing: -2, alpha: o });
+}
+function vDraw(v) {
+  if (vx.reset) vx.reset();
+  vReset();
+  vx.fillStyle = C.bg; vx.fillRect(0, 0, VW, VH);
+  scene(vx, GV, v);
+  hookV(v);
+  vReset();
+  vShade(C.bgRGB, 0.86);
+  vTag('KRUSKAL’S ALGORITHM', C.accent);
+  if (v >= VEND) vEndCard(v - VEND, { title: 'Kruskal’s Spanning Tree', line: `${GV.Gr.NE} links sorted  ·  ${GV.Gr.S} checked  ·  ${GV.Gr.N - 1} kept`,
+    ink: C.paper, dim: 'rgba(241,238,230,0.72)', accent: C.accent, scrim: C.bgRGB, a: 0.88 });
+  vReset();
+}
+
+// The player asks for a frame on every display refresh; at 30 fps on a 60 Hz screen every other call
+// asks for the frame already on the canvas, which is then left as it is (same frame, same pixels).
+const shown = { L: -1, V: -1 };
+window.__motion = {
+  title: 'Kruskal’s Spanning Tree',
+  description: `${GL.Gr.N} points, each linked to its ${K} nearest neighbours (${GL.Gr.NE} links, total length ${fmt(GL.Gr.ALL)}): Kruskal's algorithm takes the links shortest first, keeps one only when union-find says it joins two groups and skips the ${GL.Gr.rej} that would close a loop, stopping after ${GL.Gr.S} links with a spanning tree of ${GL.Gr.N - 1} links and length ${fmt(GL.Gr.total)}, ${Math.round(100 * GL.Gr.total / GL.Gr.ALL)}% of the whole.`,
+  fps: FPS, width: W, height: H, frames: FRAMES,
+  poster: Math.round(TLL.start(Math.floor(GL.Gr.S * 0.6))),
+  gifStart: Math.floor(TLL.start(TLL.slowN + 4) / FPS),
+  seek(i) { const f = Math.max(0, Math.min(FRAMES - 1, Math.floor(i))); if (f !== shown.L) { shown.L = f; draw(f); } },
+  audio: () => renderAudio(GL, FRAMES),
+  variants: {
+    vertical: {
+      width: VW, height: VH, frames: VFR, canvas: vcv,
+      poster: Math.round(TLV.start(Math.floor(GV.Gr.S * 0.6))), gifStart: Math.floor(TLV.start(TLV.slowN + 4) / FPS),
+      seek(i) { const v = Math.max(0, Math.min(VFR - 1, Math.floor(i))); if (v !== shown.V) { shown.V = v; vSeek(vDraw, v, VFR); } },
+      audio: () => renderAudio(GV, VFR),
+    },
+  },
+};
+
+/* ==========================================================================
+   PLAYER — identical in every piece; keep as is.
+   Autoplays and loops, starts sound on the first click, ?frame=N pauses on a
+   frame, ?variant=vertical plays the vertical cut (if the piece has one).
+   When the renderer sets window.__MOTION_RENDER__ it stays out of the way.
+   ========================================================================== */
+(function player() {
+  const btn = document.getElementById('sound'), q = new URLSearchParams(location.search);
+  let M = window.__motion;
+  const V = !window.__MOTION_RENDER__ && M.variants && M.variants[q.get('variant')];
+  if (V) {                                                // show the variant's own canvas instead
+    M = Object.assign({}, M, V);
+    V.canvas.style.cssText = `width:min(100vw,calc(100vh*${V.width}/${V.height}));height:auto;aspect-ratio:${V.width}/${V.height}`;
+    document.querySelector('canvas').replaceWith(V.canvas);
+  }
+  const dur = M.frames / M.fps;
+  if (window.__MOTION_RENDER__) { btn.hidden = true; M.seek(0); return; }
+  if (q.has('frame')) { btn.hidden = true; M.seek(+q.get('frame') || 0); return; }
+  let t0 = performance.now(), ac = null, src = null, buf = null, paused = false, pausedAt = 0;
+  const clock = () => ac && src ? (ac.currentTime - t0) : (performance.now() - t0) / 1000;
+  function loop() {
+    if (!paused) M.seek(Math.floor(((clock() % dur) + dur) % dur * M.fps));
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+  btn.addEventListener('click', async () => {
+    if (src) { src.stop(); src = null; btn.textContent = 'Click for sound'; t0 = performance.now(); return; }
+    btn.textContent = 'Loading sound…';
+    ac = ac || new AudioContext({ sampleRate: 48000 });
+    buf = buf || await M.audio();
+    await ac.resume();
+    src = ac.createBufferSource(); src.buffer = buf; src.loop = true; src.connect(ac.destination);
+    t0 = ac.currentTime + 0.05; src.start(t0);        // picture restarts from frame 0 in sync with the sound
+    btn.textContent = 'Sound on — click to mute';
+  });
+  addEventListener('keydown', e => {
+    if (e.code !== 'Space') return;
+    e.preventDefault(); paused = !paused;
+    if (ac) paused ? ac.suspend() : ac.resume();
+    if (!ac) { if (paused) pausedAt = performance.now(); else t0 += performance.now() - pausedAt; }
+  });
+})();
+</script>
+</body>
+</html>

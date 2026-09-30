@@ -1,0 +1,605 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="author" content="teambytepatterns">
+<meta name="description" content="A jagged five-pointed star has every corner cut off at a quarter and three quarters of each edge, six times over, until 640 points trace a smooth curve; then its corners are moved to show that each one only bends the curve near it.">
+<title>Cut Every Corner — motion-lab</title>
+<style>
+  /* Player chrome. The piece itself lives entirely in the canvas. */
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  body { display: grid; place-items: center; font: 500 15px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #fff; }
+  canvas { display: block; width: min(100vw, calc(100vh * 16 / 9)); height: auto; aspect-ratio: 16 / 9; }
+  #sound { position: fixed; left: 16px; bottom: 16px; padding: 8px 14px; border: 1px solid rgba(255,255,255,.35); border-radius: 999px;
+           background: rgba(0,0,0,.55); color: #fff; font: inherit; cursor: pointer; }
+  #sound[hidden] { display: none; }
+</style>
+</head>
+<body>
+<canvas id="stage" width="1920" height="1080" aria-label="A jagged white star outline; small dots appear along every edge and the tips break off and fall away, leaving a star with twice as many corners; this repeats until the outline is a smooth rounded flower, drawn over faint copies of every earlier outline; then the outline sways and one tip is pulled out while only nearby parts of the curve follow"></canvas>
+<button id="sound" type="button">Click for sound</button>
+<script>
+'use strict';
+/* ==========================================================================
+   PIECE — Cut Every Corner (Chaikin's algorithm).
+   Take a closed polygon. On every edge put two new points, at 1/4 and 3/4
+   of the way along; keep only the new points. Every corner has been cut
+   off, the polygon has twice as many points and its turns are gentler.
+   Repeat, and the polygon converges to a smooth curve: the quadratic
+   B-spline whose control points are the corners you started with. Because
+   every new point depends on only two old ones, moving one control point
+   only moves a short stretch of the limit curve.
+   Every round, the point counts, the sharpest turn and the length of each
+   polygon, and the number of curve points that follow a moved corner are
+   computed at load; the sway is a function of the frame number, so seek(i)
+   is pure in i.
+   ========================================================================== */
+const W = 1920, H = 1080, FPS = 30;
+const cv = document.getElementById('stage');
+const ctx = cv.getContext('2d', { willReadFrequently: true });   // CPU raster: identical pixels on every redraw
+const FONT = 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
+const MONO = 'ui-monospace, "Cascadia Code", Consolas, Menlo, monospace';
+
+// ---- helpers -------------------------------------------------------------
+function mulberry32(a) { return function () { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a);
+  t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const lerp = (a, b, t) => a + (b - a) * t;
+const prog = (f, a, b) => clamp((f - a) / (b - a));
+const smooth = t => t * t * (3 - 2 * t);
+const E = {
+  inCubic: t => t * t * t,
+  outCubic: t => 1 - Math.pow(1 - t, 3),
+  inOutCubic: t => t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2,
+  outExpo: t => t === 1 ? 1 : 1 - Math.pow(2, -10 * t),
+  inExpo: t => t === 0 ? 0 : Math.pow(2, 10 * t - 10),
+  inOutExpo: t => t === 0 ? 0 : t === 1 ? 1 : t < .5 ? Math.pow(2, 20 * t - 10) / 2 : (2 - Math.pow(2, -20 * t + 10)) / 2,
+  outBack: t => 1 + 2.70158 * Math.pow(t - 1, 3) + 1.70158 * Math.pow(t - 1, 2),
+};
+/** Canvas text; `max` shrinks the size until the line fits. Returns the width drawn. */
+function text(g, str, x, y, { size = 40, weight = 600, color = '#fff', alpha = 1, spacing = 0, align = 'left', fam = FONT, base = 'alphabetic', max = 0 } = {}) {
+  if (alpha <= 0.002 || !str) return 0;
+  g.font = `${weight} ${size}px ${fam}`; g.letterSpacing = spacing + 'px';
+  if (max) { const w0 = g.measureText(str).width; if (w0 > max) { size *= max / w0; g.font = `${weight} ${size}px ${fam}`; } }
+  g.textAlign = align; g.textBaseline = base;
+  const a0 = g.globalAlpha; g.globalAlpha = a0 * alpha; g.fillStyle = color;
+  g.fillText(str, x, y);
+  const w = g.measureText(str).width;
+  g.globalAlpha = a0; g.letterSpacing = '0px';
+  return w;
+}
+const measure = (g, str, size, weight = 800, fam = FONT, spacing = 0) => { g.font = `${weight} ${size}px ${fam}`; g.letterSpacing = spacing + 'px'; const w = g.measureText(str).width; g.letterSpacing = '0px'; return w; };
+const env = (f, a, b, fin = 12, fout = 10) => {
+  const i = E.outCubic(prog(f, a, a + fin)), o = 1 - E.inCubic(prog(f, b - fout, b));
+  return [Math.min(i, o), (1 - i) * 24 - (1 - o) * 10];
+};
+
+// ---- palette -------------------------------------------------------------
+const C = {
+  bg: '#0B0C13', bgRGB: '11,12,19', paper: '#F1EEE6', dim: 'rgba(241,238,230,0.62)', faint: 'rgba(241,238,230,0.16)',
+  accent: '#FFC857', accentRGB: '255,200,87', cut: '#FF7A6B', cutRGB: '255,122,107',
+  // one colour per round, from the jagged start to the smooth end
+  levels: ['#8FA8FF', '#A99BFF', '#C49BFF', '#E59BD6', '#FF9FA8', '#FFB98A', '#FFD27A'],
+};
+const hexRGB = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16)).join(',');
+
+// ---- the polygons ---------------------------------------------------------------------------
+const NC = 10, ROUNDS = 6;
+/** The control star in unit coordinates: alternating long and short spokes, a little uneven. */
+const STAR = (() => { const r = mulberry32(0x52C4A1), P = [];
+  for (let i = 0; i < NC; i++) { const a = -Math.PI / 2 + i * 2 * Math.PI / NC + (r() - 0.5) * 0.18, rad = (i % 2 ? 0.44 : 1) * (0.88 + 0.12 * r());
+    P.push([Math.cos(a) * rad, Math.sin(a) * rad]); }
+  return P; })();
+function chaikin(P) {
+  const n = P.length, Q = new Array(2 * n);
+  for (let i = 0; i < n; i++) { const a = P[i], b = P[(i + 1) % n];
+    Q[2 * i] = [0.75 * a[0] + 0.25 * b[0], 0.75 * a[1] + 0.25 * b[1]]; Q[2 * i + 1] = [0.25 * a[0] + 0.75 * b[0], 0.25 * a[1] + 0.75 * b[1]]; }
+  return Q;
+}
+const levelsOf = P => { const L = [P]; for (let r = 0; r < ROUNDS; r++) L.push(chaikin(L[r])); return L; };
+const LV = levelsOf(STAR);
+/** The sharpest turn (degrees) and the length of a closed polygon. */
+function measureP(P) {
+  let turn = 0, len = 0; const n = P.length;
+  for (let i = 0; i < n; i++) {
+    const a = P[(i + n - 1) % n], b = P[i], c = P[(i + 1) % n];
+    const u = Math.atan2(b[1] - a[1], b[0] - a[0]), v = Math.atan2(c[1] - b[1], c[0] - b[0]);
+    let d = Math.abs(v - u); if (d > Math.PI) d = 2 * Math.PI - d; turn = Math.max(turn, d);
+    len += Math.hypot(c[0] - b[0], c[1] - b[1]);
+  }
+  return { turn: turn * 180 / Math.PI, len };
+}
+const STATS = LV.map(measureP);
+const NPTS = LV.map(P => P.length);
+// local control: pull one corner out along its spoke; how many of the final points move?
+const PULL = 0.22, PI0 = 8;
+const pulled = s => STAR.map((p, i) => i === PI0 ? [p[0] * (1 + s * PULL / Math.hypot(p[0], p[1])), p[1] * (1 + s * PULL / Math.hypot(p[0], p[1]))] : p);
+const LVP = levelsOf(pulled(1));
+const MOVED = LVP[ROUNDS].filter((p, i) => Math.hypot(p[0] - LV[ROUNDS][i][0], p[1] - LV[ROUNDS][i][1]) > 1e-9).length;
+const MOVEDMASK = LVP[ROUNDS].map((p, i) => Math.hypot(p[0] - LV[ROUNDS][i][0], p[1] - LV[ROUNDS][i][1]) > 1e-9);
+const deg = d => `${Math.round(d)}°`;
+
+// ---- timeline -------------------------------------------------------------------------------
+// draw0..draw1: the star is drawn; rs: the start of each round (and the end of the last);
+// sway0..pull0: the control points sway; pull0..pull1: one corner is pulled out and let go;
+// calm: the verdict; end: the closing card.
+function buildTL(o) {
+  const TL = Object.assign({}, o);
+  TL.caps = [
+    [TL.rs[0] - 8, TL.rs[1] - 2, 'Mark each edge at ¼ and ¾,|then cut the corner off.'],
+    [TL.rs[1], TL.rs[ROUNDS] + 2, 'Again, and again:|twice the points, gentler turns.'],
+    [TL.sway0, TL.pull0 - 2, 'The limit is a smooth curve,|steered by the first corners.'],
+    [TL.pull0, TL.calm - 2, 'Move one corner:|only the curve near it follows.'],
+  ];
+  return TL;
+}
+function roundAt(TL, f) {
+  if (f < TL.rs[0]) return { r: 0, p: 0 };
+  for (let r = 0; r < ROUNDS; r++) if (f < TL.rs[r + 1]) return { r: r + 1, p: prog(f, TL.rs[r], TL.rs[r + 1]) };
+  return { r: ROUNDS, p: 1 };
+}
+/** The control star at frame f: still, swaying, or with corner 0 pulled out. */
+function controlAt(TL, f) {
+  if (f >= TL.pull0) { const s = Math.sin(Math.PI * E.inOutCubic(prog(f, TL.pull0 + 6, TL.pull1 - 6))); return { P: pulled(s), s }; }
+  const amp = Math.sin(Math.PI * prog(f, TL.sway0, TL.pull0)) * 0.11, t = (f - TL.sway0) / FPS;
+  if (amp <= 0) return { P: STAR, s: 0 };
+  return { P: STAR.map((p, i) => [p[0] + amp * Math.sin(t * 1.9 + i * 2.1), p[1] + amp * Math.cos(t * 1.5 + i * 1.3)]), s: 0 };
+}
+
+// ---- drawing ------------------------------------------------------------------------------
+function poly(g, G, P, { color, width = 3, alpha = 1, close = true } = {}) {
+  if (alpha <= 0.005) return;
+  g.save(); g.globalAlpha = alpha; g.strokeStyle = color; g.lineWidth = width; g.lineJoin = 'round'; g.lineCap = 'round';
+  g.beginPath();
+  P.forEach((p, i) => { const x = G.cx + p[0] * G.s, y = G.cy + p[1] * G.s; if (i) g.lineTo(x, y); else g.moveTo(x, y); });
+  if (close) g.closePath(); g.stroke(); g.restore();
+}
+const X = (G, p) => [G.cx + p[0] * G.s, G.cy + p[1] * G.s];
+function dots(g, G, P, rad, color, alpha = 1, from = 0, step = 1) {
+  if (alpha <= 0.005) return;
+  g.save(); g.globalAlpha = alpha; g.fillStyle = color;
+  for (let i = from; i < P.length; i += step) { const [x, y] = X(G, P[i]); g.beginPath(); g.arc(x, y, rad, 0, Math.PI * 2); g.fill(); }
+  g.restore();
+}
+function rounds(g, G, f) {
+  const TL = G.TL, { r, p } = roundAt(TL, f);
+  if (f < TL.sway0 - 4) {
+    // ghosts of the rounds already done, inside the current shape
+    for (let q = 0; q < r - 1 + (p >= 0.35 ? 1 : 0); q++) poly(g, G, LV[q], { color: C.levels[q], width: 1.6, alpha: 0.32 });
+    if (f < TL.rs[0]) {
+      // the star is drawn on, edge by edge
+      const k = E.inOutCubic(prog(f, TL.draw0, TL.draw1)), n = STAR.length, upto = k * n;
+      const Pp = []; for (let i = 0; i <= Math.floor(upto) && i <= n; i++) Pp.push(STAR[i % n]);
+      if (upto < n) { const i = Math.floor(upto), a = STAR[i % n], b = STAR[(i + 1) % n], u = upto - i; Pp.push([lerp(a[0], b[0], u), lerp(a[1], b[1], u)]); }
+      poly(g, G, Pp, { color: C.levels[0], width: G.lw, close: false });
+      dots(g, G, STAR.slice(0, Math.ceil(upto)), G.dot + 2, C.paper, 1);
+      return { r: 0, p: 0 };
+    }
+    const old = LV[r - 1], nw = LV[r], n = old.length;
+    const markK = E.outCubic(prog(p, 0.02, 0.34));
+    if (p < 0.35) {
+      poly(g, G, old, { color: C.levels[r - 1], width: G.lw });
+      if (r === 1 || n <= 36) dots(g, G, old, G.dot, C.paper, 0.9);
+      // the new points appear one edge after another
+      g.save(); g.fillStyle = C.accent;
+      for (let i = 0; i < n; i++) { const k = clamp((markK * (n + 3) - i) / 3); if (k <= 0) continue;
+        for (const q of [nw[2 * i], nw[2 * i + 1]]) { const [x, y] = X(G, q); g.globalAlpha = k; g.beginPath(); g.arc(x, y, G.dot * (0.6 + 0.6 * k) * Math.max(0.5, 1.4 - r * 0.15), 0, Math.PI * 2); g.fill(); } }
+      g.restore();
+    } else {
+      poly(g, G, nw, { color: C.levels[r], width: G.lw });
+      // the cut-off corners fall away, one after another around the shape
+      g.save(); g.lineJoin = 'round'; g.lineCap = 'round';
+      for (let i = 0; i < n; i++) {
+        const t0 = 0.35 + 0.34 * i / n, q = E.inCubic(prog(p, t0, t0 + 0.3)); if (q >= 1) continue;
+        const a = nw[(2 * i - 1 + 2 * n) % (2 * n)], c = old[i], b = nw[2 * i];
+        const out = Math.hypot(c[0], c[1]) || 1, dx = c[0] / out, dy = c[1] / out;
+        const off = [dx * q * 0.28, dy * q * 0.28 + q * q * 0.5];
+        const pts = [a, c, b].map(v => X(G, [v[0] + off[0], v[1] + off[1]]));
+        g.globalAlpha = (1 - q) * 0.95; g.strokeStyle = C.cut; g.lineWidth = Math.max(1.5, G.lw - r * 0.3);
+        g.beginPath(); g.moveTo(...pts[0]); g.lineTo(...pts[1]); g.lineTo(...pts[2]); g.stroke();
+      }
+      g.restore();
+      if (r === 1 || n <= 36) dots(g, G, nw, G.dot * 0.8, C.accent, 1 - E.inCubic(prog(p, 0.7, 1)));
+    }
+    return { r, p };
+  }
+  // the smooth curve under moving control points, over all its rounds
+  const { P, s } = controlAt(TL, f), L = levelsOf(P), a = E.outCubic(prog(f, TL.sway0 - 4, TL.sway0 + 16));
+  for (let q = 0; q < ROUNDS; q++) poly(g, G, L[q], { color: C.levels[q], width: q ? 1.6 : 2.2, alpha: lerp(0.32, q ? 0.4 : 0.7, a) });
+  dots(g, G, P, G.dot + 2, C.paper, 0.9);
+  // trails of the curve a moment earlier
+  if (f < TL.pull0) for (let k = 4; k >= 1; k--) { const Pk = controlAt(TL, f - k * 2).P; poly(g, G, levelsOf(Pk)[ROUNDS], { color: C.levels[ROUNDS], width: G.lw, alpha: 0.1 * (5 - k) * a }); }
+  const fin = L[ROUNDS];
+  poly(g, G, fin, { color: C.levels[ROUNDS], width: G.lw + 12, alpha: 0.12 * a });
+  poly(g, G, fin, { color: C.levels[ROUNDS], width: G.lw + 1 });
+  if (f >= TL.pull0) {
+    const k = Math.min(E.outCubic(prog(f, TL.pull0, TL.pull0 + 14)), 1 - E.inCubic(prog(f, TL.pull1 + 10, TL.pull1 + 30)));
+    if (k > 0.01) {
+      // the stretch that follows the moved corner
+      g.save(); g.globalAlpha = k; g.strokeStyle = C.paper; g.lineWidth = G.lw + 4; g.lineCap = 'round'; g.lineJoin = 'round'; g.beginPath();
+      let on = false; for (let i = 0; i <= fin.length; i++) { const j = i % fin.length; if (!MOVEDMASK[j]) { on = false; continue; } const [x, y] = X(G, fin[j]); if (on) g.lineTo(x, y); else { g.moveTo(x, y); on = true; } }
+      g.stroke(); g.restore();
+      const [x, y] = X(G, P[PI0]); g.save(); g.globalAlpha = k; g.strokeStyle = C.accent; g.lineWidth = 3; g.beginPath(); g.arc(x, y, 18 + 6 * s, 0, Math.PI * 2); g.stroke(); g.restore();
+    }
+  }
+  return { r: ROUNDS, p: 1, s };
+}
+function caption(g, G, f) {
+  for (const [t0, t1, str] of G.TL.caps) {
+    const [a, dy] = env(f, t0, t1, 12, 10); if (a <= 0) continue;
+    const [p1, p2] = str.split('|');
+    if (G.capTwo) {
+      text(g, p1, G.capX, G.capY + dy, { size: G.cap, weight: 850, color: C.paper, spacing: -1, alpha: a, max: G.capMax });
+      text(g, p2, G.capX, G.capY + G.cap * 1.14 + dy, { size: G.cap, weight: 850, color: C.accent, spacing: -1, alpha: a, max: G.capMax });
+    } else {
+      const w1 = text(g, p1 + ' ', G.capX, G.capY + dy, { size: G.cap, weight: 850, color: C.paper, spacing: -1, alpha: a });
+      text(g, p2, G.capX + w1, G.capY + dy, { size: G.cap, weight: 850, color: C.accent, spacing: -1, alpha: a });
+    }
+  }
+}
+/** The table of rounds: points, sharpest turn, length (landscape only). */
+function table(g, G, f, st) {
+  const TL = G.TL; if (!G.table) return;
+  const [a] = env(f, TL.rs[0] - 10, TL.end + 10, 14, 12);
+  if (a <= 0) return;
+  const x0 = G.tx, cols = [0, 150, 330], hy = G.ty;
+  ['round', 'points', 'sharpest turn'].forEach((h, i) => text(g, h, x0 + cols[i], hy, { size: 28, weight: 700, color: C.dim, alpha: a }));
+  for (let q = 0; q <= ROUNDS; q++) {
+    const shown = q === 0 ? 1 : E.outCubic(prog(f, TL.rs[q - 1] + (TL.rs[q] - TL.rs[q - 1]) * 0.4, TL.rs[q - 1] + (TL.rs[q] - TL.rs[q - 1]) * 0.4 + 10));
+    if (shown <= 0) continue;
+    const y = hy + 56 + q * 54, cur = q === st.r && f < TL.sway0;
+    g.save(); g.globalAlpha = a * shown; g.fillStyle = C.levels[q]; g.fillRect(x0 - 26, y - 22, 10, 26); g.restore();
+    const col = cur ? C.paper : C.dim;
+    text(g, String(q), x0 + cols[0], y, { size: 32, weight: 800, color: col, fam: MONO, alpha: a * shown });
+    text(g, String(NPTS[q]), x0 + cols[1], y, { size: 32, weight: 800, color: cur ? C.accent : col, fam: MONO, alpha: a * shown });
+    text(g, deg(STATS[q].turn), x0 + cols[2], y, { size: 32, weight: 800, color: col, fam: MONO, alpha: a * shown });
+  }
+}
+function readout(g, G, f, st) {
+  const TL = G.TL, [a] = env(f, TL.draw0, TL.end + 10, 12, 12);
+  if (a <= 0) return;
+  let l1, l2;
+  if (f >= TL.pull0) { l1 = `1 of ${NC} corners moved`; l2 = `${MOVED} of ${NPTS[ROUNDS]} curve points follow`; }
+  else if (f >= TL.sway0) { l1 = `${NC} control points`; l2 = `${ROUNDS} rounds  ·  ${NPTS[ROUNDS]} points`; }
+  else {
+    const q = st.p >= 0.35 ? st.r : Math.max(0, st.r - 1);
+    l1 = `round ${st.r}  ·  ${NPTS[q]} points`; l2 = `sharpest turn ${deg(STATS[q].turn)}  ·  length ${(STATS[q].len / STATS[0].len * 100).toFixed(1)}%`;
+  }
+  text(g, l1, G.foX, G.foY, { size: G.fo, weight: 700, color: C.paper, fam: MONO, alpha: a, align: G.foAlign });
+  text(g, l2, G.foX2, G.foY2, { size: G.fo, weight: 700, color: C.dim, fam: MONO, alpha: a, align: G.foAlign2 });
+}
+function finale(g, G, f) {
+  const TL = G.TL, k1 = E.outCubic(prog(f, TL.calm, TL.calm + 18)), k2 = E.outCubic(prog(f, TL.calm + 10, TL.calm + 28));
+  if (k1 <= 0) return;
+  const out = 1 - E.inCubic(prog(f, TL.end - 6, TL.end + 12));
+  g.save(); g.fillStyle = `rgba(${C.bgRGB},${0.8 * k1 * out})`; g.fillRect(0, G.fnY - G.fn * 1.2, G.w, G.fn * 2.9); g.restore();
+  text(g, `${NC} corners, ${NPTS[ROUNDS]} points.`, G.fnX, G.fnY, { size: G.fn, weight: 900, color: C.paper, spacing: -2, align: G.fnAlign, alpha: k1 * out, max: G.fnMax });
+  text(g, `Sharpest turn ${deg(STATS[0].turn)} → ${deg(STATS[ROUNDS].turn)}`, G.fnX, G.fnY + G.fn * 1.05, { size: G.fn * 0.62, weight: 850, color: C.accent, spacing: -1, align: G.fnAlign, alpha: k2 * out, max: G.fnMax });
+}
+function scene(g, G, f) {
+  const st = rounds(g, G, f);
+  table(g, G, f, st);
+  caption(g, G, f); readout(g, G, f, st); finale(g, G, f);
+  return st;
+}
+
+// ---- landscape picture ------------------------------------------------------------------
+const TLL = buildTL({ draw0: 40, draw1: 92, rs: [98, 198, 268, 322, 364, 400, 434], sway0: 444, pull0: 560, pull1: 656, calm: 668, end: 736 });
+const FRAMES = TLL.end + 72;
+const GL = { TL: TLL, w: W, h: H, cx: 700, cy: 620, s: 340, lw: 4, dot: 5,
+  table: true, tx: 1300, ty: 380,
+  capX: 120, capY: 216, cap: 52, capTwo: false, capMax: 1680,
+  fo: 30, foX: 120, foY: 1004, foAlign: 'left', foX2: 1800, foY2: 1004, foAlign2: 'right',
+  fn: 100, fnX: W / 2, fnY: 560, fnAlign: 'center', fnMax: 1680 };
+function hookL(f) {
+  const o = 1 - E.inCubic(prog(f, TLL.draw0 - 14, TLL.draw0 + 4));
+  if (o <= 0) return;
+  const k = E.outExpo(prog(f, -8, 10)), k2 = E.outBack(prog(f, -6, 12));
+  ctx.save(); ctx.fillStyle = `rgba(${C.bgRGB},${0.8 * o})`; ctx.fillRect(0, 400, W, 330); ctx.restore();
+  text(ctx, 'Cut every corner.', W / 2, 540 + (1 - k) * 30, { size: 108, weight: 900, color: C.paper, spacing: -3, align: 'center', alpha: o * Math.max(0.3, k) });
+  text(ctx, `Then do it ${ROUNDS - 1} more times.`, W / 2, 670 + (1 - clamp(k2)) * 30, { size: 108, weight: 900, color: C.accent, spacing: -3, align: 'center', alpha: o * Math.max(0.3, clamp(k2)) });
+}
+function draw(f) {
+  if (ctx.reset) ctx.reset();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; ctx.filter = 'none'; ctx.shadowBlur = 0;
+  ctx.fillStyle = C.bg; ctx.fillRect(0, 0, W, H);
+  const T = TLL, endK = E.inOutCubic(prog(f, T.end, T.end + 20)), a = 1 - endK;
+  scene(ctx, GL, f);
+  text(ctx, 'GEOMETRY  ·  CHAIKIN’S CORNER CUTTING', 120, 104, { size: 26, weight: 600, color: C.dim, spacing: 5, alpha: a });
+  text(ctx, 'BYTEPATTERNS', 1800, 104, { size: 26, weight: 600, color: C.dim, spacing: 5, align: 'right', alpha: a });
+  hookL(f);
+  if (endK > 0) {
+    ctx.fillStyle = `rgba(${C.bgRGB},${0.86 * endK})`; ctx.fillRect(0, 0, W, H);
+    const k1 = E.outCubic(prog(f, T.end + 6, T.end + 28)), k2 = E.outCubic(prog(f, T.end + 16, T.end + 38)), k3 = E.outCubic(prog(f, T.end + 26, T.end + 48));
+    text(ctx, 'Cut Every Corner', W / 2, 500 + (1 - k1) * 30, { size: 140, weight: 850, color: C.paper, spacing: -3, align: 'center', alpha: k1, max: 1680 });
+    text(ctx, `Chaikin’s algorithm  ·  ${ROUNDS} rounds  ·  ${NC} → ${NPTS[ROUNDS]} points  ·  a quadratic B-spline`, W / 2, 580 + (1 - k2) * 20, { size: 42, weight: 500, color: C.accent, align: 'center', alpha: k2, max: 1680 });
+    text(ctx, 'drawn in code  ·  bytepatterns.com', W / 2, 1000, { size: 32, weight: 600, color: C.paper, spacing: 3, align: 'center', alpha: k3 * 0.8 });
+  }
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.letterSpacing = '0px';
+}
+
+// ---- sound: a rising line as the star is drawn, ticks as the edges are marked, a fall of clicks as corners drop, a chord per round ----
+async function renderAudio(TL = TLL, frames = FRAMES) {
+  const SR = 48000, dur = frames / FPS, LEN = Math.round(SR * dur);
+  const ac = new OfflineAudioContext(2, LEN, SR);
+  const at = fr => fr / FPS;
+  const comp = ac.createDynamicsCompressor();
+  comp.threshold.value = -16; comp.ratio.value = 3; comp.attack.value = 0.005; comp.release.value = 0.25;
+  const master = ac.createGain(); master.gain.value = 0.9; master.connect(comp).connect(ac.destination);
+  master.gain.setValueAtTime(0.9, dur - 1.0); master.gain.linearRampToValueAtTime(0.0001, dur - 0.02);
+  const rnd = mulberry32(0x52A0D1);
+  const ir = ac.createBuffer(2, SR * 2.5, SR);
+  for (let c = 0; c < 2; c++) { const d = ir.getChannelData(c); for (let k = 0; k < d.length; k++) d[k] = (rnd() * 2 - 1) * Math.pow(1 - k / d.length, 2.6); }
+  const verb = ac.createConvolver(); verb.buffer = ir; const vg = ac.createGain(); vg.gain.value = 0.36; verb.connect(vg).connect(master);
+  const hz = m => 440 * Math.pow(2, (m - 69) / 12);
+  const pluck = (t0, m, amp, pan, dec = 0.35, type = 'triangle') => {
+    const o = ac.createOscillator(), g = ac.createGain(), p = ac.createStereoPanner(); o.type = type; o.frequency.value = hz(m);
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(amp, t0 + 0.004); g.gain.exponentialRampToValueAtTime(0.0001, t0 + dec);
+    p.pan.value = pan; o.connect(g).connect(p); p.connect(master); p.connect(verb); o.start(t0); o.stop(t0 + dec + 0.05);
+  };
+  const pad = (t0, t1, notes, amp, cutoff) => {
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = cutoff; lp.Q.value = 1; lp.connect(master); lp.connect(verb);
+    notes.forEach((m, i) => { for (const det of [-6, 6]) {
+      const o = ac.createOscillator(), g = ac.createGain(), p = ac.createStereoPanner(); o.type = 'sawtooth'; o.frequency.value = hz(m); o.detune.value = det;
+      p.pan.value = (i / Math.max(1, notes.length - 1) - 0.5) * 0.8 * Math.sign(det);
+      g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(amp, t0 + 1.0); g.gain.setValueAtTime(amp, Math.max(t0 + 1.0, t1 - 0.8)); g.gain.exponentialRampToValueAtTime(0.0001, t1 + 0.5);
+      o.connect(g).connect(p).connect(lp); o.start(t0); o.stop(t1 + 0.55); } });
+  };
+  const PENTA = [0, 2, 4, 7, 9, 12, 14, 16, 19, 21, 24, 26, 28];
+  pad(0, at(TL.rs[3]), [45, 52, 57, 59], 0.012, 800);
+  pad(at(TL.rs[3] - 10), at(TL.sway0 + 10), [48, 55, 60, 64], 0.012, 1100);
+  pad(at(TL.sway0), at(TL.end + 50), [41, 48, 53, 57, 60, 64], 0.014, 1500);
+  // the star drawn on: one note per corner
+  for (let i = 0; i < NC; i++) pluck(at(TL.draw0 + (TL.draw1 - TL.draw0) * E.inOutCubic(i / NC) ), 69 + PENTA[i], 0.05, (i / NC - 0.5), 0.4, 'sine');
+  for (let r = 1; r <= ROUNDS; r++) {
+    const s = TL.rs[r - 1], d = TL.rs[r] - s, n = NPTS[r - 1], m = Math.min(n, 18);
+    // marks: a soft tick per edge (thinned out on later rounds)
+    for (let i = 0; i < m; i++) pluck(at(s + d * (0.02 + 0.32 * i / m)), 84 + PENTA[(i + r) % 8], 0.022, (i / m - 0.5) * 1.2, 0.1, 'sine');
+    // cuts: falling clicks around the shape
+    for (let i = 0; i < m; i++) pluck(at(s + d * (0.35 + 0.34 * i / m)), 72 - PENTA[i % 6] + r * 2, 0.03, (0.5 - i / m) * 1.2, 0.14, 'triangle');
+    [0, 4, 7].forEach((q, i) => pluck(at(s + d * 0.98) + i * 0.03, 57 + r * 2 + q, 0.05, 0, 1.0, 'sine'));
+  }
+  // the sway: a slow bell pair; the pull: a stretched note
+  [64, 71, 76].forEach((m, i) => pluck(at(TL.sway0) + i * 0.3, m, 0.05, -0.3 + i * 0.3, 2.2, 'sine'));
+  { const t0 = at(TL.pull0 + 6), t1 = at(TL.pull1 - 6), o = ac.createOscillator(), g = ac.createGain(); o.type = 'triangle';
+    o.frequency.setValueAtTime(hz(64), t0); o.frequency.linearRampToValueAtTime(hz(71), (t0 + t1) / 2); o.frequency.linearRampToValueAtTime(hz(64), t1);
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(0.04, t0 + 0.3); g.gain.setValueAtTime(0.04, t1 - 0.3); g.gain.exponentialRampToValueAtTime(0.0001, t1 + 0.3);
+    o.connect(g).connect(master); o.connect(verb); o.start(t0); o.stop(t1 + 0.35); }
+  [69, 72, 76, 81].forEach((m, i) => pluck(at(TL.calm) + i * 0.09, m, 0.06, -0.3 + i * 0.2, 1.6, 'sine'));
+  [76, 81, 84, 88].forEach((m, i) => pluck(at(TL.end + 10 + i * 6), m, 0.05, -0.45 + i * 0.3, 1.8, 'sine'));
+  const buf = await ac.startRendering();
+  let peak = 0; for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let k = 0; k < d.length; k++) peak = Math.max(peak, Math.abs(d[k])); }
+  const norm = 0.85 / Math.max(peak, 1e-6);                          // every piece peaks at the same level
+  for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let k = 0; k < d.length; k++) d[k] *= norm; }
+  return buf;
+}
+
+/* ==========================================================================
+   VERTICAL CUT — shared block, identical in every piece.
+   1080x1920 for Reels, Shorts and TikTok (__motion.variants.vertical). The
+   piece's own scene code is re-used and recomposed for a phone: everything a
+   viewer must read stays inside the area no platform covers (x 60..900,
+   y 230..1400); outside it there is only dimmed texture.
+   ========================================================================== */
+const VW = 1080, VH = 1920, SAFE = { x: 60, y: 230, w: 840, h: 1170, r: 900, b: 1400 };
+const vcv = document.createElement('canvas'); vcv.width = VW; vcv.height = VH;
+const vx = vcv.getContext('2d', { willReadFrequently: true });   // CPU raster: identical pixels on every redraw
+const VL = 96, VR = 864;                                          // text column inside the safe area
+
+function vReset() {
+  vx.setTransform(1, 0, 0, 1, 0, 0); vx.globalAlpha = 1; vx.globalCompositeOperation = 'source-over';
+  vx.filter = 'none'; vx.shadowBlur = 0; vx.shadowColor = 'transparent'; vx.letterSpacing = '0px'; vx.setLineDash([]);
+  vx.textAlign = 'left'; vx.textBaseline = 'alphabetic'; vx.lineCap = 'butt'; vx.lineJoin = 'miter';
+}
+/** Canvas text on the vertical frame; `max` shrinks the size until the line fits. */
+function vText(str, x, y, { size = 40, weight = 700, color = '#FFFFFF', align = 'left', spacing = 0, alpha = 1, fam = FONT, max = 0 } = {}) {
+  if (alpha <= 0.002 || !str) return size;
+  vx.font = `${weight} ${size}px ${fam}`; vx.letterSpacing = spacing + 'px';
+  if (max) { const w = vx.measureText(str).width; if (w > max) { size = size * max / w; vx.font = `${weight} ${size}px ${fam}`; } }
+  vx.textAlign = align; vx.textBaseline = 'alphabetic';
+  const a0 = vx.globalAlpha; vx.globalAlpha = a0 * alpha; vx.fillStyle = color;
+  vx.fillText(str, x + (align === 'center' ? spacing / 2 : align === 'right' ? spacing : 0), y);   // tracking is added after the last glyph too
+  vx.globalAlpha = a0; vx.letterSpacing = '0px';
+  return size;
+}
+/** Word-wraps with the given font; returns the lines. */
+function vWrap(str, maxW, size, weight = 700, fam = FONT) {
+  vx.font = `${weight} ${size}px ${fam}`; vx.letterSpacing = '0px';
+  const words = str.split(' '), lines = []; let cur = '';
+  for (const w of words) { const t = cur ? cur + ' ' + w : w; if (vx.measureText(t).width > maxW && cur) { lines.push(cur); cur = w; } else cur = t; }
+  if (cur) lines.push(cur);
+  return lines;
+}
+/** Fade envelope with a small rise: [alpha, dy]. */
+function vEnv(v, a, b, fin = 8, fout = 8) {
+  const i = E.outCubic(prog(v, a, a + fin)), o = 1 - E.inCubic(prog(v, b - fout, b));
+  return [Math.min(i, o), (1 - i) * 22 - (1 - o) * 10];
+}
+/** Which segment of a cut list a vertical frame is in: segs = [{ at, src, len }] in frames. */
+function vSeg(segs, v) {
+  let k = 0; while (k < segs.length - 1 && v >= segs[k + 1].at) k++;
+  const s = segs[k];
+  return { k, s, local: v - s.at, src: s.src + (v - s.at) };
+}
+/** Dims everything outside the safe area to a quiet texture (brightness x 0.2), with a soft inner edge. */
+function vShade(rgb, a = 0.8, feather = 40) {
+  vx.save(); vx.setTransform(1, 0, 0, 1, 0, 0); vx.globalAlpha = 1; vx.globalCompositeOperation = 'source-over';
+  vx.fillStyle = `rgba(${rgb},${a})`;
+  vx.beginPath(); vx.rect(0, 0, VW, VH); vx.rect(SAFE.x, SAFE.y, SAFE.w, SAFE.h); vx.fill('evenodd');
+  const strip = (x0, y0, x1, y1, rx, ry, rw, rh) => {
+    const g = vx.createLinearGradient(x0, y0, x1, y1);
+    g.addColorStop(0, `rgba(${rgb},${a})`); g.addColorStop(1, `rgba(${rgb},0)`);
+    vx.fillStyle = g; vx.fillRect(rx, ry, rw, rh);
+  };
+  strip(SAFE.x, 0, SAFE.x + feather, 0, SAFE.x, SAFE.y, feather, SAFE.h);
+  strip(SAFE.r, 0, SAFE.r - feather, 0, SAFE.r - feather, SAFE.y, feather, SAFE.h);
+  strip(0, SAFE.y, 0, SAFE.y + feather, SAFE.x, SAFE.y, SAFE.w, feather);
+  strip(0, SAFE.b, 0, SAFE.b - feather, SAFE.x, SAFE.b - feather, SAFE.w, feather);
+  vx.restore();
+}
+/** Series tag at the top of the safe area, e.g. MADE IN CODE · 04. */
+function vTag(label, color, alpha = 1) {
+  vText('MADE IN CODE', VL, 292, { size: 28, weight: 800, color, spacing: 5, alpha });
+  vx.font = `800 28px ${FONT}`; vx.letterSpacing = '5px';
+  const w = vx.measureText('MADE IN CODE').width; vx.letterSpacing = '0px';
+  vText('·  ' + label, VL + w + 14, 292, { size: 28, weight: 600, color: 'rgba(255,255,255,0.72)', spacing: 3, alpha, max: VR - VL - w - 14 });
+}
+/** Big hook lines, left-aligned from y0; visible from frame 0, settles in a few frames. */
+function vHook(v, lines, y0, { size = 84, lh = 1.08, color = '#FFFFFF', accent = null, weight = 800, spacing = -1.5, alpha = 1 } = {}) {
+  const k = E.outExpo(prog(v, -6, 12));
+  lines.forEach((ln, i) => {
+    const kk = E.outExpo(prog(v, -12 + i * 2, 8 + i * 2));
+    vText(ln, VL, y0 + i * size * lh + (1 - kk) * 30, { size, weight, spacing, color: accent && i === lines.length - 1 ? accent : color, alpha: alpha * Math.max(0.25, kk), max: VR - VL });
+  });
+  return k;
+}
+/** Closing card, the last 60 frames: piece title, "drawn in code · bytepatterns.com". l = frames into the card. */
+function vEndCard(l, { title, line = '', ink = '#FFFFFF', dim = 'rgba(255,255,255,0.66)', accent = '#FFFFFF', scrim = '0,0,0', a = 0.84 }) {
+  const k = E.outCubic(prog(l, 0, 12));
+  vx.save(); vx.setTransform(1, 0, 0, 1, 0, 0);
+  vx.fillStyle = `rgba(${scrim},${a * k})`; vx.fillRect(0, 0, VW, VH);
+  vx.restore();
+  const t1 = E.outExpo(prog(l, 3, 19)), t2 = E.outExpo(prog(l, 11, 27)), t3 = E.outExpo(prog(l, 19, 35));
+  vx.fillStyle = accent; vx.globalAlpha = t1; vx.fillRect(VL, 742, 88 * t1, 7); vx.globalAlpha = 1;
+  const size = vText(title, VL, 850 + (1 - t1) * 40, { size: 92, weight: 800, color: ink, spacing: -2, alpha: t1, max: VR - VL });
+  const y2 = 850 + Math.max(size, 60) * 0.25 + 70;
+  vx.font = `600 44px ${FONT}`;
+  const lead = 'drawn in code  ·  ', lw = vx.measureText(lead).width;
+  vText(lead, VL, y2 + (1 - t2) * 24, { size: 44, weight: 600, color: dim, alpha: t2 });
+  vText('bytepatterns.com', VL + lw, y2 + (1 - t2) * 24, { size: 44, weight: 800, color: accent, alpha: t2 });
+  if (line) vText(line, VL, y2 + 72 + (1 - t3) * 18, { size: 32, weight: 500, color: dim, alpha: t3, max: VR - VL });
+}
+/** Seeks a cut. The first frame a page draws is drawn twice: the very first read of a
+ *  GPU-backed source canvas can come out a shade different from every later one. */
+let vWarm = false;
+function vSeek(draw, i, frames) {
+  const f = Math.max(0, Math.min(frames - 1, Math.floor(i)));
+  if (!vWarm) { vWarm = true; draw(f); }
+  draw(f);
+}
+/** The soundtrack of a cut: the piece's own audio() spliced to the same segments as the picture. */
+async function vAudio(segs, frames, { xf = 0.025, fadeOut = 0.6, extra = null } = {}) {
+  const src = await renderAudio();
+  const SR = 48000, dur = frames / FPS, ac = new OfflineAudioContext(2, Math.round(SR * dur), SR);
+  const out = ac.createGain(); out.connect(ac.destination);
+  out.gain.setValueAtTime(1, 0); out.gain.setValueAtTime(1, dur - fadeOut); out.gain.linearRampToValueAtTime(0, dur - 0.01);
+  segs.forEach((s, k) => {
+    const at = s.at / FPS, off = s.src / FPS, d = s.len / FPS;
+    const pre = k === 0 ? 0 : Math.min(xf, off), post = k === segs.length - 1 ? 0 : xf;
+    const b = ac.createBufferSource(), g = ac.createGain(); b.buffer = src;
+    g.gain.setValueAtTime(pre ? 0 : 1, at - pre);
+    if (pre) g.gain.linearRampToValueAtTime(1, at + pre);
+    if (post) { g.gain.setValueAtTime(1, at + d - post); g.gain.linearRampToValueAtTime(0, at + d + post); }
+    b.connect(g).connect(out); b.start(at - pre, off - pre, d + pre + post);
+  });
+  if (extra) extra(ac, out);
+  const buf = await ac.startRendering();
+  let peak = 0; for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) peak = Math.max(peak, Math.abs(d[i])); }
+  if (peak > 0.9) for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) d[i] *= 0.9 / peak; }
+  return buf;
+}
+/** A soft three-partial bell, for the closing card. */
+function vChime(ac, dest, at, freq, vol = 0.08) {
+  for (const [mul, v, dec] of [[1, 1, 1.8], [2.01, 0.35, 0.8], [3.02, 0.12, 0.4]]) {
+    const o = ac.createOscillator(), g = ac.createGain(); o.type = 'sine'; o.frequency.value = freq * mul;
+    g.gain.setValueAtTime(0.0001, at); g.gain.exponentialRampToValueAtTime(vol * v, at + 0.006); g.gain.exponentialRampToValueAtTime(0.0001, at + dec);
+    o.connect(g).connect(dest); o.start(at); o.stop(at + dec + 0.05);
+  }
+}
+
+/* VERTICAL CUT — this piece */
+// The same star and the same six rounds, centred on a 1080 x 1920 stage, on a faster clock.
+const TLV = buildTL({ draw0: 30, draw1: 62, rs: [66, 130, 176, 212, 240, 264, 288], sway0: 296, pull0: 384, pull1: 468, calm: 476, end: 534 });
+const VFR = TLV.end + 60, VEND = VFR - 60;
+const GV = { TL: TLV, w: VW, h: VH, cx: 480, cy: 840, s: 310, lw: 4, dot: 5, table: false,
+  capX: VL, capY: 390, cap: 48, capTwo: true, capMax: VR - VL,
+  fo: 30, foX: VL, foY: 1300, foAlign: 'left', foX2: VL, foY2: 1350, foAlign2: 'left',
+  fn: 84, fnX: VL, fnY: 820, fnAlign: 'left', fnMax: VR - VL };
+function hookV(v) {
+  const o = 1 - E.inCubic(prog(v, TLV.draw0 - 10, TLV.draw0 + 4));
+  if (o <= 0) return;
+  vx.save(); vx.fillStyle = `rgba(${C.bgRGB},${0.84 * o})`; vx.fillRect(SAFE.x, 400, SAFE.w, 560); vx.restore();
+  vHook(v, ['Cut every', 'corner.', `Then do it`, `${ROUNDS - 1} more times.`], 510, { size: 104, accent: C.accent, color: C.paper, weight: 900, spacing: -2, alpha: o });
+}
+function vDraw(v) {
+  if (vx.reset) vx.reset();
+  vReset();
+  vx.fillStyle = C.bg; vx.fillRect(0, 0, VW, VH);
+  scene(vx, GV, v);
+  hookV(v);
+  vReset();
+  vShade(C.bgRGB, 0.86);
+  vTag('CHAIKIN’S ALGORITHM', C.accent);
+  if (v >= VEND) vEndCard(v - VEND, { title: 'Cut Every Corner', line: `${ROUNDS} rounds  ·  ${NC} → ${NPTS[ROUNDS]} points  ·  turns ${deg(STATS[0].turn)} → ${deg(STATS[ROUNDS].turn)}`,
+    ink: C.paper, dim: 'rgba(241,238,230,0.72)', accent: C.accent, scrim: C.bgRGB, a: 0.88 });
+  vReset();
+}
+
+// The player asks for a frame on every display refresh; at 30 fps on a 60 Hz screen every other call
+// asks for the frame already on the canvas, which is then left as it is (same frame, same pixels).
+const shown = { L: -1, V: -1 };
+window.__motion = {
+  title: 'Cut Every Corner',
+  description: `Chaikin's algorithm cuts every corner of a ${NC / 2}-pointed star at ¼ and ¾ of each edge, ${ROUNDS} times, doubling it to ${NPTS[ROUNDS]} points while the sharpest turn falls from ${deg(STATS[0].turn)} to ${deg(STATS[ROUNDS].turn)}, until it traces the smooth quadratic B-spline of the first corners, where pulling one corner out moves only ${MOVED} of the ${NPTS[ROUNDS]} points.`,
+  fps: FPS, width: W, height: H, frames: FRAMES,
+  poster: TLL.rs[3] + 20,
+  gifStart: Math.floor(TLL.rs[1] / FPS),
+  seek(i) { const f = Math.max(0, Math.min(FRAMES - 1, Math.floor(i))); if (f !== shown.L) { shown.L = f; draw(f); } },
+  audio: () => renderAudio(TLL, FRAMES),
+  variants: {
+    vertical: {
+      width: VW, height: VH, frames: VFR, canvas: vcv,
+      poster: TLV.rs[3] + 14, gifStart: Math.floor(TLV.rs[1] / FPS),
+      seek(i) { const v = Math.max(0, Math.min(VFR - 1, Math.floor(i))); if (v !== shown.V) { shown.V = v; vSeek(vDraw, v, VFR); } },
+      audio: () => renderAudio(TLV, VFR),
+    },
+  },
+};
+
+/* ==========================================================================
+   PLAYER — identical in every piece; keep as is.
+   Autoplays and loops, starts sound on the first click, ?frame=N pauses on a
+   frame, ?variant=vertical plays the vertical cut (if the piece has one).
+   When the renderer sets window.__MOTION_RENDER__ it stays out of the way.
+   ========================================================================== */
+(function player() {
+  const btn = document.getElementById('sound'), q = new URLSearchParams(location.search);
+  let M = window.__motion;
+  const V = !window.__MOTION_RENDER__ && M.variants && M.variants[q.get('variant')];
+  if (V) {                                                // show the variant's own canvas instead
+    M = Object.assign({}, M, V);
+    V.canvas.style.cssText = `width:min(100vw,calc(100vh*${V.width}/${V.height}));height:auto;aspect-ratio:${V.width}/${V.height}`;
+    document.querySelector('canvas').replaceWith(V.canvas);
+  }
+  const dur = M.frames / M.fps;
+  if (window.__MOTION_RENDER__) { btn.hidden = true; M.seek(0); return; }
+  if (q.has('frame')) { btn.hidden = true; M.seek(+q.get('frame') || 0); return; }
+  let t0 = performance.now(), ac = null, src = null, buf = null, paused = false, pausedAt = 0;
+  const clock = () => ac && src ? (ac.currentTime - t0) : (performance.now() - t0) / 1000;
+  function loop() {
+    if (!paused) M.seek(Math.floor(((clock() % dur) + dur) % dur * M.fps));
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+  btn.addEventListener('click', async () => {
+    if (src) { src.stop(); src = null; btn.textContent = 'Click for sound'; t0 = performance.now(); return; }
+    btn.textContent = 'Loading sound…';
+    ac = ac || new AudioContext({ sampleRate: 48000 });
+    buf = buf || await M.audio();
+    await ac.resume();
+    src = ac.createBufferSource(); src.buffer = buf; src.loop = true; src.connect(ac.destination);
+    t0 = ac.currentTime + 0.05; src.start(t0);        // picture restarts from frame 0 in sync with the sound
+    btn.textContent = 'Sound on — click to mute';
+  });
+  addEventListener('keydown', e => {
+    if (e.code !== 'Space') return;
+    e.preventDefault(); paused = !paused;
+    if (ac) paused ? ac.suspend() : ac.resume();
+    if (!ac) { if (paused) pausedAt = performance.now(); else t0 += performance.now() - pausedAt; }
+  });
+})();
+</script>
+</body>
+</html>

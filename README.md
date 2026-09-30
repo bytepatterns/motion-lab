@@ -635,6 +635,71 @@ Click a preview to open the piece live in your browser (click once more there fo
 <br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/48-three-body-eight/?variant=vertical">open</a> · <a href="out/48-three-body-eight.vertical.png">still</a></sub>
 </td>
 </tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/49-huffman-coding/"><img src="out/49-huffman-coding.gif" width="100%" alt="Huffman Coding — animated preview"></a>
+<br><b>49 · Huffman Coding</b> <sub>27 s</sub>
+<br>The sentence &quot;SHE SELLS SEA SHELLS BY THE SEA SHORE&quot; is counted into 11 symbols, queued rarest first and joined two at a time in 10 merges into one tree whose paths become codes of 2 to 5 bits, which spell its 37 letters in 114 bits instead of 296 in 8-bit ASCII or 148 in a fixed 4-bit code (entropy bound 111.4).
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/49-huffman-coding/">open in browser</a> · <a href="out/49-huffman-coding.png">still</a> · <a href="projects/49-huffman-coding/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/49-huffman-coding/?variant=vertical"><img src="out/49-huffman-coding.vertical.gif" width="100%" alt="Huffman Coding — vertical cut, animated preview"></a>
+<br><sub>9:16 · 20 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/49-huffman-coding/?variant=vertical">open</a> · <a href="out/49-huffman-coding.vertical.png">still</a></sub>
+</td>
+</tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/50-kruskal-mst/"><img src="out/50-kruskal-mst.gif" width="100%" alt="Kruskal’s Spanning Tree — animated preview"></a>
+<br><b>50 · Kruskal’s Spanning Tree</b> <sub>27 s</sub>
+<br>40 points, each linked to its 5 nearest neighbours (116 links, total length 2,179): Kruskal's algorithm takes the links shortest first, keeps one only when union-find says it joins two groups and skips the 12 that would close a loop, stopping after 51 links with a spanning tree of 39 links and length 531, 24% of the whole.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/50-kruskal-mst/">open in browser</a> · <a href="out/50-kruskal-mst.png">still</a> · <a href="projects/50-kruskal-mst/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/50-kruskal-mst/?variant=vertical"><img src="out/50-kruskal-mst.vertical.gif" width="100%" alt="Kruskal’s Spanning Tree — vertical cut, animated preview"></a>
+<br><sub>9:16 · 20 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/50-kruskal-mst/?variant=vertical">open</a> · <a href="out/50-kruskal-mst.vertical.png">still</a></sub>
+</td>
+</tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/51-raft-election/"><img src="out/51-raft-election.gif" width="100%" alt="Raft: Losing the Leader — animated preview"></a>
+<br><b>51 · Raft: Losing the Leader</b> <sub>27 s</sub>
+<br>Five servers run Raft for 1273 simulated ms: S2 wins term 1 with 3 of 5 votes and commits 3 writes, crashes holding x=9 unsent, S4 and S3 split the vote in term 2, S5 wins term 3 after 387 ms without a leader, and when S2 returns its uncommitted x=9 is overwritten, leaving 4 committed writes on all 5 logs after 147 messages.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/51-raft-election/">open in browser</a> · <a href="out/51-raft-election.png">still</a> · <a href="projects/51-raft-election/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/51-raft-election/?variant=vertical"><img src="out/51-raft-election.vertical.gif" width="100%" alt="Raft: Losing the Leader — vertical cut, animated preview"></a>
+<br><sub>9:16 · 20 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/51-raft-election/?variant=vertical">open</a> · <a href="out/51-raft-election.vertical.png">still</a></sub>
+</td>
+</tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/52-chaikin-corners/"><img src="out/52-chaikin-corners.gif" width="100%" alt="Cut Every Corner — animated preview"></a>
+<br><b>52 · Cut Every Corner</b> <sub>27 s</sub>
+<br>Chaikin's algorithm cuts every corner of a 5-pointed star at ¼ and ¾ of each edge, 6 times, doubling it to 640 points while the sharpest turn falls from 140° to 5°, until it traces the smooth quadratic B-spline of the first corners, where pulling one corner out moves only 190 of the 640 points.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/52-chaikin-corners/">open in browser</a> · <a href="out/52-chaikin-corners.png">still</a> · <a href="projects/52-chaikin-corners/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/52-chaikin-corners/?variant=vertical"><img src="out/52-chaikin-corners.vertical.gif" width="100%" alt="Cut Every Corner — vertical cut, animated preview"></a>
+<br><sub>9:16 · 20 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/52-chaikin-corners/?variant=vertical">open</a> · <a href="out/52-chaikin-corners.vertical.png">still</a></sub>
+</td>
+</tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/53-perlin-marble/"><img src="out/53-perlin-marble.gif" width="100%" alt="Marble from One Sine — animated preview"></a>
+<br><b>53 · Marble from One Sine</b> <sub>27 s</sub>
+<br>Generative: sin(x + power · turbulence) on a 960 × 540 grid, where the turbulence sums 5 octaves of seeded Perlin noise (2,592,000 samples, each octave twice as fine and half as strong), bends straight stripes into marble veins as the power grows from 0 to 7.5 and the octaves from 1 to 5, while 3 colour ramps turn the same field into Night, Carrara, Nero stone.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/53-perlin-marble/">open in browser</a> · <a href="out/53-perlin-marble.png">still</a> · <a href="projects/53-perlin-marble/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/53-perlin-marble/?variant=vertical"><img src="out/53-perlin-marble.vertical.gif" width="100%" alt="Marble from One Sine — vertical cut, animated preview"></a>
+<br><sub>9:16 · 20 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/53-perlin-marble/?variant=vertical">open</a> · <a href="out/53-perlin-marble.vertical.png">still</a></sub>
+</td>
+</tr>
 </table>
 <!-- gallery:end -->
 

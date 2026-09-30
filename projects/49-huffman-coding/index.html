@@ -1,0 +1,659 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="author" content="teambytepatterns">
+<meta name="description" content="A sentence of 37 letters is counted, its eleven symbols are queued rarest first and joined two at a time into one tree, and the paths through that tree become codes that spell the sentence in 114 bits instead of 296.">
+<title>Huffman Coding — motion-lab</title>
+<style>
+  /* Player chrome. The piece itself lives entirely in the canvas. */
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  body { display: grid; place-items: center; font: 500 15px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #fff; }
+  canvas { display: block; width: min(100vw, calc(100vh * 16 / 9)); height: auto; aspect-ratio: 16 / 9; }
+  #sound { position: fixed; left: 16px; bottom: 16px; padding: 8px 14px; border: 1px solid rgba(255,255,255,.35); border-radius: 999px;
+           background: rgba(0,0,0,.55); color: #fff; font: inherit; cursor: pointer; }
+  #sound[hidden] { display: none; }
+</style>
+</head>
+<body>
+<canvas id="stage" width="1920" height="1080" aria-label="A line of capital letters at the top; circles with letters appear in a row, slide into order and are joined two at a time under new circles until one tree hangs from a single root; zeros and ones appear on its branches and two strips of coloured cells grow at the bottom, the lower one much shorter"></canvas>
+<button id="sound" type="button">Click for sound</button>
+<script>
+'use strict';
+/* ==========================================================================
+   PIECE — Huffman Coding.
+   Count how often every symbol occurs, put one leaf per symbol in a
+   priority queue ordered by count, then repeat: take the two lightest trees,
+   join them under a new node whose weight is their sum, and put it back.
+   When one tree is left, the path from the root to a leaf is that symbol's
+   code (left = 0, right = 1). Frequent symbols end up near the root with
+   short codes, rare ones deep down with long codes, and no code is the
+   prefix of another, so the bit string decodes without separators.
+   The counts, every merge, every layout of the forest, the codes, the bit
+   totals, the saving and the entropy bound are all computed at load from
+   the sentence; each frame interpolates between two of those states, so
+   seek(i) is pure in i.
+   ========================================================================== */
+const W = 1920, H = 1080, FPS = 30;
+const cv = document.getElementById('stage');
+const ctx = cv.getContext('2d', { willReadFrequently: true });   // CPU raster: identical pixels on every redraw
+const FONT = 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
+const MONO = 'ui-monospace, "Cascadia Code", Consolas, Menlo, monospace';
+
+// ---- helpers -------------------------------------------------------------
+function mulberry32(a) { return function () { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a);
+  t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const lerp = (a, b, t) => a + (b - a) * t;
+const prog = (f, a, b) => clamp((f - a) / (b - a));
+const smooth = t => t * t * (3 - 2 * t);
+const E = {
+  inCubic: t => t * t * t,
+  outCubic: t => 1 - Math.pow(1 - t, 3),
+  inOutCubic: t => t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2,
+  outExpo: t => t === 1 ? 1 : 1 - Math.pow(2, -10 * t),
+  inExpo: t => t === 0 ? 0 : Math.pow(2, 10 * t - 10),
+  inOutExpo: t => t === 0 ? 0 : t === 1 ? 1 : t < .5 ? Math.pow(2, 20 * t - 10) / 2 : (2 - Math.pow(2, -20 * t + 10)) / 2,
+  outBack: t => 1 + 2.70158 * Math.pow(t - 1, 3) + 1.70158 * Math.pow(t - 1, 2),
+};
+/** Canvas text; `max` shrinks the size until the line fits. Returns the width drawn. */
+function text(g, str, x, y, { size = 40, weight = 600, color = '#fff', alpha = 1, spacing = 0, align = 'left', fam = FONT, base = 'alphabetic', max = 0 } = {}) {
+  if (alpha <= 0.002 || !str) return 0;
+  g.font = `${weight} ${size}px ${fam}`; g.letterSpacing = spacing + 'px';
+  if (max) { const w0 = g.measureText(str).width; if (w0 > max) { size *= max / w0; g.font = `${weight} ${size}px ${fam}`; } }
+  g.textAlign = align; g.textBaseline = base;
+  const a0 = g.globalAlpha; g.globalAlpha = a0 * alpha; g.fillStyle = color;
+  g.fillText(str, x, y);
+  const w = g.measureText(str).width;
+  g.globalAlpha = a0; g.letterSpacing = '0px';
+  return w;
+}
+const measure = (g, str, size, weight = 800, fam = FONT, spacing = 0) => { g.font = `${weight} ${size}px ${fam}`; g.letterSpacing = spacing + 'px'; const w = g.measureText(str).width; g.letterSpacing = '0px'; return w; };
+const env = (f, a, b, fin = 12, fout = 10) => {
+  const i = E.outCubic(prog(f, a, a + fin)), o = 1 - E.inCubic(prog(f, b - fout, b));
+  return [Math.min(i, o), (1 - i) * 24 - (1 - o) * 10];
+};
+
+// ---- palette -------------------------------------------------------------
+const C = {
+  bg: '#0B0D14', bgRGB: '11,13,20', paper: '#F1EEE6', dim: 'rgba(241,238,230,0.62)', faint: 'rgba(241,238,230,0.16)',
+  accent: '#FFC857', accentRGB: '255,200,87', node: '#151A28', edge: 'rgba(241,238,230,0.34)',
+  sym: ['#FFC857', '#5CD6CB', '#FF8FA3', '#8FA8FF', '#B8F07A', '#C49BFF', '#FF9F6B', '#7FD1FF', '#F2E394', '#9EE6B8', '#FFB3E6'],
+};
+
+// ---- the code, built once from the sentence ------------------------------------------------
+const PHRASE = 'SHE SELLS SEA SHELLS BY THE SEA SHORE', NCH = PHRASE.length;
+const SYM = [], CNT = {};
+for (const ch of PHRASE) { if (!(ch in CNT)) { CNT[ch] = 0; SYM.push(ch); } CNT[ch]++; }
+const NS = SYM.length, NM = NS - 1;
+const SIDX = {}; SYM.forEach((s, i) => { SIDX[s] = i; });
+/** NODES: leaves 0..NS-1 in order of first appearance, then one internal node per merge. */
+const NODES = SYM.map((ch, id) => ({ id, w: CNT[ch], sym: ch, l: -1, r: -1, par: -1 }));
+const byW = (a, b) => NODES[a].w - NODES[b].w || a - b;
+const STATES = [SYM.map((_, i) => i).sort(byW)], MERGES = [];
+for (let k = 0; k < NM; k++) {
+  const q = STATES[k].slice(), a = q.shift(), b = q.shift(), id = NODES.length;
+  NODES.push({ id, w: NODES[a].w + NODES[b].w, sym: null, l: a, r: b, par: -1 });
+  NODES[a].par = id; NODES[b].par = id;
+  let at = q.findIndex(x => NODES[x].w > NODES[id].w); if (at < 0) at = q.length;   // ties: the new tree goes last
+  q.splice(at, 0, id); STATES.push(q); MERGES.push({ a, b, p: id });
+}
+const ROOT = NODES.length - 1;
+const CODE = {};
+(function walk(id, c) { const n = NODES[id]; if (n.l < 0) { CODE[n.sym] = c; return; } walk(n.l, c + '0'); walk(n.r, c + '1'); })(ROOT, '');
+/** Forest layout: every tree's leaves take consecutive slots, a parent sits over the middle of its children. */
+function layoutOf(roots) {
+  const L = new Map(); let slot = 0;
+  const place = (id, d) => { const n = NODES[id]; if (n.l < 0) { L.set(id, { s: slot++, d }); return; }
+    place(n.l, d + 1); place(n.r, d + 1); L.set(id, { s: (L.get(n.l).s + L.get(n.r).s) / 2, d }); };
+  for (const r of roots) place(r, 0);
+  return L;
+}
+// LAY[0]: leaves in order of first appearance; LAY[k + 1]: the queue after k merges
+const LAY = [new Map(SYM.map((_, i) => [i, { s: i, d: 0 }])), ...STATES.map(layoutOf)];
+const LAYD = new Map(LAY.map(L => [L, Math.max(...[...L.values()].map(v => v.d))])), DMAX = LAYD.get(LAY[NM + 1]);
+const ASCII = 8 * NCH, FIXED = Math.ceil(Math.log2(NS)) * NCH;
+const BITS = [0]; for (const ch of PHRASE) BITS.push(BITS[BITS.length - 1] + CODE[ch].length);
+const HUFF = BITS[NCH];
+const ENTROPY = SYM.reduce((s, ch) => s - CNT[ch] * Math.log2(CNT[ch] / NCH), 0);
+const SAVE = Math.round(100 * (1 - HUFF / ASCII));
+const LENS = SYM.map(s => CODE[s].length), MINL = Math.min(...LENS), MAXL = Math.max(...LENS);
+const FIRST = SYM.map(s => PHRASE.indexOf(s));
+const pathTo = id => { const p = []; for (let q = id; q >= 0; q = NODES[q].par) p.unshift(q); return p; };
+
+// ---- timeline -------------------------------------------------------------------------------
+// count0..count1: the scan counts letters; sort0..sort1: the leaves line up rarest first;
+// md: frames per merge; code0..code1: 0/1 on the branches; enc0..enc1: the sentence is encoded;
+// calm: the verdict; end: the closing card.
+function buildTL(o) {
+  const TL = Object.assign({}, o);
+  TL.ms = [TL.merge0]; for (let k = 0; k < NM; k++) TL.ms.push(TL.ms[k] + TL.md[k]);
+  TL.cntAt = j => TL.count0 + (TL.count1 - TL.count0) * j / NCH;
+  TL.encAt = j => TL.enc0 + (TL.enc1 - TL.enc0) * j / NCH;
+  TL.caps = [
+    [TL.count0 - 6, TL.sort0 + 2, 'Count every letter:|common ones should cost less.'],
+    [TL.sort0 + 2, TL.ms[1], 'Queue them rarest first,|join the two lightest.'],
+    [TL.ms[1], TL.ms[NM] + 4, 'Their sum goes back in the queue.|Repeat.'],
+    [TL.code0, TL.enc0 - 2, 'Left is 0, right is 1:|the path to a letter is its code.'],
+    [TL.enc0, TL.calm - 2, 'Frequent letters get short codes,|rare ones long codes.'],
+  ];
+  return TL;
+}
+/** The two layouts a frame lies between, how far, and the merge in progress. */
+function stateAt(TL, f) {
+  if (f < TL.sort0) return { A: LAY[0], B: LAY[0], e: 0, k: -1, p: 0 };
+  if (f < TL.merge0) return { A: LAY[0], B: LAY[1], e: E.inOutCubic(prog(f, TL.sort0, TL.sort1)), k: -1, p: 0 };
+  if (f >= TL.ms[NM]) return { A: LAY[NM + 1], B: LAY[NM + 1], e: 0, k: NM, p: 1 };
+  let k = 0; while (f >= TL.ms[k + 1]) k++;
+  const p = prog(f, TL.ms[k], TL.ms[k + 1]);
+  return { A: LAY[k + 1], B: LAY[k + 2], e: E.inOutCubic(prog(p, 0.24, 0.8)), k, p };
+}
+/** The letter being encoded at frame f (or -1). */
+function encIdx(TL, f) { return f >= TL.enc0 && f < TL.enc1 + 4 ? Math.min(NCH - 1, Math.floor((f - TL.enc0) / ((TL.enc1 - TL.enc0) / NCH))) : -1; }
+
+// ---- drawing ------------------------------------------------------------------------------
+/** A symbol; the space is drawn as an open box. */
+function glyph(g, ch, x, y, size, color, alpha = 1, weight = 850, fam = FONT) {
+  if (alpha <= 0.002) return;
+  if (ch === ' ') {
+    g.save(); g.globalAlpha *= alpha; g.strokeStyle = color; g.lineWidth = Math.max(2, size * 0.08); g.lineJoin = 'round';
+    g.beginPath(); g.moveTo(x - size * 0.28, y - size * 0.02); g.lineTo(x - size * 0.28, y + size * 0.2); g.lineTo(x + size * 0.28, y + size * 0.2); g.lineTo(x + size * 0.28, y - size * 0.02); g.stroke();
+    g.restore(); return;
+  }
+  text(g, ch, x, y + size * 0.02, { size, weight, color, alpha, fam, align: 'center', base: 'middle' });
+}
+function phrase(g, G, f) {
+  const TL = G.TL, x0 = G.phX - (NCH - 1) * G.phCW / 2, [a] = env(f, TL.count0 - 16, TL.end + 10, 14, 12);
+  if (a <= 0) return;
+  const je = encIdx(TL, f);
+  for (let j = 0; j < NCH; j++) {
+    const ch = PHRASE[j], x = x0 + j * G.phCW, s = SIDX[ch];
+    const sc = f >= TL.cntAt(j), hot = sc ? 1 - prog(f, TL.cntAt(j), TL.cntAt(j) + 10) : 0;
+    let al = sc ? 1 : 0.5;
+    if (f >= TL.enc0 - 4 && f < TL.calm) al = je >= 0 && j < je ? 0.42 : 1;
+    if (j === je) { g.save(); g.globalAlpha = a * 0.9; g.fillStyle = `rgba(${C.accentRGB},0.24)`; g.fillRect(x - G.phCW / 2, G.phY - G.ph * 0.62, G.phCW, G.ph * 1.24); g.restore(); }
+    glyph(g, ch, x, G.phY - hot * 8, G.ph * (1 + 0.25 * hot), sc ? C.sym[s] : C.paper, a * al, 800, MONO);
+  }
+}
+function node(g, G, id, x, y, { alpha = 1, scale = 1, ring = 0, label = null } = {}) {
+  if (alpha <= 0.01 || scale <= 0.01) return;
+  const n = NODES[id], leaf = n.l < 0, r = (leaf ? G.rL : G.rI) * scale, col = leaf ? C.sym[id] : C.paper;
+  g.save(); g.globalAlpha = alpha;
+  if (ring > 0.01) {
+    g.globalAlpha = alpha * ring; g.fillStyle = `rgba(${C.accentRGB},0.2)`; g.beginPath(); g.arc(x, y, r + 14, 0, Math.PI * 2); g.fill();
+    g.strokeStyle = C.accent; g.lineWidth = 3; g.beginPath(); g.arc(x, y, r + 9, 0, Math.PI * 2); g.stroke(); g.globalAlpha = alpha;
+  }
+  g.fillStyle = C.node; g.beginPath(); g.arc(x, y, r, 0, Math.PI * 2); g.fill();
+  if (leaf) { g.fillStyle = col; g.globalAlpha = alpha * 0.18; g.fill(); g.globalAlpha = alpha; }
+  g.strokeStyle = leaf ? col : 'rgba(241,238,230,0.5)'; g.lineWidth = leaf ? 3 : 2; g.stroke();
+  g.restore();
+  if (leaf) glyph(g, n.sym, x, y, r * 1.12, C.paper, alpha, 850);
+  else text(g, String(n.w), x, y + 1, { size: Math.round(r * 0.95), weight: 800, color: C.paper, align: 'center', base: 'middle', alpha, fam: MONO });
+  if (label) label();
+}
+function forest(g, G, f) {
+  const TL = G.TL, st = stateAt(TL, f), { A, B, e, k, p } = st;
+  // the forest is kept centred in its area as it grows deeper
+  const rowY = G.rowY + (DMAX - lerp(LAYD.get(A), LAYD.get(B), e)) * G.gap * 0.5, P = new Map();
+  for (const [id, b] of B) { const a = A.get(id) || b; P.set(id, [G.x0 + lerp(a.s, b.s, e) * G.u, rowY + lerp(a.d, b.d, e) * G.gap]); }
+  const M = k >= 0 && k < NM ? MERGES[k] : null;
+  const pop = M ? E.outBack(prog(p, 0.42, 0.62)) : 1, popA = M ? clamp(prog(p, 0.42, 0.52) * 2) : 1;
+  const done = k === NM;
+  // code phase: edge labels, then a pulse running down from the root one level at a time
+  const lab = E.outCubic(prog(f, TL.code0, TL.code0 + 16));
+  const pulseD = f >= TL.code0 + 12 ? (f - TL.code0 - 12) / ((TL.code1 - TL.code0 - 20) / (MAXL + 0.5)) : -1;
+  // encoding: the path to the letter being encoded glows in its colour
+  const je = encIdx(TL, f);
+  const hotPath = je >= 0 ? new Set(pathTo(SIDX[PHRASE[je]])) : null, hotK = je >= 0 ? 1 - 0.5 * prog(f, TL.encAt(je), TL.encAt(je + 1)) : 0;
+  const hotCol = je >= 0 ? C.sym[SIDX[PHRASE[je]]] : null;
+  g.save(); g.lineCap = 'round';
+  for (const [id] of B) {
+    const n = NODES[id]; if (n.l < 0) continue;
+    const a = M && id === M.p ? popA : 1, [px, py] = P.get(id), dep = B.get(id).d;
+    for (const [c, bit] of [[n.l, '0'], [n.r, '1']]) {
+      const [cx, cy] = P.get(c), lit = done && pulseD >= 0 ? clamp(pulseD - dep) : 0;
+      const hot = hotPath && hotPath.has(c) && hotPath.has(id), run = lit > 0 && lit < 1;
+      g.globalAlpha = a; g.strokeStyle = hot ? hotCol : run ? C.accent : C.edge; g.lineWidth = hot ? 3 + 4 * hotK : run ? 4 : 2.5;
+      const r1 = NODES[c].l < 0 ? G.rL : G.rI, dx = cx - px, dy = cy - py, dl = Math.hypot(dx, dy) || 1;
+      g.beginPath(); g.moveTo(px + dx / dl * G.rI, py + dy / dl * G.rI); g.lineTo(cx - dx / dl * r1, cy - dy / dl * r1); g.stroke();
+      if (run) { g.fillStyle = C.accent; g.beginPath(); g.arc(lerp(px, cx, lit), lerp(py, cy, lit), 7, 0, Math.PI * 2); g.fill(); }
+      if (lab > 0 && done) {
+        const mx = (px + cx) / 2 + (bit === '0' ? -1 : 1) * G.bitOff, my = (py + cy) / 2 - 8;
+        text(g, bit, mx, my, { size: G.bitSize, weight: 800, color: bit === '0' ? C.paper : C.accent, align: 'center', base: 'middle', fam: MONO, alpha: lab * a });
+      }
+    }
+  }
+  g.restore();
+  for (const [id] of B) {
+    const [x, y] = P.get(id), n = NODES[id];
+    let alpha = 1, scale = 1, ring = 0;
+    if (id < NS) { const t0 = TL.cntAt(FIRST[id]); if (f < t0) continue; scale = clamp(E.outBack(prog(f, t0, t0 + 8)), 0, 1.3); alpha = clamp(prog(f, t0, t0 + 4)); }
+    if (M && id === M.p) { scale = clamp(pop, 0, 1.3); alpha = popA; }
+    if (M && (id === M.a || id === M.b)) ring = Math.min(E.outCubic(prog(p, 0, 0.14)), 1 - E.inCubic(prog(p, 0.72, 0.98)));
+    if (hotPath && n.l < 0 && hotPath.has(id)) ring = hotK;
+    const label = n.l < 0 ? () => {
+      // under a leaf: its count so far, then its code
+      let count = 0; for (let j = 0; j < NCH; j++) if (PHRASE[j] === n.sym && f >= TL.cntAt(j)) count++;
+      const cA = done && pulseD >= 0 ? E.outCubic(clamp(pulseD - B.get(id).d + 1)) : 0;
+      if (cA < 1) text(g, String(count), x, y + G.rL + G.lblGap, { size: G.lbl, weight: 700, color: C.dim, align: 'center', fam: MONO, alpha: alpha * (1 - cA) });
+      if (cA > 0) {
+        const code = CODE[n.sym];
+        if (G.stack) for (let q = 0; q < code.length; q++) text(g, code[q], x, y + G.rL + G.lblGap + q * G.lbl * 0.96, { size: G.lbl, weight: 800, color: code[q] === '1' ? C.accent : C.paper, align: 'center', fam: MONO, alpha: alpha * cA });
+        else text(g, code, x, y + G.rL + G.lblGap, { size: G.lbl, weight: 800, color: C.sym[id], align: 'center', fam: MONO, alpha: alpha * cA });
+      }
+    } : null;
+    node(g, G, id, x, y, { alpha, scale, ring, label });
+  }
+  // the sum being formed
+  if (M) {
+    const a = Math.min(E.outCubic(prog(p, 0.06, 0.2)), 1 - E.inCubic(prog(p, 0.8, 0.98)));
+    const [ax] = P.get(M.a), [bx] = P.get(M.b), [px] = P.get(M.p), x = lerp((ax + bx) / 2, px, E.inOutCubic(prog(p, 0.4, 0.62)));
+    text(g, `${NODES[M.a].w} + ${NODES[M.b].w} = ${NODES[M.p].w}`, x, rowY - G.rL - 20, { size: G.sum, weight: 800, color: C.accent, align: 'center', fam: MONO, alpha: a });
+  }
+  return st;
+}
+/** Two strips of cells: the sentence in 8-bit ASCII and in the Huffman code; lit cells are 1 bits. */
+function tapes(g, G, f) {
+  const TL = G.TL, [a] = env(f, TL.enc0 - 12, TL.end + 10, 12, 12);
+  if (a <= 0) return;
+  const j = clamp((f - TL.enc0) / (TL.enc1 - TL.enc0)) * NCH, jf = Math.floor(j), fr = j - jf;
+  const asc = Math.min(ASCII, Math.round(8 * j)), huf = jf >= NCH ? HUFF : Math.round(BITS[jf] + (BITS[jf + 1] - BITS[jf]) * fr);
+  const cw = G.tapeW / ASCII;
+  for (const [row, n, name] of [[0, asc, '8-bit ASCII'], [1, huf, 'Huffman']]) {
+    const y = G.tapeY + row * G.tapeGap;
+    g.save(); g.globalAlpha = a;
+    g.strokeStyle = C.faint; g.lineWidth = 1.5; g.strokeRect(G.tapeX - 3, y - 3, (row ? HUFF : ASCII) * cw + 6, G.tapeH + 6);
+    let q = 0;
+    for (let b = 0; b < n; b++) {
+      let s, bit;
+      if (row === 0) { const c = Math.floor(b / 8); s = SIDX[PHRASE[c]]; bit = (PHRASE.charCodeAt(c) >> (7 - b % 8)) & 1; }
+      else { while (BITS[q + 1] <= b) q++; s = SIDX[PHRASE[q]]; bit = +CODE[PHRASE[q]][b - BITS[q]]; }
+      g.fillStyle = C.sym[s]; g.globalAlpha = a * (bit ? 1 : 0.34);
+      g.fillRect(G.tapeX + b * cw + 0.5, y, Math.max(1, cw - 1), G.tapeH);
+    }
+    g.restore();
+    const ly = G.tapeLabDY + y;
+    text(g, name, G.tapeLabX, ly, { size: G.tapeLab, weight: 700, color: row ? C.accent : C.dim, align: G.tapeLabAlign, alpha: a });
+    text(g, `${n} bits`, G.tapeNumX, ly, { size: G.tapeLab, weight: 800, color: row ? C.accent : C.paper, align: G.tapeNumAlign, fam: MONO, alpha: a });
+  }
+}
+function caption(g, G, f) {
+  for (const [t0, t1, str] of G.TL.caps) {
+    const [a, dy] = env(f, t0, t1, 12, 10); if (a <= 0) continue;
+    const [p1, p2] = str.split('|');
+    if (G.capTwo) {
+      text(g, p1, G.capX, G.capY + dy, { size: G.cap, weight: 850, color: C.paper, spacing: -1, alpha: a, max: G.capMax });
+      text(g, p2, G.capX, G.capY + G.cap * 1.14 + dy, { size: G.cap, weight: 850, color: C.accent, spacing: -1, alpha: a, max: G.capMax });
+    } else {
+      const w1 = measure(g, p1 + ' ', G.cap, 850, FONT, -1), w2 = measure(g, p2, G.cap, 850, FONT, -1), x0 = G.capX - (w1 + w2) / 2;
+      text(g, p1 + ' ', x0, G.capY + dy, { size: G.cap, weight: 850, color: C.paper, spacing: -1, alpha: a });
+      text(g, p2, x0 + w1, G.capY + dy, { size: G.cap, weight: 850, color: C.accent, spacing: -1, alpha: a });
+    }
+  }
+}
+function readout(g, G, f, st) {
+  const TL = G.TL, [a] = env(f, TL.count0 - 10, TL.enc0 - 8, 12, 10);
+  if (a <= 0) return;
+  let l1, l2;
+  if (f < TL.sort0) {
+    let n = 0; for (let j = 0; j < NCH; j++) if (f >= TL.cntAt(j)) n++;
+    const d = FIRST.filter(q => q < n).length;
+    l1 = `${n} of ${NCH} letters`; l2 = `${d} symbol${d === 1 ? '' : 's'}`;
+  } else if (st.k < 0) { l1 = `${NS} leaves in the queue`; l2 = 'lightest first'; }
+  else if (st.k < NM) { l1 = `merge ${st.k + 1} of ${NM}`; l2 = `${STATES[st.k + (st.p > 0.5 ? 1 : 0)].length} trees in the queue`; }
+  else { l1 = `${NS} codes`; l2 = `${MINL} to ${MAXL} bits long`; }
+  text(g, l1, G.foX, G.foY, { size: G.fo, weight: 700, color: C.paper, fam: MONO, alpha: a, align: G.foAlign });
+  text(g, l2, G.foX2, G.foY2, { size: G.fo, weight: 700, color: C.dim, fam: MONO, alpha: a, align: G.foAlign2 });
+}
+function finale(g, G, f) {
+  const TL = G.TL, k1 = E.outCubic(prog(f, TL.calm, TL.calm + 18)), k2 = E.outCubic(prog(f, TL.calm + 10, TL.calm + 28));
+  if (k1 <= 0) return;
+  const out = 1 - E.inCubic(prog(f, TL.end - 6, TL.end + 12));
+  g.save(); g.fillStyle = `rgba(${C.bgRGB},${0.84 * k1 * out})`; g.fillRect(0, G.fnY - G.fn * 1.2, G.w, G.fn * 2.9); g.restore();
+  text(g, `${HUFF} bits, not ${ASCII}.`, G.fnX, G.fnY, { size: G.fn, weight: 900, color: C.paper, spacing: -2, align: G.fnAlign, alpha: k1 * out, max: G.fnMax });
+  text(g, `${SAVE}% smaller  ·  ${(HUFF / NCH).toFixed(2)} bits a letter`, G.fnX, G.fnY + G.fn * 1.05, { size: G.fn * 0.62, weight: 850, color: C.accent, spacing: -1, align: G.fnAlign, alpha: k2 * out, max: G.fnMax });
+}
+function scene(g, G, f) {
+  phrase(g, G, f);
+  const st = forest(g, G, f);
+  tapes(g, G, f);
+  caption(g, G, f); readout(g, G, f, st); finale(g, G, f);
+  return st;
+}
+
+// ---- landscape picture ------------------------------------------------------------------
+const TLL = buildTL({ count0: 54, count1: 144, sort0: 150, sort1: 178, merge0: 186, md: [46, 40, 34, 30, 28, 28, 28, 28, 28, 28],
+  code0: 512, code1: 584, enc0: 592, enc1: 682, calm: 690, end: 736 });
+const FRAMES = TLL.end + 72;
+const GL = { TL: TLL, w: W, h: H, capX: W / 2, capY: 200, cap: 50, capTwo: false, capMax: 1680,
+  phX: W / 2, phY: 282, ph: 44, phCW: 27,
+  x0: W / 2 - (NS - 1) * 75, u: 150, rowY: 392, gap: 90, rL: 31, rI: 27, lbl: 30, lblGap: 36, stack: false, sum: 30, bitSize: 28, bitOff: 18,
+  tapeX: 330, tapeW: 1290, tapeY: 952, tapeGap: 40, tapeH: 16, tapeLab: 28, tapeLabX: 300, tapeLabDY: 16, tapeLabAlign: 'right', tapeNumX: 1800, tapeNumAlign: 'right',
+  fo: 30, foX: 120, foY: 1004, foAlign: 'left', foX2: 1800, foY2: 1004, foAlign2: 'right',
+  fn: 104, fnX: W / 2, fnY: 600, fnAlign: 'center', fnMax: 1680 };
+function hookL(f) {
+  const o = 1 - E.inCubic(prog(f, TLL.count0 - 16, TLL.count0 + 2));
+  if (o <= 0) return;
+  const k = E.outExpo(prog(f, -8, 10)), k2 = E.outBack(prog(f, -6, 12));
+  ctx.save(); ctx.fillStyle = `rgba(${C.bgRGB},${0.8 * o})`; ctx.fillRect(0, 400, W, 330); ctx.restore();
+  text(ctx, `${NCH} letters. ${ASCII} bits.`, W / 2, 540 + (1 - k) * 30, { size: 108, weight: 900, color: C.paper, spacing: -3, align: 'center', alpha: o * Math.max(0.3, k) });
+  text(ctx, 'Can we spend fewer?', W / 2, 670 + (1 - clamp(k2)) * 30, { size: 108, weight: 900, color: C.accent, spacing: -3, align: 'center', alpha: o * Math.max(0.3, clamp(k2)) });
+}
+function draw(f) {
+  if (ctx.reset) ctx.reset();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; ctx.filter = 'none'; ctx.shadowBlur = 0;
+  ctx.fillStyle = C.bg; ctx.fillRect(0, 0, W, H);
+  const T = TLL, endK = E.inOutCubic(prog(f, T.end, T.end + 20)), a = 1 - endK;
+  scene(ctx, GL, f);
+  text(ctx, 'COMPRESSION  ·  HUFFMAN CODING', 120, 104, { size: 26, weight: 600, color: C.dim, spacing: 5, alpha: a });
+  text(ctx, 'BYTEPATTERNS', 1800, 104, { size: 26, weight: 600, color: C.dim, spacing: 5, align: 'right', alpha: a });
+  hookL(f);
+  if (endK > 0) {
+    ctx.fillStyle = `rgba(${C.bgRGB},${0.86 * endK})`; ctx.fillRect(0, 0, W, H);
+    const k1 = E.outCubic(prog(f, T.end + 6, T.end + 28)), k2 = E.outCubic(prog(f, T.end + 16, T.end + 38)), k3 = E.outCubic(prog(f, T.end + 26, T.end + 48));
+    text(ctx, 'Huffman Coding', W / 2, 500 + (1 - k1) * 30, { size: 140, weight: 850, color: C.paper, spacing: -3, align: 'center', alpha: k1, max: 1680 });
+    text(ctx, `${NS} symbols  ·  ${NM} merges  ·  ${ASCII} bits → ${HUFF}  ·  entropy bound ${ENTROPY.toFixed(1)}`, W / 2, 580 + (1 - k2) * 20, { size: 42, weight: 500, color: C.accent, align: 'center', alpha: k2, max: 1680 });
+    text(ctx, 'drawn in code  ·  bytepatterns.com', W / 2, 1000, { size: 32, weight: 600, color: C.paper, spacing: 3, align: 'center', alpha: k3 * 0.8 });
+  }
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.letterSpacing = '0px';
+}
+
+// ---- sound: a tick per letter counted, two notes and a sum per merge, a note per code, a blip per bit ----
+async function renderAudio(TL = TLL, frames = FRAMES) {
+  const SR = 48000, dur = frames / FPS, LEN = Math.round(SR * dur);
+  const ac = new OfflineAudioContext(2, LEN, SR);
+  const at = fr => fr / FPS;
+  const comp = ac.createDynamicsCompressor();
+  comp.threshold.value = -16; comp.ratio.value = 3; comp.attack.value = 0.005; comp.release.value = 0.25;
+  const master = ac.createGain(); master.gain.value = 0.9; master.connect(comp).connect(ac.destination);
+  master.gain.setValueAtTime(0.9, dur - 1.0); master.gain.linearRampToValueAtTime(0.0001, dur - 0.02);
+  const rnd = mulberry32(0x49F0C0);
+  const ir = ac.createBuffer(2, SR * 2, SR);
+  for (let c = 0; c < 2; c++) { const d = ir.getChannelData(c); for (let k = 0; k < d.length; k++) d[k] = (rnd() * 2 - 1) * Math.pow(1 - k / d.length, 3); }
+  const verb = ac.createConvolver(); verb.buffer = ir; const vg = ac.createGain(); vg.gain.value = 0.3; verb.connect(vg).connect(master);
+  const noise = ac.createBuffer(1, SR, SR); { const d = noise.getChannelData(0); for (let k = 0; k < d.length; k++) d[k] = rnd() * 2 - 1; }
+  const hz = m => 440 * Math.pow(2, (m - 69) / 12);
+  const pluck = (t0, m, amp, pan, dec = 0.35, type = 'triangle') => {
+    const o = ac.createOscillator(), g = ac.createGain(), p = ac.createStereoPanner(); o.type = type; o.frequency.value = hz(m);
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(amp, t0 + 0.004); g.gain.exponentialRampToValueAtTime(0.0001, t0 + dec);
+    p.pan.value = pan; o.connect(g).connect(p); p.connect(master); p.connect(verb); o.start(t0); o.stop(t0 + dec + 0.05);
+  };
+  const pad = (t0, t1, notes, amp, cutoff) => {
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = cutoff; lp.Q.value = 1; lp.connect(master); lp.connect(verb);
+    notes.forEach((m, i) => { for (const det of [-6, 6]) {
+      const o = ac.createOscillator(), g = ac.createGain(), p = ac.createStereoPanner(); o.type = 'sawtooth'; o.frequency.value = hz(m); o.detune.value = det;
+      p.pan.value = (i / Math.max(1, notes.length - 1) - 0.5) * 0.8 * Math.sign(det);
+      g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(amp, t0 + 1.0); g.gain.setValueAtTime(amp, Math.max(t0 + 1.0, t1 - 0.8)); g.gain.exponentialRampToValueAtTime(0.0001, t1 + 0.4);
+      o.connect(g).connect(p).connect(lp); o.start(t0); o.stop(t1 + 0.45); } });
+  };
+  const PENTA = [0, 2, 4, 7, 9, 12, 14, 16, 19, 21, 24, 26, 28];
+  pad(0, at(TL.merge0 + 4), [45, 52, 57, 59], 0.012, 850);
+  pad(at(TL.merge0), at(TL.code0 + 6), [43, 50, 55, 59, 62], 0.012, 1050);
+  pad(at(TL.code0), at(TL.end + 50), [48, 55, 60, 64, 67], 0.014, 1400);
+  // counting: a tick per letter, pitched by symbol; a brighter one the first time a symbol appears
+  for (let j = 0; j < NCH; j++) {
+    const s = SIDX[PHRASE[j]], first = FIRST[s] === j;
+    pluck(at(TL.cntAt(j)), 72 + PENTA[s], first ? 0.06 : 0.03, (j / NCH - 0.5) * 1.2, first ? 0.4 : 0.16, first ? 'triangle' : 'sine');
+  }
+  // the sort: a short swell of filtered noise
+  { const s = ac.createBufferSource(); s.buffer = noise; const bp = ac.createBiquadFilter(); bp.type = 'bandpass'; bp.Q.value = 3;
+    bp.frequency.setValueAtTime(400, at(TL.sort0)); bp.frequency.exponentialRampToValueAtTime(2400, at(TL.sort1));
+    const g = ac.createGain(); g.gain.setValueAtTime(0.0001, at(TL.sort0)); g.gain.exponentialRampToValueAtTime(0.05, at(TL.sort1) - 0.1); g.gain.exponentialRampToValueAtTime(0.0001, at(TL.sort1) + 0.1);
+    s.connect(bp).connect(g).connect(master); s.start(at(TL.sort0)); s.stop(at(TL.sort1) + 0.15); }
+  // merges: the two lightest, then their sum (higher as the weights grow)
+  const pitch = w => 55 + PENTA[Math.min(12, Math.round(Math.log2(w) * 2.2))];
+  MERGES.forEach((M, k) => {
+    const s = TL.ms[k], d = TL.md[k];
+    pluck(at(s + 0.02 * d), pitch(NODES[M.a].w), 0.05, -0.35, 0.3); pluck(at(s + 0.1 * d), pitch(NODES[M.b].w), 0.05, 0.35, 0.3);
+    pluck(at(s + 0.45 * d), pitch(NODES[M.p].w) + 12, 0.075, 0, 0.7); pluck(at(s + 0.45 * d) + 0.03, pitch(NODES[M.p].w) + 19, 0.03, 0.1, 0.5, 'sine');
+  });
+  // codes: a note as the pulse reaches each leaf, lower for longer codes
+  const pd = (TL.code1 - TL.code0 - 20) / (MAXL + 0.5);
+  SYM.forEach((ch, i) => { const L = CODE[ch].length; pluck(at(TL.code0 + 12 + pd * (L - 1)), 84 - PENTA[L + 1], 0.045, (i / NS - 0.5) * 1.4, 0.5, 'sine'); });
+  // encoding: one short blip per bit (1 high, 0 low), spread over the letter
+  for (let j = 0; j < NCH; j++) {
+    const code = CODE[PHRASE[j]], t0 = TL.encAt(j), t1 = TL.encAt(j + 1);
+    for (let q = 0; q < code.length; q++) pluck(at(t0 + (t1 - t0) * q / code.length), code[q] === '1' ? 88 : 81, 0.03, (j / NCH - 0.5) * 1.0, 0.07, 'sine');
+  }
+  [69, 72, 76, 81].forEach((m, i) => pluck(at(TL.calm) + i * 0.09, m, 0.06, -0.3 + i * 0.2, 1.6, 'sine'));
+  [76, 81, 84, 88].forEach((m, i) => pluck(at(TL.end + 10 + i * 6), m, 0.05, -0.45 + i * 0.3, 1.8, 'sine'));
+  const buf = await ac.startRendering();
+  let peak = 0; for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let k = 0; k < d.length; k++) peak = Math.max(peak, Math.abs(d[k])); }
+  const norm = 0.85 / Math.max(peak, 1e-6);                          // every piece peaks at the same level
+  for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let k = 0; k < d.length; k++) d[k] *= norm; }
+  return buf;
+}
+
+/* ==========================================================================
+   VERTICAL CUT — shared block, identical in every piece.
+   1080x1920 for Reels, Shorts and TikTok (__motion.variants.vertical). The
+   piece's own scene code is re-used and recomposed for a phone: everything a
+   viewer must read stays inside the area no platform covers (x 60..900,
+   y 230..1400); outside it there is only dimmed texture.
+   ========================================================================== */
+const VW = 1080, VH = 1920, SAFE = { x: 60, y: 230, w: 840, h: 1170, r: 900, b: 1400 };
+const vcv = document.createElement('canvas'); vcv.width = VW; vcv.height = VH;
+const vx = vcv.getContext('2d', { willReadFrequently: true });   // CPU raster: identical pixels on every redraw
+const VL = 96, VR = 864;                                          // text column inside the safe area
+
+function vReset() {
+  vx.setTransform(1, 0, 0, 1, 0, 0); vx.globalAlpha = 1; vx.globalCompositeOperation = 'source-over';
+  vx.filter = 'none'; vx.shadowBlur = 0; vx.shadowColor = 'transparent'; vx.letterSpacing = '0px'; vx.setLineDash([]);
+  vx.textAlign = 'left'; vx.textBaseline = 'alphabetic'; vx.lineCap = 'butt'; vx.lineJoin = 'miter';
+}
+/** Canvas text on the vertical frame; `max` shrinks the size until the line fits. */
+function vText(str, x, y, { size = 40, weight = 700, color = '#FFFFFF', align = 'left', spacing = 0, alpha = 1, fam = FONT, max = 0 } = {}) {
+  if (alpha <= 0.002 || !str) return size;
+  vx.font = `${weight} ${size}px ${fam}`; vx.letterSpacing = spacing + 'px';
+  if (max) { const w = vx.measureText(str).width; if (w > max) { size = size * max / w; vx.font = `${weight} ${size}px ${fam}`; } }
+  vx.textAlign = align; vx.textBaseline = 'alphabetic';
+  const a0 = vx.globalAlpha; vx.globalAlpha = a0 * alpha; vx.fillStyle = color;
+  vx.fillText(str, x + (align === 'center' ? spacing / 2 : align === 'right' ? spacing : 0), y);   // tracking is added after the last glyph too
+  vx.globalAlpha = a0; vx.letterSpacing = '0px';
+  return size;
+}
+/** Word-wraps with the given font; returns the lines. */
+function vWrap(str, maxW, size, weight = 700, fam = FONT) {
+  vx.font = `${weight} ${size}px ${fam}`; vx.letterSpacing = '0px';
+  const words = str.split(' '), lines = []; let cur = '';
+  for (const w of words) { const t = cur ? cur + ' ' + w : w; if (vx.measureText(t).width > maxW && cur) { lines.push(cur); cur = w; } else cur = t; }
+  if (cur) lines.push(cur);
+  return lines;
+}
+/** Fade envelope with a small rise: [alpha, dy]. */
+function vEnv(v, a, b, fin = 8, fout = 8) {
+  const i = E.outCubic(prog(v, a, a + fin)), o = 1 - E.inCubic(prog(v, b - fout, b));
+  return [Math.min(i, o), (1 - i) * 22 - (1 - o) * 10];
+}
+/** Which segment of a cut list a vertical frame is in: segs = [{ at, src, len }] in frames. */
+function vSeg(segs, v) {
+  let k = 0; while (k < segs.length - 1 && v >= segs[k + 1].at) k++;
+  const s = segs[k];
+  return { k, s, local: v - s.at, src: s.src + (v - s.at) };
+}
+/** Dims everything outside the safe area to a quiet texture (brightness x 0.2), with a soft inner edge. */
+function vShade(rgb, a = 0.8, feather = 40) {
+  vx.save(); vx.setTransform(1, 0, 0, 1, 0, 0); vx.globalAlpha = 1; vx.globalCompositeOperation = 'source-over';
+  vx.fillStyle = `rgba(${rgb},${a})`;
+  vx.beginPath(); vx.rect(0, 0, VW, VH); vx.rect(SAFE.x, SAFE.y, SAFE.w, SAFE.h); vx.fill('evenodd');
+  const strip = (x0, y0, x1, y1, rx, ry, rw, rh) => {
+    const g = vx.createLinearGradient(x0, y0, x1, y1);
+    g.addColorStop(0, `rgba(${rgb},${a})`); g.addColorStop(1, `rgba(${rgb},0)`);
+    vx.fillStyle = g; vx.fillRect(rx, ry, rw, rh);
+  };
+  strip(SAFE.x, 0, SAFE.x + feather, 0, SAFE.x, SAFE.y, feather, SAFE.h);
+  strip(SAFE.r, 0, SAFE.r - feather, 0, SAFE.r - feather, SAFE.y, feather, SAFE.h);
+  strip(0, SAFE.y, 0, SAFE.y + feather, SAFE.x, SAFE.y, SAFE.w, feather);
+  strip(0, SAFE.b, 0, SAFE.b - feather, SAFE.x, SAFE.b - feather, SAFE.w, feather);
+  vx.restore();
+}
+/** Series tag at the top of the safe area, e.g. MADE IN CODE · 04. */
+function vTag(label, color, alpha = 1) {
+  vText('MADE IN CODE', VL, 292, { size: 28, weight: 800, color, spacing: 5, alpha });
+  vx.font = `800 28px ${FONT}`; vx.letterSpacing = '5px';
+  const w = vx.measureText('MADE IN CODE').width; vx.letterSpacing = '0px';
+  vText('·  ' + label, VL + w + 14, 292, { size: 28, weight: 600, color: 'rgba(255,255,255,0.72)', spacing: 3, alpha, max: VR - VL - w - 14 });
+}
+/** Big hook lines, left-aligned from y0; visible from frame 0, settles in a few frames. */
+function vHook(v, lines, y0, { size = 84, lh = 1.08, color = '#FFFFFF', accent = null, weight = 800, spacing = -1.5, alpha = 1 } = {}) {
+  const k = E.outExpo(prog(v, -6, 12));
+  lines.forEach((ln, i) => {
+    const kk = E.outExpo(prog(v, -12 + i * 2, 8 + i * 2));
+    vText(ln, VL, y0 + i * size * lh + (1 - kk) * 30, { size, weight, spacing, color: accent && i === lines.length - 1 ? accent : color, alpha: alpha * Math.max(0.25, kk), max: VR - VL });
+  });
+  return k;
+}
+/** Closing card, the last 60 frames: piece title, "drawn in code · bytepatterns.com". l = frames into the card. */
+function vEndCard(l, { title, line = '', ink = '#FFFFFF', dim = 'rgba(255,255,255,0.66)', accent = '#FFFFFF', scrim = '0,0,0', a = 0.84 }) {
+  const k = E.outCubic(prog(l, 0, 12));
+  vx.save(); vx.setTransform(1, 0, 0, 1, 0, 0);
+  vx.fillStyle = `rgba(${scrim},${a * k})`; vx.fillRect(0, 0, VW, VH);
+  vx.restore();
+  const t1 = E.outExpo(prog(l, 3, 19)), t2 = E.outExpo(prog(l, 11, 27)), t3 = E.outExpo(prog(l, 19, 35));
+  vx.fillStyle = accent; vx.globalAlpha = t1; vx.fillRect(VL, 742, 88 * t1, 7); vx.globalAlpha = 1;
+  const size = vText(title, VL, 850 + (1 - t1) * 40, { size: 92, weight: 800, color: ink, spacing: -2, alpha: t1, max: VR - VL });
+  const y2 = 850 + Math.max(size, 60) * 0.25 + 70;
+  vx.font = `600 44px ${FONT}`;
+  const lead = 'drawn in code  ·  ', lw = vx.measureText(lead).width;
+  vText(lead, VL, y2 + (1 - t2) * 24, { size: 44, weight: 600, color: dim, alpha: t2 });
+  vText('bytepatterns.com', VL + lw, y2 + (1 - t2) * 24, { size: 44, weight: 800, color: accent, alpha: t2 });
+  if (line) vText(line, VL, y2 + 72 + (1 - t3) * 18, { size: 32, weight: 500, color: dim, alpha: t3, max: VR - VL });
+}
+/** Seeks a cut. The first frame a page draws is drawn twice: the very first read of a
+ *  GPU-backed source canvas can come out a shade different from every later one. */
+let vWarm = false;
+function vSeek(draw, i, frames) {
+  const f = Math.max(0, Math.min(frames - 1, Math.floor(i)));
+  if (!vWarm) { vWarm = true; draw(f); }
+  draw(f);
+}
+/** The soundtrack of a cut: the piece's own audio() spliced to the same segments as the picture. */
+async function vAudio(segs, frames, { xf = 0.025, fadeOut = 0.6, extra = null } = {}) {
+  const src = await renderAudio();
+  const SR = 48000, dur = frames / FPS, ac = new OfflineAudioContext(2, Math.round(SR * dur), SR);
+  const out = ac.createGain(); out.connect(ac.destination);
+  out.gain.setValueAtTime(1, 0); out.gain.setValueAtTime(1, dur - fadeOut); out.gain.linearRampToValueAtTime(0, dur - 0.01);
+  segs.forEach((s, k) => {
+    const at = s.at / FPS, off = s.src / FPS, d = s.len / FPS;
+    const pre = k === 0 ? 0 : Math.min(xf, off), post = k === segs.length - 1 ? 0 : xf;
+    const b = ac.createBufferSource(), g = ac.createGain(); b.buffer = src;
+    g.gain.setValueAtTime(pre ? 0 : 1, at - pre);
+    if (pre) g.gain.linearRampToValueAtTime(1, at + pre);
+    if (post) { g.gain.setValueAtTime(1, at + d - post); g.gain.linearRampToValueAtTime(0, at + d + post); }
+    b.connect(g).connect(out); b.start(at - pre, off - pre, d + pre + post);
+  });
+  if (extra) extra(ac, out);
+  const buf = await ac.startRendering();
+  let peak = 0; for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) peak = Math.max(peak, Math.abs(d[i])); }
+  if (peak > 0.9) for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) d[i] *= 0.9 / peak; }
+  return buf;
+}
+/** A soft three-partial bell, for the closing card. */
+function vChime(ac, dest, at, freq, vol = 0.08) {
+  for (const [mul, v, dec] of [[1, 1, 1.8], [2.01, 0.35, 0.8], [3.02, 0.12, 0.4]]) {
+    const o = ac.createOscillator(), g = ac.createGain(); o.type = 'sine'; o.frequency.value = freq * mul;
+    g.gain.setValueAtTime(0.0001, at); g.gain.exponentialRampToValueAtTime(vol * v, at + 0.006); g.gain.exponentialRampToValueAtTime(0.0001, at + dec);
+    o.connect(g).connect(dest); o.start(at); o.stop(at + dec + 0.05);
+  }
+}
+
+/* VERTICAL CUT — this piece */
+// The same sentence and the same tree on a 1080 x 1920 stage and a faster clock; the
+// leaves sit closer together, so each code is stacked under its leaf, one bit per line.
+const TLV = buildTL({ count0: 36, count1: 96, sort0: 100, sort1: 120, merge0: 126, md: [34, 30, 26, 24, 22, 22, 22, 22, 22, 22],
+  code0: 378, code1: 430, enc0: 436, enc1: 494, calm: 500, end: 534 });
+const VFR = TLV.end + 60, VEND = VFR - 60;
+const GV = { TL: TLV, w: VW, h: VH, capX: VL, capY: 390, cap: 48, capTwo: true, capMax: VR - VL,
+  phX: 480, phY: 540, ph: 34, phCW: 20.6,
+  x0: 480 - (NS - 1) * 38, u: 76, rowY: 648, gap: 86, rL: 27, rI: 23, lbl: 28, lblGap: 30, stack: true, sum: 28, bitSize: 28, bitOff: 14,
+  tapeX: VL, tapeW: VR - VL, tapeY: 1306, tapeGap: 58, tapeH: 12, tapeLab: 28, tapeLabX: VL, tapeLabDY: -10, tapeLabAlign: 'left', tapeNumX: VR, tapeNumAlign: 'right',
+  fo: 30, foX: VL, foY: 1300, foAlign: 'left', foX2: VL, foY2: 1350, foAlign2: 'left',
+  fn: 84, fnX: VL, fnY: 800, fnAlign: 'left', fnMax: VR - VL };
+function hookV(v) {
+  const o = 1 - E.inCubic(prog(v, TLV.count0 - 12, TLV.count0 + 2));
+  if (o <= 0) return;
+  vx.save(); vx.fillStyle = `rgba(${C.bgRGB},${0.84 * o})`; vx.fillRect(SAFE.x, 400, SAFE.w, 560); vx.restore();
+  vHook(v, [`${NCH} letters.`, `${ASCII} bits.`, 'Can we spend', 'fewer?'], 510, { size: 104, accent: C.accent, color: C.paper, weight: 900, spacing: -2, alpha: o });
+}
+function vDraw(v) {
+  if (vx.reset) vx.reset();
+  vReset();
+  vx.fillStyle = C.bg; vx.fillRect(0, 0, VW, VH);
+  scene(vx, GV, v);
+  hookV(v);
+  vReset();
+  vShade(C.bgRGB, 0.86);
+  vTag('HUFFMAN CODING', C.accent);
+  if (v >= VEND) vEndCard(v - VEND, { title: 'Huffman Coding', line: `${NCH} letters  ·  ${NS} symbols  ·  ${ASCII} bits → ${HUFF}`,
+    ink: C.paper, dim: 'rgba(241,238,230,0.72)', accent: C.accent, scrim: C.bgRGB, a: 0.88 });
+  vReset();
+}
+
+// The player asks for a frame on every display refresh; at 30 fps on a 60 Hz screen every other call
+// asks for the frame already on the canvas, which is then left as it is (same frame, same pixels).
+const shown = { L: -1, V: -1 };
+window.__motion = {
+  title: 'Huffman Coding',
+  description: `The sentence "${PHRASE}" is counted into ${NS} symbols, queued rarest first and joined two at a time in ${NM} merges into one tree whose paths become codes of ${MINL} to ${MAXL} bits, which spell its ${NCH} letters in ${HUFF} bits instead of ${ASCII} in 8-bit ASCII or ${FIXED} in a fixed ${FIXED / NCH}-bit code (entropy bound ${ENTROPY.toFixed(1)}).`,
+  fps: FPS, width: W, height: H, frames: FRAMES,
+  poster: TLL.ms[7] + 20,
+  gifStart: Math.floor(TLL.ms[4] / FPS),
+  seek(i) { const f = Math.max(0, Math.min(FRAMES - 1, Math.floor(i))); if (f !== shown.L) { shown.L = f; draw(f); } },
+  audio: () => renderAudio(TLL, FRAMES),
+  variants: {
+    vertical: {
+      width: VW, height: VH, frames: VFR, canvas: vcv,
+      poster: TLV.enc0 + 30, gifStart: Math.floor(TLV.ms[6] / FPS),
+      seek(i) { const v = Math.max(0, Math.min(VFR - 1, Math.floor(i))); if (v !== shown.V) { shown.V = v; vSeek(vDraw, v, VFR); } },
+      audio: () => renderAudio(TLV, VFR),
+    },
+  },
+};
+
+/* ==========================================================================
+   PLAYER — identical in every piece; keep as is.
+   Autoplays and loops, starts sound on the first click, ?frame=N pauses on a
+   frame, ?variant=vertical plays the vertical cut (if the piece has one).
+   When the renderer sets window.__MOTION_RENDER__ it stays out of the way.
+   ========================================================================== */
+(function player() {
+  const btn = document.getElementById('sound'), q = new URLSearchParams(location.search);
+  let M = window.__motion;
+  const V = !window.__MOTION_RENDER__ && M.variants && M.variants[q.get('variant')];
+  if (V) {                                                // show the variant's own canvas instead
+    M = Object.assign({}, M, V);
+    V.canvas.style.cssText = `width:min(100vw,calc(100vh*${V.width}/${V.height}));height:auto;aspect-ratio:${V.width}/${V.height}`;
+    document.querySelector('canvas').replaceWith(V.canvas);
+  }
+  const dur = M.frames / M.fps;
+  if (window.__MOTION_RENDER__) { btn.hidden = true; M.seek(0); return; }
+  if (q.has('frame')) { btn.hidden = true; M.seek(+q.get('frame') || 0); return; }
+  let t0 = performance.now(), ac = null, src = null, buf = null, paused = false, pausedAt = 0;
+  const clock = () => ac && src ? (ac.currentTime - t0) : (performance.now() - t0) / 1000;
+  function loop() {
+    if (!paused) M.seek(Math.floor(((clock() % dur) + dur) % dur * M.fps));
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+  btn.addEventListener('click', async () => {
+    if (src) { src.stop(); src = null; btn.textContent = 'Click for sound'; t0 = performance.now(); return; }
+    btn.textContent = 'Loading sound…';
+    ac = ac || new AudioContext({ sampleRate: 48000 });
+    buf = buf || await M.audio();
+    await ac.resume();
+    src = ac.createBufferSource(); src.buffer = buf; src.loop = true; src.connect(ac.destination);
+    t0 = ac.currentTime + 0.05; src.start(t0);        // picture restarts from frame 0 in sync with the sound
+    btn.textContent = 'Sound on — click to mute';
+  });
+  addEventListener('keydown', e => {
+    if (e.code !== 'Space') return;
+    e.preventDefault(); paused = !paused;
+    if (ac) paused ? ac.suspend() : ac.resume();
+    if (!ac) { if (paused) pausedAt = performance.now(); else t0 += performance.now() - pausedAt; }
+  });
+})();
+</script>
+</body>
+</html>
