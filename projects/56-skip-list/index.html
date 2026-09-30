@@ -1,0 +1,705 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="author" content="teambytepatterns">
+<meta name="description" content="Twenty sorted keys in a linked list get express lanes from coin flips; searches run right along the top lanes and drop down, racing a scan of the bottom lane, and an insert flips coins for its own height and is spliced into every lane it reaches.">
+<title>Skip List: Express Lanes — motion-lab</title>
+<style>
+  /* Player chrome. The piece itself lives entirely in the canvas. */
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  body { display: grid; place-items: center; font: 500 15px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #fff; }
+  canvas { display: block; width: min(100vw, calc(100vh * 16 / 9)); height: auto; aspect-ratio: 16 / 9; }
+  #sound { position: fixed; left: 16px; bottom: 16px; padding: 8px 14px; border: 1px solid rgba(255,255,255,.35); border-radius: 999px;
+           background: rgba(0,0,0,.55); color: #fff; font: inherit; cursor: pointer; }
+  #sound[hidden] { display: none; }
+</style>
+</head>
+<body>
+<canvas id="stage" width="1920" height="1080" aria-label="A row of numbered boxes joined by arrows; towers of boxes rise on some of them, joined by longer arrows; a yellow path runs along the top rows and steps down while a red ring crawls box by box along the bottom row; the columns part and a new tower grows in the gap"></canvas>
+<button id="sound" type="button">Click for sound</button>
+<script>
+'use strict';
+/* ==========================================================================
+   PIECE — Skip List: Express Lanes.
+   A skip list is a sorted linked list with extra lanes on top. Every key
+   flips a coin: heads, it also joins the lane above, and flips again. About
+   half the keys reach lane 1, a quarter lane 2, and so on. A search starts
+   at the top of the head tower and moves right while the next key is
+   smaller than the target, otherwise it drops one lane; at the bottom the
+   next key either is the target or proves it absent. An insert walks the
+   same way, remembers where it dropped on every lane, flips coins for its
+   height and is spliced in after those nodes: no rebalancing.
+   The keys, every coin flip, the lanes, every step of every walk and the
+   bottom-lane scans it races are computed once at load from a fixed seed;
+   a frame maps to a step of that record, so seek(i) is pure in i.
+   ========================================================================== */
+const W = 1920, H = 1080, FPS = 30;
+const cv = document.getElementById('stage');
+const ctx = cv.getContext('2d', { willReadFrequently: true });   // CPU raster: identical pixels on every redraw
+const FONT = 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
+const MONO = 'ui-monospace, "Cascadia Code", Consolas, Menlo, monospace';
+
+// ---- helpers -------------------------------------------------------------
+function mulberry32(a) { return function () { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a);
+  t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const lerp = (a, b, t) => a + (b - a) * t;
+const prog = (f, a, b) => clamp((f - a) / (b - a));
+const smooth = t => t * t * (3 - 2 * t);
+const E = {
+  inCubic: t => t * t * t,
+  outCubic: t => 1 - Math.pow(1 - t, 3),
+  inOutCubic: t => t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2,
+  outExpo: t => t === 1 ? 1 : 1 - Math.pow(2, -10 * t),
+  inExpo: t => t === 0 ? 0 : Math.pow(2, 10 * t - 10),
+  inOutExpo: t => t === 0 ? 0 : t === 1 ? 1 : t < .5 ? Math.pow(2, 20 * t - 10) / 2 : (2 - Math.pow(2, -20 * t + 10)) / 2,
+  outBack: t => 1 + 2.70158 * Math.pow(t - 1, 3) + 1.70158 * Math.pow(t - 1, 2),
+};
+/** Canvas text; `max` shrinks the size until the line fits. Returns the width drawn. */
+function text(g, str, x, y, { size = 40, weight = 600, color = '#fff', alpha = 1, spacing = 0, align = 'left', fam = FONT, base = 'alphabetic', max = 0 } = {}) {
+  if (alpha <= 0.002 || !str) return 0;
+  g.font = `${weight} ${size}px ${fam}`; g.letterSpacing = spacing + 'px';
+  if (max) { const w0 = g.measureText(str).width; if (w0 > max) { size *= max / w0; g.font = `${weight} ${size}px ${fam}`; } }
+  g.textAlign = align; g.textBaseline = base;
+  const a0 = g.globalAlpha; g.globalAlpha = a0 * alpha; g.fillStyle = color;
+  g.fillText(str, x, y);
+  const w = g.measureText(str).width;
+  g.globalAlpha = a0; g.letterSpacing = '0px';
+  return w;
+}
+const measure = (g, str, size, weight = 800, fam = FONT, spacing = 0) => { g.font = `${weight} ${size}px ${fam}`; g.letterSpacing = spacing + 'px'; const w = g.measureText(str).width; g.letterSpacing = '0px'; return w; };
+const env = (f, a, b, fin = 12, fout = 10) => {
+  const i = E.outCubic(prog(f, a, a + fin)), o = 1 - E.inCubic(prog(f, b - fout, b));
+  return [Math.min(i, o), (1 - i) * 24 - (1 - o) * 10];
+};
+
+// ---- palette -------------------------------------------------------------
+const C = {
+  bg: '#0B0D14', bgRGB: '11,13,20', paper: '#F1EEE6', paperRGB: '241,238,230', dim: 'rgba(241,238,230,0.62)', faint: 'rgba(241,238,230,0.16)',
+  accent: '#FFC857', accentRGB: '255,200,87', go: '#5CD6CB', lin: '#FF5E6C', linRGB: '255,94,108', node: '#151A28',
+  lane: ['#F1EEE6', '#5CD6CB', '#8FA8FF', '#C49BFF', '#FF8FA3', '#B8F07A'],
+};
+
+// ---- the list, the coin flips and every walk, computed once --------------------------------
+const N0 = 20, MAXL = 6;
+const R = mulberry32(0x5FE0);
+const KEYS = (function () { const s = new Set(); while (s.size < N0) s.add(3 + Math.floor(R() * 95)); return [...s].sort((a, b) => a - b); })();
+const flips = () => { const f = []; while (f.length < MAXL - 1) { const h = R() < 0.5; f.push(h); if (!h) break; } return f; };
+const LIST_A = KEYS.map(key => { const fl = flips(); return { key, fl, h: fl.filter(Boolean).length + 1 }; });
+// the key to insert: between the 9th and 10th keys; its own flips
+const XK = (function () { for (let i = 8; i < N0 - 1; i++) { const x = Math.floor((KEYS[i] + KEYS[i + 1]) / 2); if (x !== KEYS[i] && x !== KEYS[i + 1]) return x; } return 1; })();
+const XFL = flips(), XH = XFL.filter(Boolean).length + 1;
+const LIST_B = LIST_A.concat([{ key: XK, fl: XFL, h: XH, isNew: true }]).sort((a, b) => a.key - b.key);
+const XI = LIST_B.findIndex(n => n.isNew);
+const T1 = KEYS[15], T2 = (function () { for (let i = 17; i > 0; i--) { const x = Math.floor((KEYS[i] + KEYS[i + 1]) / 2); if (!KEYS.includes(x) && x !== XK) return x; } return 2; })();
+const TOP = list => Math.max(...list.map(n => n.h));
+/** Walk a list for `target`: events in order, and where the walk dropped on each lane. Columns: 0 = head, i + 1 = node i, n + 1 = nil. */
+function walk(list, target) {
+  const nxt = (c, l) => { for (let j = c; j < list.length; j++) if (list[j].h > l) return j + 1; return list.length + 1; };
+  const ev = [], drop = [];
+  let c = 0, l = TOP(list) - 1, cmp = 0;
+  for (;;) {
+    const n = nxt(c, l), key = n <= list.length ? list[n - 1].key : null;
+    if (key !== null && key < target) { cmp++; ev.push({ t: 'right', from: c, to: n, l, key, cmp }); c = n; continue; }
+    if (key !== null) cmp++;
+    drop[l] = c;
+    if (l === 0) { ev.push({ t: 'stop', c, l, key, next: n, cmp, found: key === target }); break; }
+    ev.push({ t: 'down', c, l, key, next: n, cmp }); l--;
+  }
+  let lin = 0; for (const nd of list) { lin++; if (nd.key >= target) break; }
+  return { target, ev, drop, cmp, lin, found: ev[ev.length - 1].found };
+}
+const S1 = walk(LIST_A, T1), SI = walk(LIST_A, XK), S2 = walk(LIST_B, T2);
+const LANES_A = Array.from({ length: TOP(LIST_A) }, (_, l) => LIST_A.filter(n => n.h > l).length);
+const LANES_B = Array.from({ length: TOP(LIST_B) }, (_, l) => LIST_B.filter(n => n.h > l).length);
+const SUMC = S1.cmp + SI.cmp + S2.cmp, SUML = S1.lin + SI.lin + S2.lin;
+const TOPALL = Math.max(TOP(LIST_A), TOP(LIST_B));
+const flipStr = fl => fl.map(h => h ? 'heads' : 'tails').join(', ');
+
+// ---- timeline -------------------------------------------------------------------------------
+// b0: the bottom lane appears, bl0 frames; then one lane every bl; s1 / si / s2 = { a, t0, tick, t1, z }:
+// a search appears at a, walks from t0 one tick per step, ends at t1 and is gone by z. The insert
+// then opens a gap (gap0..gap1), flips (fl0 + k * flt) and splices lane by lane (sp0 + l * spt).
+function buildTL(o) {
+  const TL = Object.assign({}, o);
+  TL.b1 = TL.b0 + TL.bl0 + (TOP(LIST_A) - 1) * TL.bl;
+  const mk = (a, S, tick, race) => { const t0 = a + TL.lead, n = race ? Math.max(S.ev.length, S.lin) : S.ev.length, t1 = t0 + n * tick; return { a, t0, tick, t1, z: t1 + TL.hold, S, race }; };
+  TL.s1 = mk(TL.b1 + TL.gapA, S1, TL.tick1, true);
+  TL.si = mk(TL.s1.z + 4, SI, TL.tickI, false);
+  TL.gap0 = TL.si.t1 + 4; TL.gap1 = TL.gap0 + TL.gapT;
+  TL.fl0 = TL.gap1 + 4; TL.fl1 = TL.fl0 + XFL.length * TL.flt;
+  TL.sp0 = TL.fl1 + 4; TL.sp1 = TL.sp0 + XH * TL.spt;
+  TL.si.z = TL.sp1 + TL.hold;
+  TL.s2 = mk(TL.si.z + 4, S2, TL.tick2, true);
+  TL.calm = TL.s2.z + 2;
+  TL.end = Math.round(TL.calm + TL.calmT);
+  TL.caps = [
+    [TL.b0 - 4, TL.b0 + TL.bl0 + TL.bl * 1.5, 'A sorted linked list, plus express lanes:|every key flips coins to climb.'],
+    [TL.b0 + TL.bl0 + TL.bl * 1.5, TL.s1.a - 2, `${LANES_A.length} lanes holding ${LANES_A.join(', ')} keys:|each lane skips about half of the one below.`],
+    [TL.s1.a, TL.s1.t0 + (S1.ev.length + 1) * TL.tick1, `Find ${T1}: go right while the next key is smaller,|otherwise drop a lane.`],
+    [TL.s1.t0 + (S1.ev.length + 1) * TL.tick1, TL.si.a - 2, `Found in ${S1.cmp} comparisons.|The bottom lane alone needs ${S1.lin}.`],
+    [TL.si.a, TL.fl0 - 2, `Insert ${XK}: the same walk|remembers where it dropped.`],
+    [TL.fl0, TL.s2.a - 2, `Coin flips pick its height: ${XH}.|Splice it in on ${XH === 1 ? 'one lane' : `${XH} lanes`}. No rebalancing.`],
+    [TL.s2.a, TL.calm - 2, `Find ${T2}: ${S2.found ? 'found' : 'not there'}, proved in ${S2.cmp} comparisons,|not ${S2.lin}.`],
+  ];
+  return TL;
+}
+function searchAt(TL, f) {
+  for (const k of ['s1', 'si', 's2']) { const s = TL[k]; if (f >= s.a && f < s.z) return { k, s }; }
+  return null;
+}
+
+// ---- drawing ------------------------------------------------------------------------------
+const pos = (G, col, l) => G.T ? [G.x0 + l * G.lg, G.y0 + col * G.u] : [G.x0 + col * G.u, G.y0 - l * G.lg];
+const half = G => (G.T ? G.bh : G.bw) / 2;
+function arrow(g, G, p1, p2, k, col, lw, alpha) {
+  if (k <= 0 || alpha <= 0.01) return;
+  const dx = p2[0] - p1[0], dy = p2[1] - p1[1], d = Math.hypot(dx, dy) || 1, ux = dx / d, uy = dy / d;
+  const s = half(G) + 3, e = half(G) + 5, x0 = p1[0] + ux * s, y0 = p1[1] + uy * s, len = Math.max(0, d - s - e) * k;
+  const x1 = x0 + ux * len, y1 = y0 + uy * len;
+  g.save(); g.globalAlpha = alpha; g.strokeStyle = col; g.fillStyle = col; g.lineWidth = lw; g.lineCap = 'round';
+  g.beginPath(); g.moveTo(x0, y0); g.lineTo(x1, y1); g.stroke();
+  if (len > 10) { const ah = 11; g.beginPath(); g.moveTo(x1 + ux * 2, y1 + uy * 2); g.lineTo(x1 - ux * ah - uy * ah * 0.55, y1 - uy * ah + ux * ah * 0.55); g.lineTo(x1 - ux * ah + uy * ah * 0.55, y1 - uy * ah - ux * ah * 0.55); g.closePath(); g.fill(); }
+  g.restore();
+}
+function box(g, G, x, y, { key = null, col = C.paper, alpha = 1, fill = C.node, ring = null, lw = 2.5 } = {}) {
+  if (alpha <= 0.01) return;
+  g.save(); g.globalAlpha = alpha; g.fillStyle = fill; g.beginPath(); g.roundRect(x - G.bw / 2, y - G.bh / 2, G.bw, G.bh, 8); g.fill();
+  g.strokeStyle = ring || col; g.lineWidth = ring ? 4 : lw; g.stroke(); g.restore();
+  if (key !== null) text(g, String(key), x, y + 1, { size: G.key, weight: 800, color: C.paper, align: 'center', base: 'middle', fam: MONO, alpha });
+}
+/** The list at frame f: which nodes, at which (fractional) column, how many lanes each shows, how far each lane's arrows have grown. */
+function listState(TL, f) {
+  const gap = E.inOutCubic(prog(f, TL.gap0, TL.gap1));
+  const rows = LIST_B.map((n, i) => {
+    if (n.isNew) {
+      const up = f < TL.gap1 - 6 ? 0 : 1 + XFL.filter((h, k) => h && f >= TL.fl0 + (k + 0.5) * TL.flt).length;
+      return { n, col: XI + 1, lanes: up, grow: n => 1, isNew: true };
+    }
+    return { n, col: (i < XI ? i + 1 : i + gap), isNew: false };
+  });
+  return { rows, nilCol: N0 + 1 + gap, gap };
+}
+function list(g, G, f, S) {
+  const TL = G.TL, [a] = env(f, TL.b0 - 16, TL.end + 10, 14, 12);
+  if (a <= 0) return;
+  const st = listState(TL, f), top = f >= TL.fl0 ? TOPALL : TOP(LIST_A);
+  const laneK = l => E.outCubic(prog(f, TL.b0 + (l === 0 ? 0 : TL.bl0 + (l - 1) * TL.bl), TL.b0 + (l === 0 ? TL.bl0 : TL.bl0 + l * TL.bl)));
+  const spK = l => E.inOutCubic(prog(f, TL.sp0 + l * TL.spt, TL.sp0 + (l + 1) * TL.spt));
+  // lane labels and the nil wall
+  for (let l = 0; l < top; l++) {
+    const k = laneK(l); if (k <= 0) continue;
+    const [x, y] = pos(G, -0.95, l);
+    text(g, 'L' + l, x, y + 1, { size: 28, weight: 800, color: C.lane[l], align: 'center', base: 'middle', fam: MONO, alpha: a * k * 0.9 });
+  }
+  { const [x0, y0] = pos(G, st.nilCol, 0), [x1, y1] = pos(G, st.nilCol, top - 1), k = laneK(0);
+    g.save(); g.globalAlpha = a * k; g.strokeStyle = 'rgba(241,238,230,0.5)'; g.lineWidth = 5; g.lineCap = 'round';
+    g.beginPath(); if (G.T) { g.moveTo(x0 - G.bw / 2, y0); g.lineTo(x1 + G.bw / 2, y1); } else { g.moveTo(x0, y0 + G.bh / 2); g.lineTo(x1, y1 - G.bh / 2); } g.stroke(); g.restore();
+    const [lx, ly] = G.T ? [x0 - G.bw / 2 - 12, y0] : [x0, y0 + G.bh / 2 + 36];
+    text(g, 'nil', lx, ly, { size: 28, weight: 700, color: C.dim, align: G.T ? 'right' : 'center', base: 'middle', fam: MONO, alpha: a * k }); }
+  // arrows, lane by lane
+  for (let l = 0; l < top; l++) {
+    const k0 = laneK(l); if (k0 <= 0 && l < TOP(LIST_A)) continue;
+    const sk = l < XH ? spK(l) : 0;
+    const cols = [0];                                       // columns with a node on lane l (old list), then nil
+    const colsB = [0];
+    for (const r of st.rows) {
+      if (!r.isNew && r.n.h > l) { cols.push(r.col); colsB.push(r.col); }
+      if (r.isNew && l < XH) colsB.push(r.col);
+    }
+    cols.push(st.nilCol); colsB.push(st.nilCol);
+    const lc = C.lane[l], lw = l === 0 ? 2.5 : 3;
+    const drawSeq = (cs, alpha, onlyNew) => {
+      for (let j = 0; j + 1 < cs.length; j++) {
+        const nw = cs[j] === XI + 1 || cs[j + 1] === XI + 1;
+        if (onlyNew !== null && nw !== onlyNew) continue;
+        arrow(g, G, pos(G, cs[j], l), pos(G, cs[j + 1], l), onlyNew ? sk : k0, lc, lw, a * alpha);
+      }
+    };
+    if (sk <= 0) drawSeq(cols, 0.75, null);
+    else if (sk >= 1) drawSeq(colsB, 0.75, null);
+    else {
+      // splicing lane l: the old pointer fades out while the two new ones grow
+      const b = cols.findIndex(c => c > XI + 1);
+      for (let j = 0; j + 1 < cols.length; j++) arrow(g, G, pos(G, cols[j], l), pos(G, cols[j + 1], l), k0, lc, lw, a * 0.75 * (j + 1 === b ? 1 - sk : 1));
+      drawSeq(colsB, 1, true);
+    }
+  }
+  // the head tower
+  for (let l = 0; l < top; l++) {
+    const k = laneK(l); if (k <= 0) continue;
+    const [x, y] = pos(G, 0, l);
+    box(g, G, x, y, { col: C.lane[l], alpha: a * k, fill: 'rgba(241,238,230,0.1)' });
+  }
+  { const [x, y] = pos(G, 0, 0), lk = laneK(0);
+    if (G.T) text(g, 'head', x - G.bw / 2 - 12, y, { size: 28, weight: 700, color: C.dim, align: 'right', base: 'middle', fam: MONO, alpha: a * lk });
+    else text(g, 'head', x, y + G.bh / 2 + 36, { size: 28, weight: 700, color: C.dim, align: 'center', base: 'middle', fam: MONO, alpha: a * lk }); }
+  // node towers
+  const walkHit = S ? walkMarks(TL, f, S) : null;
+  st.rows.forEach((r, i) => {
+    const n = r.n;
+    for (let l = 0; l < (r.isNew ? r.lanes : n.h); l++) {
+      let k = r.isNew ? 1 : laneK(l); if (k <= 0) continue;
+      if (!r.isNew && l === 0) k = E.outCubic(prog(f, TL.b0 + i * TL.bl0 * 0.03, TL.b0 + i * TL.bl0 * 0.03 + TL.bl0 * 0.5));
+      if (r.isNew) { const t0 = l === 0 ? TL.gap1 - 6 : TL.fl0 + (XFL.findIndex((h, q) => h && XFL.slice(0, q + 1).filter(Boolean).length === l) + 0.5) * TL.flt; k = E.outBack(prog(f, t0, t0 + 10)); }
+      const [x, y0] = pos(G, r.col, l), [, yb] = pos(G, r.col, Math.max(0, l - 1)), [xb] = pos(G, r.col, Math.max(0, l - 1));
+      const x1 = G.T ? lerp(xb, x, clamp(k)) : x, y1 = G.T ? y0 : lerp(yb, y0, clamp(k));
+      const hit = walkHit && walkHit.get(`${r.col}|${l}`);
+      box(g, G, x1, y1, { key: n.key, col: r.isNew ? C.accent : C.lane[l], alpha: a * clamp(k * 1.5), ring: hit || null, fill: r.isNew ? 'rgba(255,200,87,0.16)' : C.node });
+    }
+  });
+}
+/** Boxes being compared by the walk at frame f: column|lane -> ring colour. */
+function walkMarks(TL, f, S) {
+  const m = new Map(), s = S.s, ev = s.S.ev, j = Math.floor((f - s.t0) / s.tick);
+  if (j >= 0 && j < ev.length) {
+    const e = ev[j], col = e.t === 'right' ? e.to : e.next, ok = e.t === 'right';
+    if (e.key !== null) m.set(`${col}|${e.l}`, ok ? C.go : C.lin);
+  }
+  // the linear scan: the bottom-lane box it is comparing
+  if (s.race) { const q = Math.floor((f - s.t0) / s.tick); if (q >= 0 && q < s.S.lin) m.set(`${q + 1}|0`, C.lin); }
+  return m;
+}
+/** The walk's trail and cursor, and the race along the bottom lane. */
+function walker(g, G, f, S) {
+  if (!S) return;
+  const s = S.s, ev = s.S.ev, fa = Math.min(E.outCubic(prog(f, s.a, s.a + 10)), 1 - E.inCubic(prog(f, s.z - 12, s.z)));
+  if (fa <= 0) return;
+  const top = s.S === S2 ? TOP(LIST_B) : TOP(LIST_A);
+  const pts = [pos(G, 0, top - 1)];                          // a walk's columns are those of the list it walks
+  for (const e of ev) pts.push(e.t === 'right' ? pos(G, e.to, e.l) : e.t === 'down' ? pos(G, e.c, e.l - 1) : pos(G, e.c, 0));
+  const u = (f - s.t0) / s.tick, j = Math.floor(u), p = E.inOutCubic(clamp(u - j));
+  // trail up to the cursor
+  g.save(); g.globalAlpha = fa; g.strokeStyle = C.accent; g.lineWidth = 6; g.lineCap = 'round'; g.lineJoin = 'round';
+  const off = G.T ? [G.bw / 2 + 9, G.u / 2] : [G.u / 2, -G.bh / 2 - 9];   // the trail runs beside the boxes, in the gaps
+  g.beginPath(); g.moveTo(pts[0][0] + off[0], pts[0][1] + off[1]);
+  let cx = pts[0][0], cy = pts[0][1];
+  for (let q = 0; q < ev.length && q <= j; q++) {
+    const t = q < j ? 1 : (ev[q].t === 'stop' ? 0 : p), A0 = pts[q], B0 = pts[q + 1];
+    cx = lerp(A0[0], B0[0], t); cy = lerp(A0[1], B0[1], t);
+    g.lineTo(cx + off[0], cy + off[1]);
+  }
+  g.stroke();
+  // drop marks: where the walk left each lane (the insert splices after these)
+  if (S.k === 'si') for (const e of ev) { if (e.t === 'right') continue; const q = ev.indexOf(e); if (q > j) break; const [x, y] = pos(G, e.c, e.l);
+    g.fillStyle = C.accent; g.beginPath(); g.arc(x + off[0] * 0.55, y + off[1] * 0.55, 7, 0, Math.PI * 2); g.fill(); }
+  // cursor
+  g.strokeStyle = C.accent; g.lineWidth = 4; g.beginPath(); g.roundRect(cx - G.bw / 2 - 7, cy - G.bh / 2 - 7, G.bw + 14, G.bh + 14, 12); g.stroke();
+  g.restore();
+  // the comparison in progress
+  if (j >= 0 && j < ev.length) {
+    const e = ev[j], lab = e.key === null ? 'nil: drop' : e.t === 'right' ? `${e.key} < ${s.S.target}: right` : e.t === 'down' ? `${e.key} ≥ ${s.S.target}: drop` : e.found ? `${e.key} = ${s.S.target}: found` : `${e.key} > ${s.S.target}: absent`;
+    const col = e.t === 'right' ? C.go : e.t === 'stop' ? (e.found ? C.accent : C.lin) : C.lin;
+    const al = fa * Math.min(E.outCubic(prog(u - j, 0, 0.25)), e.t === 'stop' ? 1 : 1 - E.inCubic(prog(u - j, 0.85, 1)));
+    const [px, py] = pos(G, e.t === 'right' ? e.from : e.c, e.l), w = measure(g, lab, G.pill, 800, MONO) + 28, h = G.pill + 18;
+    let x = G.pillX, y = G.T ? py - h / 2 : G.pillY;
+    x = clamp(x, G.clip[0], G.clip[2] - w); y = clamp(y, G.clip[1], G.clip[3] - h);
+    g.save(); g.globalAlpha = al; g.fillStyle = C.bg; g.beginPath(); g.roundRect(x, y, w, h, h / 2); g.fill(); g.strokeStyle = col; g.lineWidth = 2.5; g.stroke(); g.restore();
+    text(g, lab, x + 14, y + h / 2 + 1, { size: G.pill, weight: 800, color: col, base: 'middle', fam: MONO, alpha: al });
+  }
+  // the race: a scan of the bottom lane, one comparison per tick
+  if (s.race) {
+    const q = clamp(u, 0, s.S.lin), qi = Math.min(s.S.lin - 1, Math.floor(q)), [x0, y0] = pos(G, 1, 0), [x1, y1] = pos(G, 1 + Math.min(q, s.S.lin - 1), 0);
+    const offL = G.T ? [-G.bw / 2 - 16, 0] : [0, G.bh / 2 + 16];
+    g.save(); g.globalAlpha = fa; g.strokeStyle = C.lin; g.lineWidth = 5; g.lineCap = 'round';
+    g.beginPath(); g.moveTo(x0 + offL[0], y0 + offL[1]); g.lineTo(x1 + offL[0], y1 + offL[1]); g.stroke();
+    g.fillStyle = C.lin; g.beginPath(); g.arc(x1 + offL[0], y1 + offL[1], 8, 0, Math.PI * 2); g.fill(); g.restore();
+  }
+}
+/** Coin flips of the new key, one pill per flip. */
+function coins(g, G, f) {
+  const TL = G.TL, fa = Math.min(E.outCubic(prog(f, TL.fl0 - 6, TL.fl0 + 6)), 1 - E.inCubic(prog(f, TL.si.z - 12, TL.si.z)));
+  if (fa <= 0) return;
+  const [x] = pos(G, XI + 1, 0), w = measure(g, 'heads', G.pill, 800, MONO) + 26, hh = G.pill + 16, gap = 12;
+  XFL.forEach((h, k) => {
+    const t0 = TL.fl0 + k * TL.flt, kk = E.outBack(prog(f, t0, t0 + 10)); if (kk <= 0) return;
+    const lab = h ? 'heads' : 'tails';
+    const px = G.T ? G.coinX : x - (XFL.length * (w + gap) - gap) / 2 + k * (w + gap), py = G.T ? G.coinY + k * (hh + gap) : G.coinY;
+    g.save(); g.globalAlpha = fa * clamp(kk); g.fillStyle = C.bg; g.beginPath(); g.roundRect(px, py, w, hh, hh / 2); g.fill();
+    g.strokeStyle = h ? C.accent : C.lin; g.lineWidth = 2.5; g.stroke(); g.restore();
+    text(g, lab, px + w / 2, py + hh / 2 + 1, { size: G.pill, weight: 800, color: h ? C.accent : C.lin, align: 'center', base: 'middle', fam: MONO, alpha: fa * clamp(kk) });
+  });
+}
+function counters(g, G, f, S) {
+  if (!S || !S.s.race) return;
+  const s = S.s, fa = Math.min(E.outCubic(prog(f, s.a, s.a + 10)), 1 - E.inCubic(prog(f, s.z - 12, s.z)));
+  const u = (f - s.t0) / s.tick, j = Math.floor(u);
+  const sk = j < 0 ? 0 : s.S.ev[Math.min(j, s.S.ev.length - 1)].cmp, ln = clamp(j + 1, 0, s.S.lin);
+  [['skip list', sk, C.accent], ['bottom lane', ln, C.lin]].forEach(([l, v, col], q) => {
+    const y = G.ky + q * G.kl;
+    text(g, l, G.kx - G.kw, y, { size: G.ks, weight: 700, color: C.dim, alpha: fa });
+    text(g, String(v), G.kx, y, { size: G.ks, weight: 850, color: col, align: 'right', fam: MONO, alpha: fa });
+  });
+}
+function caption(g, G, f) {
+  for (const [t0, t1, str] of G.TL.caps) {
+    const [a, dy] = env(f, t0, t1, 10, 8); if (a <= 0) continue;
+    const [p1, p2] = str.split('|');
+    if (G.capTwo) {
+      text(g, p1, G.capX, G.capY + dy, { size: G.cap, weight: 850, color: C.paper, spacing: -1, alpha: a, max: G.capMax });
+      text(g, p2, G.capX, G.capY + G.cap * 1.14 + dy, { size: G.cap, weight: 850, color: C.accent, spacing: -1, alpha: a, max: G.capMax });
+    } else {
+      const w1 = measure(g, p1 + ' ', G.cap, 850, FONT, -1), w2 = measure(g, p2, G.cap, 850, FONT, -1), sc = Math.min(1, G.capMax / (w1 + w2));
+      const w = text(g, p1 + ' ', G.capX, G.capY + dy, { size: G.cap * sc, weight: 850, color: C.paper, spacing: -1, alpha: a });
+      text(g, p2, G.capX + w, G.capY + dy, { size: G.cap * sc, weight: 850, color: C.accent, spacing: -1, alpha: a });
+    }
+  }
+}
+function readout(g, G, f, S) {
+  const TL = G.TL, [a] = env(f, TL.b0 - 10, TL.calm, 12, 10);
+  if (a <= 0) return;
+  let l1, l2;
+  if (!S && f < TL.s1.a) {
+    const l = clamp(Math.floor((f - TL.b0 - TL.bl0) / TL.bl) + 1, 0, TOP(LIST_A) - 1);
+    l1 = `lane L${l}: ${LANES_A[l]} of ${N0} keys`; l2 = `${N0} keys  ·  ${LANES_A.length} lanes`;
+  } else {
+    const s = S ? S.s : TL.s2, u = (f - s.t0) / s.tick, j = clamp(Math.floor(u), 0, s.S.ev.length - 1), e = s.S.ev[j];
+    const what = s.S === SI ? 'insert' : 'find';
+    l1 = `${what} ${s.S.target}  ·  lane L${e.t === 'down' && u - j > 0.5 ? e.l - 1 : e.l}`;
+    l2 = `${f >= TL.gap1 ? N0 + 1 : N0} keys  ·  ${(f >= TL.sp1 ? LANES_B : LANES_A).length} lanes`;
+  }
+  text(g, l1, G.foX, G.foY, { size: G.fo, weight: 700, color: C.paper, fam: MONO, alpha: a, align: G.foAlign });
+  text(g, l2, G.foX2, G.foY2, { size: G.fo, weight: 700, color: C.dim, fam: MONO, alpha: a, align: G.foAlign2 });
+}
+function finale(g, G, f) {
+  const TL = G.TL, k1 = E.outCubic(prog(f, TL.calm, TL.calm + 18)), k2 = E.outCubic(prog(f, TL.calm + 10, TL.calm + 28));
+  if (k1 <= 0) return;
+  const out = 1 - E.inCubic(prog(f, TL.end - 6, TL.end + 12));
+  g.save(); g.fillStyle = `rgba(${C.bgRGB},${0.86 * k1 * out})`; g.fillRect(0, G.fnY - G.fn * 1.2, G.w, G.fn * 2.9); g.restore();
+  text(g, `${SUMC} comparisons, not ${SUML}.`, G.fnX, G.fnY, { size: G.fn, weight: 900, color: C.paper, spacing: -2, align: G.fnAlign, alpha: k1 * out, max: G.fnMax });
+  text(g, `3 walks  ·  ${S1.cmp} + ${SI.cmp} + ${S2.cmp} against ${S1.lin} + ${SI.lin} + ${S2.lin} on the bottom lane`, G.fnX, G.fnY + G.fn * 1.05, { size: G.fn * 0.5, weight: 850, color: C.accent, spacing: -1, align: G.fnAlign, alpha: k2 * out, max: G.fnMax });
+}
+function scene(g, G, f) {
+  const S = searchAt(G.TL, f);
+  list(g, G, f, S); walker(g, G, f, S); coins(g, G, f); counters(g, G, f, S);
+  caption(g, G, f); readout(g, G, f, S); finale(g, G, f);
+  return S;
+}
+
+// ---- landscape picture ------------------------------------------------------------------
+const TLL = buildTL({ b0: 52, bl0: 24, bl: 18, gapA: 12, lead: 12, hold: 18, tick1: 7.5, tickI: 6, tick2: 6, gapT: 16, flt: 14, spt: 11, calmT: 70 });
+const FRAMES = TLL.end + 72;
+const GL = { TL: TLL, w: W, h: H, T: false, x0: 196, u: 1580 / (N0 + 2), y0: 800, lg: 78, bw: 54, bh: 46, key: 28, pill: 28, clip: [110, 260, 1810, 960], pillX: 120, pillY: 262,
+  coinX: 0, coinY: 856,
+  kx: 1800, kw: 330, ky: 290, kl: 44, ks: 32,
+  capX: 120, capY: 216, cap: 50, capTwo: false, capMax: 1680,
+  fo: 30, foX: 120, foY: 1004, foAlign: 'left', foX2: 1800, foY2: 1004, foAlign2: 'right',
+  fn: 100, fnX: W / 2, fnY: 560, fnAlign: 'center', fnMax: 1680 };
+function hookL(f) {
+  const o = 1 - E.inCubic(prog(f, TLL.b0 - 14, TLL.b0 + 4));
+  if (o <= 0) return;
+  const k = E.outExpo(prog(f, -8, 10)), k2 = E.outBack(prog(f, -6, 12));
+  ctx.save(); ctx.fillStyle = `rgba(${C.bgRGB},${0.8 * o})`; ctx.fillRect(0, 400, W, 330); ctx.restore();
+  text(ctx, 'A linked list with express lanes.', W / 2, 540 + (1 - k) * 30, { size: 108, weight: 900, color: C.paper, spacing: -3, align: 'center', alpha: o * Math.max(0.3, k), max: 1700 });
+  text(ctx, 'Built by flipping coins.', W / 2, 670 + (1 - clamp(k2)) * 30, { size: 108, weight: 900, color: C.accent, spacing: -3, align: 'center', alpha: o * Math.max(0.3, clamp(k2)) });
+}
+function draw(f) {
+  if (ctx.reset) ctx.reset();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; ctx.filter = 'none'; ctx.shadowBlur = 0;
+  ctx.fillStyle = C.bg; ctx.fillRect(0, 0, W, H);
+  const T = TLL, endK = E.inOutCubic(prog(f, T.end, T.end + 20)), a = 1 - endK;
+  scene(ctx, GL, f);
+  text(ctx, 'DATA STRUCTURES  ·  SKIP LIST', 120, 104, { size: 26, weight: 600, color: C.dim, spacing: 5, alpha: a });
+  text(ctx, 'BYTEPATTERNS', 1800, 104, { size: 26, weight: 600, color: C.dim, spacing: 5, align: 'right', alpha: a });
+  hookL(f);
+  if (endK > 0) {
+    ctx.fillStyle = `rgba(${C.bgRGB},${0.86 * endK})`; ctx.fillRect(0, 0, W, H);
+    const k1 = E.outCubic(prog(f, T.end + 6, T.end + 28)), k2 = E.outCubic(prog(f, T.end + 16, T.end + 38)), k3 = E.outCubic(prog(f, T.end + 26, T.end + 48));
+    text(ctx, 'Skip List: Express Lanes', W / 2, 500 + (1 - k1) * 30, { size: 132, weight: 850, color: C.paper, spacing: -3, align: 'center', alpha: k1, max: 1680 });
+    text(ctx, `${N0 + 1} keys  ·  ${LANES_B.length} lanes  ·  3 walks  ·  ${SUMC} comparisons instead of ${SUML}`, W / 2, 580 + (1 - k2) * 20, { size: 42, weight: 500, color: C.accent, align: 'center', alpha: k2, max: 1680 });
+    text(ctx, 'drawn in code  ·  bytepatterns.com', W / 2, 1000, { size: 32, weight: 600, color: C.paper, spacing: 3, align: 'center', alpha: k3 * 0.8 });
+  }
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.letterSpacing = '0px';
+}
+
+// ---- sound: a pluck per box, a step per walk move, a dull click per bottom-lane comparison, coins, splices ----
+async function renderAudio(TL = TLL, frames = FRAMES) {
+  const SR = 48000, dur = frames / FPS, LEN = Math.round(SR * dur);
+  const ac = new OfflineAudioContext(2, LEN, SR);
+  const at = fr => fr / FPS;
+  const comp = ac.createDynamicsCompressor();
+  comp.threshold.value = -16; comp.ratio.value = 3; comp.attack.value = 0.005; comp.release.value = 0.25;
+  const master = ac.createGain(); master.gain.value = 0.9; master.connect(comp).connect(ac.destination);
+  master.gain.setValueAtTime(0.9, dur - 1.0); master.gain.linearRampToValueAtTime(0.0001, dur - 0.02);
+  const rnd = mulberry32(0x56C01);
+  const ir = ac.createBuffer(2, SR * 2, SR);
+  for (let c = 0; c < 2; c++) { const d = ir.getChannelData(c); for (let k = 0; k < d.length; k++) d[k] = (rnd() * 2 - 1) * Math.pow(1 - k / d.length, 3); }
+  const verb = ac.createConvolver(); verb.buffer = ir; const vg = ac.createGain(); vg.gain.value = 0.3; verb.connect(vg).connect(master);
+  const hz = m => 440 * Math.pow(2, (m - 69) / 12);
+  const pluck = (t0, m, amp, pan, dec = 0.35, type = 'triangle') => {
+    const o = ac.createOscillator(), g = ac.createGain(), p = ac.createStereoPanner(); o.type = type; o.frequency.value = hz(m);
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(amp, t0 + 0.004); g.gain.exponentialRampToValueAtTime(0.0001, t0 + dec);
+    p.pan.value = pan; o.connect(g).connect(p); p.connect(master); p.connect(verb); o.start(t0); o.stop(t0 + dec + 0.05);
+  };
+  const pad = (t0, t1, notes, amp, cutoff) => {
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = cutoff; lp.Q.value = 1; lp.connect(master); lp.connect(verb);
+    notes.forEach((m, i) => { for (const det of [-6, 6]) {
+      const o = ac.createOscillator(), g = ac.createGain(), p = ac.createStereoPanner(); o.type = 'sawtooth'; o.frequency.value = hz(m); o.detune.value = det;
+      p.pan.value = (i / Math.max(1, notes.length - 1) - 0.5) * 0.8 * Math.sign(det);
+      g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(amp, t0 + 0.8); g.gain.setValueAtTime(amp, Math.max(t0 + 0.8, t1 - 0.6)); g.gain.exponentialRampToValueAtTime(0.0001, t1 + 0.4);
+      o.connect(g).connect(p).connect(lp); o.start(t0); o.stop(t1 + 0.45); } });
+  };
+  const PENTA = [0, 2, 4, 7, 9, 12, 14, 16, 19, 21, 24, 26, 28];
+  const panC = c => (c / (N0 + 2) - 0.5) * 1.2;
+  pad(0, at(TL.s1.a + 4), [45, 52, 57, 59], 0.012, 850);
+  pad(at(TL.s1.a), at(TL.s2.a + 4), [43, 50, 55, 59, 62], 0.012, 1100);
+  pad(at(TL.s2.a), at(TL.end + 50), [48, 55, 60, 64, 67], 0.014, 1400);
+  // the lanes: a pluck per box, higher on higher lanes
+  LIST_A.forEach((n, i) => { pluck(at(TL.b0 + i * TL.bl0 * 0.03 + 2), 60 + PENTA[i % 5], 0.02, panC(i + 1), 0.12, 'sine');
+    for (let l = 1; l < n.h; l++) pluck(at(TL.b0 + TL.bl0 + (l - 1) * TL.bl + 4) + i * 0.012, 62 + PENTA[l + 3], 0.03, panC(i + 1), 0.3); });
+  // the walks
+  for (const s of [TL.s1, TL.si, TL.s2]) {
+    s.S.ev.forEach((e, j) => {
+      const t = at(s.t0 + j * s.tick + 1), c = e.t === 'right' ? e.to : e.c;
+      if (e.t === 'right') pluck(t, 76 + PENTA[e.l + 2], 0.05, panC(c), 0.22);
+      else if (e.t === 'down') { pluck(t, 64 + PENTA[e.l], 0.05, panC(c), 0.3, 'sine'); }
+      else if (e.found) [72, 76, 79, 84].forEach((m, q) => pluck(t + q * 0.06, m, 0.05, panC(c), 1.0, 'sine'));
+      else [69, 68].forEach((m, q) => pluck(t + q * 0.12, m, 0.06, panC(c), 0.6, 'triangle'));
+    });
+    if (s.race) for (let q = 0; q < s.S.lin; q++) pluck(at(s.t0 + q * s.tick + 2), 50, 0.03, panC(q + 1), 0.08, 'square');
+  }
+  // coins and splices
+  XFL.forEach((h, k) => { const t = at(TL.fl0 + k * TL.flt + 2); pluck(t, h ? 91 : 79, 0.04, 0.2, 0.25, 'sine'); pluck(t + 0.05, h ? 96 : 76, 0.03, 0.2, 0.3, 'sine'); });
+  for (let l = 0; l < XH; l++) pluck(at(TL.sp0 + l * TL.spt + 3), 67 + PENTA[l + 2], 0.05, 0, 0.4);
+  [69, 72, 76, 81].forEach((m, i) => pluck(at(TL.calm) + i * 0.09, m, 0.06, -0.3 + i * 0.2, 1.6, 'sine'));
+  [76, 81, 84, 88].forEach((m, i) => pluck(at(TL.end + 10 + i * 6), m, 0.05, -0.45 + i * 0.3, 1.8, 'sine'));
+  const buf = await ac.startRendering();
+  let peak = 0; for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let k = 0; k < d.length; k++) peak = Math.max(peak, Math.abs(d[k])); }
+  const norm = 0.85 / Math.max(peak, 1e-6);                          // every piece peaks at the same level
+  for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let k = 0; k < d.length; k++) d[k] *= norm; }
+  return buf;
+}
+
+/* ==========================================================================
+   VERTICAL CUT — shared block, identical in every piece.
+   1080x1920 for Reels, Shorts and TikTok (__motion.variants.vertical). The
+   piece's own scene code is re-used and recomposed for a phone: everything a
+   viewer must read stays inside the area no platform covers (x 60..900,
+   y 230..1400); outside it there is only dimmed texture.
+   ========================================================================== */
+const VW = 1080, VH = 1920, SAFE = { x: 60, y: 230, w: 840, h: 1170, r: 900, b: 1400 };
+const vcv = document.createElement('canvas'); vcv.width = VW; vcv.height = VH;
+const vx = vcv.getContext('2d', { willReadFrequently: true });   // CPU raster: identical pixels on every redraw
+const VL = 96, VR = 864;                                          // text column inside the safe area
+
+function vReset() {
+  vx.setTransform(1, 0, 0, 1, 0, 0); vx.globalAlpha = 1; vx.globalCompositeOperation = 'source-over';
+  vx.filter = 'none'; vx.shadowBlur = 0; vx.shadowColor = 'transparent'; vx.letterSpacing = '0px'; vx.setLineDash([]);
+  vx.textAlign = 'left'; vx.textBaseline = 'alphabetic'; vx.lineCap = 'butt'; vx.lineJoin = 'miter';
+}
+/** Canvas text on the vertical frame; `max` shrinks the size until the line fits. */
+function vText(str, x, y, { size = 40, weight = 700, color = '#FFFFFF', align = 'left', spacing = 0, alpha = 1, fam = FONT, max = 0 } = {}) {
+  if (alpha <= 0.002 || !str) return size;
+  vx.font = `${weight} ${size}px ${fam}`; vx.letterSpacing = spacing + 'px';
+  if (max) { const w = vx.measureText(str).width; if (w > max) { size = size * max / w; vx.font = `${weight} ${size}px ${fam}`; } }
+  vx.textAlign = align; vx.textBaseline = 'alphabetic';
+  const a0 = vx.globalAlpha; vx.globalAlpha = a0 * alpha; vx.fillStyle = color;
+  vx.fillText(str, x + (align === 'center' ? spacing / 2 : align === 'right' ? spacing : 0), y);   // tracking is added after the last glyph too
+  vx.globalAlpha = a0; vx.letterSpacing = '0px';
+  return size;
+}
+/** Word-wraps with the given font; returns the lines. */
+function vWrap(str, maxW, size, weight = 700, fam = FONT) {
+  vx.font = `${weight} ${size}px ${fam}`; vx.letterSpacing = '0px';
+  const words = str.split(' '), lines = []; let cur = '';
+  for (const w of words) { const t = cur ? cur + ' ' + w : w; if (vx.measureText(t).width > maxW && cur) { lines.push(cur); cur = w; } else cur = t; }
+  if (cur) lines.push(cur);
+  return lines;
+}
+/** Fade envelope with a small rise: [alpha, dy]. */
+function vEnv(v, a, b, fin = 8, fout = 8) {
+  const i = E.outCubic(prog(v, a, a + fin)), o = 1 - E.inCubic(prog(v, b - fout, b));
+  return [Math.min(i, o), (1 - i) * 22 - (1 - o) * 10];
+}
+/** Which segment of a cut list a vertical frame is in: segs = [{ at, src, len }] in frames. */
+function vSeg(segs, v) {
+  let k = 0; while (k < segs.length - 1 && v >= segs[k + 1].at) k++;
+  const s = segs[k];
+  return { k, s, local: v - s.at, src: s.src + (v - s.at) };
+}
+/** Dims everything outside the safe area to a quiet texture (brightness x 0.2), with a soft inner edge. */
+function vShade(rgb, a = 0.8, feather = 40) {
+  vx.save(); vx.setTransform(1, 0, 0, 1, 0, 0); vx.globalAlpha = 1; vx.globalCompositeOperation = 'source-over';
+  vx.fillStyle = `rgba(${rgb},${a})`;
+  vx.beginPath(); vx.rect(0, 0, VW, VH); vx.rect(SAFE.x, SAFE.y, SAFE.w, SAFE.h); vx.fill('evenodd');
+  const strip = (x0, y0, x1, y1, rx, ry, rw, rh) => {
+    const g = vx.createLinearGradient(x0, y0, x1, y1);
+    g.addColorStop(0, `rgba(${rgb},${a})`); g.addColorStop(1, `rgba(${rgb},0)`);
+    vx.fillStyle = g; vx.fillRect(rx, ry, rw, rh);
+  };
+  strip(SAFE.x, 0, SAFE.x + feather, 0, SAFE.x, SAFE.y, feather, SAFE.h);
+  strip(SAFE.r, 0, SAFE.r - feather, 0, SAFE.r - feather, SAFE.y, feather, SAFE.h);
+  strip(0, SAFE.y, 0, SAFE.y + feather, SAFE.x, SAFE.y, SAFE.w, feather);
+  strip(0, SAFE.b, 0, SAFE.b - feather, SAFE.x, SAFE.b - feather, SAFE.w, feather);
+  vx.restore();
+}
+/** Series tag at the top of the safe area, e.g. MADE IN CODE · 04. */
+function vTag(label, color, alpha = 1) {
+  vText('MADE IN CODE', VL, 292, { size: 28, weight: 800, color, spacing: 5, alpha });
+  vx.font = `800 28px ${FONT}`; vx.letterSpacing = '5px';
+  const w = vx.measureText('MADE IN CODE').width; vx.letterSpacing = '0px';
+  vText('·  ' + label, VL + w + 14, 292, { size: 28, weight: 600, color: 'rgba(255,255,255,0.72)', spacing: 3, alpha, max: VR - VL - w - 14 });
+}
+/** Big hook lines, left-aligned from y0; visible from frame 0, settles in a few frames. */
+function vHook(v, lines, y0, { size = 84, lh = 1.08, color = '#FFFFFF', accent = null, weight = 800, spacing = -1.5, alpha = 1 } = {}) {
+  const k = E.outExpo(prog(v, -6, 12));
+  lines.forEach((ln, i) => {
+    const kk = E.outExpo(prog(v, -12 + i * 2, 8 + i * 2));
+    vText(ln, VL, y0 + i * size * lh + (1 - kk) * 30, { size, weight, spacing, color: accent && i === lines.length - 1 ? accent : color, alpha: alpha * Math.max(0.25, kk), max: VR - VL });
+  });
+  return k;
+}
+/** Closing card, the last 60 frames: piece title, "drawn in code · bytepatterns.com". l = frames into the card. */
+function vEndCard(l, { title, line = '', ink = '#FFFFFF', dim = 'rgba(255,255,255,0.66)', accent = '#FFFFFF', scrim = '0,0,0', a = 0.84 }) {
+  const k = E.outCubic(prog(l, 0, 12));
+  vx.save(); vx.setTransform(1, 0, 0, 1, 0, 0);
+  vx.fillStyle = `rgba(${scrim},${a * k})`; vx.fillRect(0, 0, VW, VH);
+  vx.restore();
+  const t1 = E.outExpo(prog(l, 3, 19)), t2 = E.outExpo(prog(l, 11, 27)), t3 = E.outExpo(prog(l, 19, 35));
+  vx.fillStyle = accent; vx.globalAlpha = t1; vx.fillRect(VL, 742, 88 * t1, 7); vx.globalAlpha = 1;
+  const size = vText(title, VL, 850 + (1 - t1) * 40, { size: 92, weight: 800, color: ink, spacing: -2, alpha: t1, max: VR - VL });
+  const y2 = 850 + Math.max(size, 60) * 0.25 + 70;
+  vx.font = `600 44px ${FONT}`;
+  const lead = 'drawn in code  ·  ', lw = vx.measureText(lead).width;
+  vText(lead, VL, y2 + (1 - t2) * 24, { size: 44, weight: 600, color: dim, alpha: t2 });
+  vText('bytepatterns.com', VL + lw, y2 + (1 - t2) * 24, { size: 44, weight: 800, color: accent, alpha: t2 });
+  if (line) vText(line, VL, y2 + 72 + (1 - t3) * 18, { size: 32, weight: 500, color: dim, alpha: t3, max: VR - VL });
+}
+/** Seeks a cut. The first frame a page draws is drawn twice: the very first read of a
+ *  GPU-backed source canvas can come out a shade different from every later one. */
+let vWarm = false;
+function vSeek(draw, i, frames) {
+  const f = Math.max(0, Math.min(frames - 1, Math.floor(i)));
+  if (!vWarm) { vWarm = true; draw(f); }
+  draw(f);
+}
+/** The soundtrack of a cut: the piece's own audio() spliced to the same segments as the picture. */
+async function vAudio(segs, frames, { xf = 0.025, fadeOut = 0.6, extra = null } = {}) {
+  const src = await renderAudio();
+  const SR = 48000, dur = frames / FPS, ac = new OfflineAudioContext(2, Math.round(SR * dur), SR);
+  const out = ac.createGain(); out.connect(ac.destination);
+  out.gain.setValueAtTime(1, 0); out.gain.setValueAtTime(1, dur - fadeOut); out.gain.linearRampToValueAtTime(0, dur - 0.01);
+  segs.forEach((s, k) => {
+    const at = s.at / FPS, off = s.src / FPS, d = s.len / FPS;
+    const pre = k === 0 ? 0 : Math.min(xf, off), post = k === segs.length - 1 ? 0 : xf;
+    const b = ac.createBufferSource(), g = ac.createGain(); b.buffer = src;
+    g.gain.setValueAtTime(pre ? 0 : 1, at - pre);
+    if (pre) g.gain.linearRampToValueAtTime(1, at + pre);
+    if (post) { g.gain.setValueAtTime(1, at + d - post); g.gain.linearRampToValueAtTime(0, at + d + post); }
+    b.connect(g).connect(out); b.start(at - pre, off - pre, d + pre + post);
+  });
+  if (extra) extra(ac, out);
+  const buf = await ac.startRendering();
+  let peak = 0; for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) peak = Math.max(peak, Math.abs(d[i])); }
+  if (peak > 0.9) for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) d[i] *= 0.9 / peak; }
+  return buf;
+}
+/** A soft three-partial bell, for the closing card. */
+function vChime(ac, dest, at, freq, vol = 0.08) {
+  for (const [mul, v, dec] of [[1, 1, 1.8], [2.01, 0.35, 0.8], [3.02, 0.12, 0.4]]) {
+    const o = ac.createOscillator(), g = ac.createGain(); o.type = 'sine'; o.frequency.value = freq * mul;
+    g.gain.setValueAtTime(0.0001, at); g.gain.exponentialRampToValueAtTime(vol * v, at + 0.006); g.gain.exponentialRampToValueAtTime(0.0001, at + dec);
+    o.connect(g).connect(dest); o.start(at); o.stop(at + dec + 0.05);
+  }
+}
+
+/* VERTICAL CUT — this piece */
+// The same list, flips and walks on a 1080 x 1920 stage and a faster clock, turned on its side:
+// keys run down the screen and the lanes stand side by side, so every key keeps a readable size.
+const TLV = buildTL({ b0: 38, bl0: 16, bl: 12, gapA: 8, lead: 8, hold: 16, tick1: 5.5, tickI: 4.5, tick2: 4.6, gapT: 12, flt: 11, spt: 8, calmT: 44 });
+const VFR = TLV.end + 60, VEND = VFR - 60;
+const GV = { TL: TLV, w: VW, h: VH, T: true, x0: 190, u: 33.5, y0: 540, lg: 96, bw: 62, bh: 30, key: 26, pill: 28, clip: [VL, 480, VR, 1300], pillX: 618, pillY: 0,
+  coinX: 690, coinY: 900,
+  kx: VR, kw: 330, ky: 1346, kl: 38, ks: 28,
+  capX: VL, capY: 390, cap: 46, capTwo: true, capMax: VR - VL,
+  fo: 28, foX: VL, foY: 1346, foAlign: 'left', foX2: VL, foY2: 1384, foAlign2: 'left',
+  fn: 72, fnX: VL, fnY: 800, fnAlign: 'left', fnMax: VR - VL };
+function hookV(v) {
+  const o = 1 - E.inCubic(prog(v, TLV.b0 - 10, TLV.b0 + 4));
+  if (o <= 0) return;
+  vx.save(); vx.fillStyle = `rgba(${C.bgRGB},${0.86 * o})`; vx.fillRect(SAFE.x, 400, SAFE.w, 560); vx.restore();
+  vHook(v, ['A linked list', 'with express', 'lanes, built', 'by coin flips.'], 510, { size: 100, accent: C.accent, color: C.paper, weight: 900, spacing: -2, alpha: o });
+}
+function vDraw(v) {
+  if (vx.reset) vx.reset();
+  vReset();
+  vx.fillStyle = C.bg; vx.fillRect(0, 0, VW, VH);
+  scene(vx, GV, v);
+  hookV(v);
+  vReset();
+  vShade(C.bgRGB, 0.86);
+  vTag('SKIP LIST', C.accent);
+  if (v >= VEND) vEndCard(v - VEND, { title: 'Skip List: Express Lanes', line: `${N0 + 1} keys  ·  ${LANES_B.length} lanes  ·  ${SUMC} comparisons, not ${SUML}`,
+    ink: C.paper, dim: 'rgba(241,238,230,0.72)', accent: C.accent, scrim: C.bgRGB, a: 0.88 });
+  vReset();
+}
+
+// The player asks for a frame on every display refresh; at 30 fps on a 60 Hz screen every other call
+// asks for the frame already on the canvas, which is then left as it is (same frame, same pixels).
+const shown = { L: -1, V: -1 };
+window.__motion = {
+  title: 'Skip List: Express Lanes',
+  description: `${N0} sorted keys flip coins into ${LANES_A.length} lanes of ${LANES_A.join(', ')} keys; finding ${T1} takes ${S1.cmp} comparisons against ${S1.lin} for a scan of the bottom lane, inserting ${XK} walks the same way, flips ${flipStr(XFL)} for a height of ${XH} and is spliced into ${XH === 1 ? 'one lane' : XH + ' lanes'}, and ${T2} is proved ${S2.found ? 'present' : 'absent'} in ${S2.cmp} comparisons against ${S2.lin}.`,
+  fps: FPS, width: W, height: H, frames: FRAMES,
+  poster: Math.round(TLL.s1.t0 + TLL.tick1 * (S1.ev.length - 2)),
+  gifStart: Math.floor(TLL.s1.a / FPS),
+  seek(i) { const f = Math.max(0, Math.min(FRAMES - 1, Math.floor(i))); if (f !== shown.L) { shown.L = f; draw(f); } },
+  audio: () => renderAudio(TLL, FRAMES),
+  variants: {
+    vertical: {
+      width: VW, height: VH, frames: VFR, canvas: vcv,
+      poster: Math.round(TLV.s1.t0 + TLV.tick1 * (S1.ev.length - 2)), gifStart: Math.floor(TLV.s1.a / FPS),
+      seek(i) { const v = Math.max(0, Math.min(VFR - 1, Math.floor(i))); if (v !== shown.V) { shown.V = v; vSeek(vDraw, v, VFR); } },
+      audio: () => renderAudio(TLV, VFR),
+    },
+  },
+};
+
+/* ==========================================================================
+   PLAYER — identical in every piece; keep as is.
+   Autoplays and loops, starts sound on the first click, ?frame=N pauses on a
+   frame, ?variant=vertical plays the vertical cut (if the piece has one).
+   When the renderer sets window.__MOTION_RENDER__ it stays out of the way.
+   ========================================================================== */
+(function player() {
+  const btn = document.getElementById('sound'), q = new URLSearchParams(location.search);
+  let M = window.__motion;
+  const V = !window.__MOTION_RENDER__ && M.variants && M.variants[q.get('variant')];
+  if (V) {                                                // show the variant's own canvas instead
+    M = Object.assign({}, M, V);
+    V.canvas.style.cssText = `width:min(100vw,calc(100vh*${V.width}/${V.height}));height:auto;aspect-ratio:${V.width}/${V.height}`;
+    document.querySelector('canvas').replaceWith(V.canvas);
+  }
+  const dur = M.frames / M.fps;
+  if (window.__MOTION_RENDER__) { btn.hidden = true; M.seek(0); return; }
+  if (q.has('frame')) { btn.hidden = true; M.seek(+q.get('frame') || 0); return; }
+  let t0 = performance.now(), ac = null, src = null, buf = null, paused = false, pausedAt = 0;
+  const clock = () => ac && src ? (ac.currentTime - t0) : (performance.now() - t0) / 1000;
+  function loop() {
+    if (!paused) M.seek(Math.floor(((clock() % dur) + dur) % dur * M.fps));
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+  btn.addEventListener('click', async () => {
+    if (src) { src.stop(); src = null; btn.textContent = 'Click for sound'; t0 = performance.now(); return; }
+    btn.textContent = 'Loading sound…';
+    ac = ac || new AudioContext({ sampleRate: 48000 });
+    buf = buf || await M.audio();
+    await ac.resume();
+    src = ac.createBufferSource(); src.buffer = buf; src.loop = true; src.connect(ac.destination);
+    t0 = ac.currentTime + 0.05; src.start(t0);        // picture restarts from frame 0 in sync with the sound
+    btn.textContent = 'Sound on — click to mute';
+  });
+  addEventListener('keydown', e => {
+    if (e.code !== 'Space') return;
+    e.preventDefault(); paused = !paused;
+    if (ac) paused ? ac.suspend() : ac.resume();
+    if (!ac) { if (paused) pausedAt = performance.now(); else t0 += performance.now() - pausedAt; }
+  });
+})();
+</script>
+</body>
+</html>

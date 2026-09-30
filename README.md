@@ -700,6 +700,71 @@ Click a preview to open the piece live in your browser (click once more there fo
 <br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/53-perlin-marble/?variant=vertical">open</a> · <a href="out/53-perlin-marble.vertical.png">still</a></sub>
 </td>
 </tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/54-kd-tree-nearest/"><img src="out/54-kd-tree-nearest.gif" width="100%" alt="k-d Tree: Nearest Neighbour — animated preview"></a>
+<br><b>54 · k-d Tree: Nearest Neighbour</b> <sub>27 s</sub>
+<br>63 points are split at the median, x then y, into a 6-level k-d tree, and 3 nearest-neighbour queries measure 9, 12, 8 distances instead of 63 each by skipping every side of a split line farther away than the best point so far, 160 of 189 points never looked at, with the same answers as brute force.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/54-kd-tree-nearest/">open in browser</a> · <a href="out/54-kd-tree-nearest.png">still</a> · <a href="projects/54-kd-tree-nearest/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/54-kd-tree-nearest/?variant=vertical"><img src="out/54-kd-tree-nearest.vertical.gif" width="100%" alt="k-d Tree: Nearest Neighbour — vertical cut, animated preview"></a>
+<br><sub>9:16 · 20 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/54-kd-tree-nearest/?variant=vertical">open</a> · <a href="out/54-kd-tree-nearest.vertical.png">still</a></sub>
+</td>
+</tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/55-sliding-window-max/"><img src="out/55-sliding-window-max.gif" width="100%" alt="Sliding Window Maximum — animated preview"></a>
+<br><b>55 · Sliding Window Maximum</b> <sub>27 s</sub>
+<br>A window of 6 slides across 28 numbers and a monotonic deque, never holding more than 4 of them, hands over all 23 window maxima from its front with 44 comparisons instead of the 115 that rescanning every window costs, each index pushed once and 24 popped (21 off the back by a bigger value, 3 off the front by the window), every maximum matching a rescan.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/55-sliding-window-max/">open in browser</a> · <a href="out/55-sliding-window-max.png">still</a> · <a href="projects/55-sliding-window-max/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/55-sliding-window-max/?variant=vertical"><img src="out/55-sliding-window-max.vertical.gif" width="100%" alt="Sliding Window Maximum — vertical cut, animated preview"></a>
+<br><sub>9:16 · 20 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/55-sliding-window-max/?variant=vertical">open</a> · <a href="out/55-sliding-window-max.vertical.png">still</a></sub>
+</td>
+</tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/56-skip-list/"><img src="out/56-skip-list.gif" width="100%" alt="Skip List: Express Lanes — animated preview"></a>
+<br><b>56 · Skip List: Express Lanes</b> <sub>26 s</sub>
+<br>20 sorted keys flip coins into 5 lanes of 20, 10, 5, 2, 1 keys; finding 73 takes 9 comparisons against 16 for a scan of the bottom lane, inserting 47 walks the same way, flips heads, heads, tails for a height of 3 and is spliced into 3 lanes, and 79 is proved absent in 6 comparisons against 19.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/56-skip-list/">open in browser</a> · <a href="out/56-skip-list.png">still</a> · <a href="projects/56-skip-list/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/56-skip-list/?variant=vertical"><img src="out/56-skip-list.vertical.gif" width="100%" alt="Skip List: Express Lanes — vertical cut, animated preview"></a>
+<br><sub>9:16 · 20 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/56-skip-list/?variant=vertical">open</a> · <a href="out/56-skip-list.vertical.png">still</a></sub>
+</td>
+</tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/57-golden-angle/"><img src="out/57-golden-angle.gif" width="100%" alt="The Golden Angle — animated preview"></a>
+<br><b>57 · The Golden Angle</b> <sub>27 s</sub>
+<br>Generative: 1000 seeds at angle n·θ and radius c·√n form 2, 3, 5 spokes with gaps up to 33.7 seeds wide at 1/2, 1/3, 2/5 of a turn, pack evenly (widest gap 0.5 seeds) at the golden angle of 137.508°, where nearest neighbours sit 34, 55, 89 seeds apart and trace 34, 55, 89 spirals, and open to a 4.8-seed gap at 138.5°.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/57-golden-angle/">open in browser</a> · <a href="out/57-golden-angle.png">still</a> · <a href="projects/57-golden-angle/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/57-golden-angle/?variant=vertical"><img src="out/57-golden-angle.vertical.gif" width="100%" alt="The Golden Angle — vertical cut, animated preview"></a>
+<br><sub>9:16 · 20 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/57-golden-angle/?variant=vertical">open</a> · <a href="out/57-golden-angle.vertical.png">still</a></sub>
+</td>
+</tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/58-de-casteljau/"><img src="out/58-de-casteljau.gif" width="100%" alt="Curves from Lerps — animated preview"></a>
+<br><b>58 · Curves from Lerps</b> <sub>27 s</sub>
+<br>Generative: de Casteljau's construction turns 4 control points into a cubic Bézier curve with 6 lerps a point, raises it through degrees 3, 4, 5, 7 (up to 28 lerps a point), then cuts the cubic at t = ½ 4 times into 16 pieces whose polygons close in from 28.6% to 0.24% of the curve's length, about 3.9× per cut.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/58-de-casteljau/">open in browser</a> · <a href="out/58-de-casteljau.png">still</a> · <a href="projects/58-de-casteljau/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/58-de-casteljau/?variant=vertical"><img src="out/58-de-casteljau.vertical.gif" width="100%" alt="Curves from Lerps — vertical cut, animated preview"></a>
+<br><sub>9:16 · 20 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/58-de-casteljau/?variant=vertical">open</a> · <a href="out/58-de-casteljau.vertical.png">still</a></sub>
+</td>
+</tr>
 </table>
 <!-- gallery:end -->
 
