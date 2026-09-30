@@ -895,6 +895,71 @@ Click a preview to open the piece live in your browser (click once more there fo
 <br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/68-two-phase-commit-saga/?variant=vertical">open</a> · <a href="out/68-two-phase-commit-saga.vertical.png">still</a></sub>
 </td>
 </tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/69-bellman-ford/"><img src="out/69-bellman-ford.gif" width="100%" alt="Bellman-Ford: One Negative Edge — animated preview"></a>
+<br><b>69 · Bellman-Ford: One Negative Edge</b> <sub>26 s</sub>
+<br>7 nodes and 10 one-way edges, one of them A → B at -5: Dijkstra settles B at 2 before that edge can lower it, so 5 of 7 distances come out too high and T reads 9; Bellman-Ford relaxes all 10 edges in the same order, round after round, changes something in 6 rounds (2, 3, 4, 3, 2, 1 relaxations) and nothing in round 7, which rules out a negative cycle, and finds T = 8 after 70 edge checks and 15 relaxations.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/69-bellman-ford/">open in browser</a> · <a href="out/69-bellman-ford.png">still</a> · <a href="projects/69-bellman-ford/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/69-bellman-ford/?variant=vertical"><img src="out/69-bellman-ford.vertical.gif" width="100%" alt="Bellman-Ford: One Negative Edge — vertical cut, animated preview"></a>
+<br><sub>9:16 · 19 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/69-bellman-ford/?variant=vertical">open</a> · <a href="out/69-bellman-ford.vertical.png">still</a></sub>
+</td>
+</tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/70-lz77-window/"><img src="out/70-lz77-window.gif" width="100%" alt="LZ77: Copy from the Window — animated preview"></a>
+<br><b>70 · LZ77: Copy from the Window</b> <sub>26 s</sub>
+<br>LZ77 reads “she sells sea shells on the sea shore, the shells she sells” (59 characters) with a 32-character window and turns every repeat of 3 or more into a pointer back into it: 19 letters at 9 bits and 10 copies at 10 bits, 29 tokens and 271 bits instead of 472, 57% of the size; the longest copy is 6 characters, and the final “she sells”, 50 characters after the first, is outside the window and comes back as 3 shorter copies.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/70-lz77-window/">open in browser</a> · <a href="out/70-lz77-window.png">still</a> · <a href="projects/70-lz77-window/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/70-lz77-window/?variant=vertical"><img src="out/70-lz77-window.vertical.gif" width="100%" alt="LZ77: Copy from the Window — vertical cut, animated preview"></a>
+<br><sub>9:16 · 19 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/70-lz77-window/?variant=vertical">open</a> · <a href="out/70-lz77-window.vertical.png">still</a></sub>
+</td>
+</tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/71-bin-packing/"><img src="out/71-bin-packing.gif" width="100%" alt="Bin Packing: First Fit vs Best Fit — animated preview"></a>
+<br><b>71 · Bin Packing: First Fit vs Best Fit</b> <sub>26 s</sub>
+<br>16 items (2 5 4 4 9 1 5 3 2 3 3 2 5 6 9 6), 69 units in all, arrive one at a time into bins that hold 10: first fit takes the leftmost bin with room and opens 9 bins, best fit takes the bin it leaves fullest and opens 8, wasting 21 and 11 units; sorted largest first, both need 7, the lower bound ⌈69 / 10⌉, with 6 bins filled to the brim.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/71-bin-packing/">open in browser</a> · <a href="out/71-bin-packing.png">still</a> · <a href="projects/71-bin-packing/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/71-bin-packing/?variant=vertical"><img src="out/71-bin-packing.vertical.gif" width="100%" alt="Bin Packing: First Fit vs Best Fit — vertical cut, animated preview"></a>
+<br><sub>9:16 · 20 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/71-bin-packing/?variant=vertical">open</a> · <a href="out/71-bin-packing.vertical.png">still</a></sub>
+</td>
+</tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/72-floyd-steinberg/"><img src="out/72-floyd-steinberg.gif" width="100%" alt="Floyd–Steinberg: Two Inks, Every Grey — animated preview"></a>
+<br><b>72 · Floyd–Steinberg: Two Inks, Every Grey</b> <sub>27 s</sub>
+<br>A 160 × 90 grey picture of a lit sphere, 40.0% grey on average, printed with two inks: rounding each pixel makes 26.1% of them white and flattens the shading into bands, while Floyd–Steinberg passes each rounding error on (7/16 right, 3/16, 5/16 and 1/16 below) and makes 39.9% white, so every 10 × 10 patch averages within 0.9% of its grey instead of 31.3%.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/72-floyd-steinberg/">open in browser</a> · <a href="out/72-floyd-steinberg.png">still</a> · <a href="projects/72-floyd-steinberg/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/72-floyd-steinberg/?variant=vertical"><img src="out/72-floyd-steinberg.vertical.gif" width="100%" alt="Floyd–Steinberg: Two Inks, Every Grey — vertical cut, animated preview"></a>
+<br><sub>9:16 · 19 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/72-floyd-steinberg/?variant=vertical">open</a> · <a href="out/72-floyd-steinberg.vertical.png">still</a></sub>
+</td>
+</tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/73-diffusion-limited-aggregation/"><img src="out/73-diffusion-limited-aggregation.gif" width="100%" alt="Diffusion-Limited Aggregation — animated preview"></a>
+<br><b>73 · Diffusion-Limited Aggregation</b> <sub>26 s</sub>
+<br>Generative: random walkers on a square lattice stick where they first touch a growing cluster; 6,000 of the 7,800 that set off stick and build a coral 134 cells in radius, whose tips catch the newcomers so that only 8 of the last 3,000 land in its inner third, and whose mass grows as its radius of gyration to the power 1.70, between a line and a filled disc.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/73-diffusion-limited-aggregation/">open in browser</a> · <a href="out/73-diffusion-limited-aggregation.png">still</a> · <a href="projects/73-diffusion-limited-aggregation/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/73-diffusion-limited-aggregation/?variant=vertical"><img src="out/73-diffusion-limited-aggregation.vertical.gif" width="100%" alt="Diffusion-Limited Aggregation — vertical cut, animated preview"></a>
+<br><sub>9:16 · 19 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/73-diffusion-limited-aggregation/?variant=vertical">open</a> · <a href="out/73-diffusion-limited-aggregation.vertical.png">still</a></sub>
+</td>
+</tr>
 </table>
 <!-- gallery:end -->
 

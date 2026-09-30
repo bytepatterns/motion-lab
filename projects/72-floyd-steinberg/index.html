@@ -1,0 +1,647 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="author" content="teambytepatterns">
+<meta name="description" content="A 160 by 90 grey picture of a lit sphere, 40.0 percent grey on average, printed with two inks: rounding each pixel to the nearer ink makes 26.1 percent of them white and flattens the shading into bands, while Floyd–Steinberg hands each rounding error on to the pixels not yet drawn, 7/16 to the right and 3/16, 5/16 and 1/16 on the row below, makes 39.9 percent white, and every 10 by 10 patch averages within 0.9 percent of its grey instead of 31.3.">
+<title>Floyd–Steinberg: Two Inks, Every Grey — motion-lab</title>
+<style>
+  /* Player chrome. The piece itself lives entirely in the canvas. */
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  body { display: grid; place-items: center; font: 500 15px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #fff; }
+  canvas { display: block; width: min(100vw, calc(100vh * 16 / 9)); height: auto; aspect-ratio: 16 / 9; }
+  #sound { position: fixed; left: 16px; bottom: 16px; padding: 8px 14px; border: 1px solid rgba(255,255,255,.35); border-radius: 999px;
+           background: rgba(0,0,0,.55); color: #fff; font: inherit; cursor: pointer; }
+  #sound[hidden] { display: none; }
+</style>
+</head>
+<body>
+<canvas id="stage" width="1920" height="1080" aria-label="A grey picture of a lit sphere on a sloping background, made of small square pixels; first every pixel is rounded to black or white and the sphere turns into flat bands; then a cursor sweeps the rows and leaves a fine pattern of dots behind it while a magnified inset shows each pixel's rounding error being split among its neighbours; finally the dotted picture is blurred and looks like the grey original again"></canvas>
+<button id="sound" type="button">Click for sound</button>
+<script>
+'use strict';
+/* ==========================================================================
+   PIECE — Floyd–Steinberg: Two Inks, Every Grey.
+   A grey image, values 0..1, has to be shown with two inks. Rounding every
+   pixel to the nearer ink (threshold 0.5) throws the difference away, so
+   smooth shading turns into flat bands. Floyd and Steinberg (1976) keep
+   it: scan the rows left to right, round the pixel, and add its error
+   e = value - ink to the pixels not yet visited:
+            .     *    7/16
+          3/16  5/16   1/16
+   The total brightness is conserved, so every patch of dots averages to
+   the grey it replaces. The picture is a function of the pixel position;
+   the rounding, the diffusion, and every running total are computed once
+   at load. A frame maps to a count of processed pixels, so seek(i) is
+   pure in i.
+   ========================================================================== */
+const W = 1920, H = 1080, FPS = 30;
+const cv = document.getElementById('stage');
+const ctx = cv.getContext('2d', { willReadFrequently: true });   // CPU raster: identical pixels on every redraw
+const FONT = 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
+const MONO = 'ui-monospace, "Cascadia Code", Consolas, Menlo, monospace';
+
+// ---- helpers -------------------------------------------------------------
+function mulberry32(a) { return function () { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a);
+  t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const lerp = (a, b, t) => a + (b - a) * t;
+const prog = (f, a, b) => clamp((f - a) / (b - a));
+const smooth = t => t * t * (3 - 2 * t);
+const E = {
+  inCubic: t => t * t * t,
+  outCubic: t => 1 - Math.pow(1 - t, 3),
+  inOutCubic: t => t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2,
+  outExpo: t => t === 1 ? 1 : 1 - Math.pow(2, -10 * t),
+  inExpo: t => t === 0 ? 0 : Math.pow(2, 10 * t - 10),
+  inOutExpo: t => t === 0 ? 0 : t === 1 ? 1 : t < .5 ? Math.pow(2, 20 * t - 10) / 2 : (2 - Math.pow(2, -20 * t + 10)) / 2,
+  outBack: t => 1 + 2.70158 * Math.pow(t - 1, 3) + 1.70158 * Math.pow(t - 1, 2),
+};
+/** Canvas text; `max` shrinks the size until the line fits. Returns the width drawn. */
+function text(g, str, x, y, { size = 40, weight = 600, color = '#fff', alpha = 1, spacing = 0, align = 'left', fam = FONT, base = 'alphabetic', max = 0 } = {}) {
+  if (alpha <= 0.002 || !str) return 0;
+  g.font = `${weight} ${size}px ${fam}`; g.letterSpacing = spacing + 'px';
+  if (max) { const w0 = g.measureText(str).width; if (w0 > max) { size *= max / w0; g.font = `${weight} ${size}px ${fam}`; } }
+  g.textAlign = align; g.textBaseline = base;
+  const a0 = g.globalAlpha; g.globalAlpha = a0 * alpha; g.fillStyle = color;
+  g.fillText(str, x, y);
+  const w = g.measureText(str).width;
+  g.globalAlpha = a0; g.letterSpacing = '0px';
+  return w;
+}
+const measure = (g, str, size, weight = 800, fam = FONT, spacing = 0) => { g.font = `${weight} ${size}px ${fam}`; g.letterSpacing = spacing + 'px'; const w = g.measureText(str).width; g.letterSpacing = '0px'; return w; };
+const env = (f, a, b, fin = 12, fout = 10) => {
+  const i = E.outCubic(prog(f, a, a + fin)), o = 1 - E.inCubic(prog(f, b - fout, b));
+  return [Math.min(i, o), (1 - i) * 24 - (1 - o) * 10];
+};
+
+
+// ---- palette -------------------------------------------------------------
+const C = {
+  bg: '#0B0D14', bgRGB: '11,13,20', paper: '#F1EEE6', paperRGB: '241,238,230', dim: 'rgba(241,238,230,0.62)', faint: 'rgba(241,238,230,0.16)',
+  accent: '#FFC857', accentRGB: '255,200,87', go: '#5CD6CB', goRGB: '92,214,203', no: '#FF5E6C', node: '#151A28',
+  blue: '#8FA8FF', blueRGB: '143,168,255',
+};
+const INK0 = [11, 13, 20], INK1 = [241, 238, 230];
+
+// ---- the picture, rounded and diffused ------------------------------------------------------------
+const KER = [[1, 0, 7], [-1, 1, 3], [0, 1, 5], [1, 1, 1]];      // dx, dy, sixteenths
+const BLK = 10;
+/** A lit sphere on a sloping background, w x h pixels, 2 x 2 samples each. P: sphere centre and radius in height units. */
+function makeImage(w, h, P) {
+  const asp = w / h, v = new Float32Array(w * h);
+  const L = [-0.55, -0.6, 0.58], ln = Math.hypot(...L); L[0] /= ln; L[1] /= ln; L[2] /= ln;
+  const Hh = [L[0], L[1], L[2] + 1], hn = Math.hypot(...Hh); Hh[0] /= hn; Hh[1] /= hn; Hh[2] /= hn;
+  const at = (X, Y) => {
+    let bg = 0.64 - 0.34 * (X / asp + 0.5) - 0.16 * (Y + 0.5);
+    const sx = (X - P.cx - 0.12) / (P.r * 1.1), sy = (Y - P.cy - P.r * 1.02) / (P.r * 0.24);
+    bg *= 1 - 0.6 * Math.exp(-(sx * sx + sy * sy) * 1.4);
+    const dx = (X - P.cx) / P.r, dy = (Y - P.cy) / P.r, d2 = dx * dx + dy * dy;
+    if (d2 >= 1) return bg;
+    const nz = Math.sqrt(1 - d2), lam = Math.max(0, dx * L[0] + dy * L[1] + nz * L[2]), sp = Math.pow(Math.max(0, dx * Hh[0] + dy * Hh[1] + nz * Hh[2]), 50);
+    return Math.min(1, 0.05 + 0.8 * lam + 0.4 * sp);
+  };
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    let s = 0;
+    for (const [ox, oy] of [[0.25, 0.25], [0.75, 0.25], [0.25, 0.75], [0.75, 0.75]]) s += at(((x + ox) / w - 0.5) * asp, (y + oy) / h - 0.5);
+    v[y * w + x] = Math.round(s / 4 * 1000) / 1000;
+  }
+  return v;
+}
+function makeGrid(w, h, P) {
+  const N = w * h, v = makeImage(w, h, P), th = new Uint8Array(N), fs = new Uint8Array(N), adj = new Float32Array(N), buf = Float64Array.from(v);
+  for (let p = 0; p < N; p++) th[p] = v[p] >= 0.5 ? 1 : 0;
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const p = y * w + x, a = buf[p], o = a >= 0.5 ? 1 : 0, e = a - o;
+    adj[p] = a; fs[p] = o;
+    for (const [dx, dy, k] of KER) { const X = x + dx, Y = y + dy; if (X >= 0 && X < w && Y < h) buf[Y * w + X] += e * k / 16; }
+  }
+  // running sums: grey and ink over the first n pixels, for the live readout
+  const cv = new Float64Array(N + 1), cf = new Uint32Array(N + 1);
+  for (let p = 0; p < N; p++) { cv[p + 1] = cv[p] + v[p]; cf[p + 1] = cf[p] + fs[p]; }
+  const mean = cv[N] / N, thW = th.reduce((s, x) => s + x, 0) / N, fsW = cf[N] / N;
+  // squint: the mean over every BLK x BLK block, against the grey
+  let et = 0, ef = 0, nb = 0;
+  for (let by = 0; by + BLK <= h; by += BLK) for (let bx = 0; bx + BLK <= w; bx += BLK) {
+    let sv = 0, st = 0, sf = 0;
+    for (let y = by; y < by + BLK; y++) for (let x = bx; x < bx + BLK; x++) { const p = y * w + x; sv += v[p]; st += th[p]; sf += fs[p]; }
+    const n = BLK * BLK; et += Math.abs(st - sv) / n; ef += Math.abs(sf - sv) / n; nb++;
+  }
+  const G = { w, h, N, v, th, fs, adj, cv, cf, mean, thW, fsW, errT: et / nb, errF: ef / nb, nb };
+  // bitmaps for the three states
+  const img = (fn) => { const d = new ImageData(w, h); for (let p = 0; p < N; p++) { const t = fn(p); d.data[p * 4] = lerp(INK0[0], INK1[0], t); d.data[p * 4 + 1] = lerp(INK0[1], INK1[1], t); d.data[p * 4 + 2] = lerp(INK0[2], INK1[2], t); d.data[p * 4 + 3] = 255; } return d; };
+  G.imgV = img(p => v[p]); G.imgT = img(p => th[p]); G.imgF = img(p => fs[p]);
+  G.work = new ImageData(w, h);
+  G.cvsT = document.createElement('canvas'); G.cvsT.width = w; G.cvsT.height = h; G.cvsT.getContext('2d', { willReadFrequently: true }).putImageData(G.imgT, 0, 0);
+  G.cvs = document.createElement('canvas'); G.cvs.width = w; G.cvs.height = h; G.cx = G.cvs.getContext('2d', { willReadFrequently: true });
+  G.small = document.createElement('canvas'); G.small.width = Math.round(w / 4); G.small.height = Math.round(h / 4); G.sx = G.small.getContext('2d', { willReadFrequently: true });
+  return G;
+}
+const IMG_L = makeGrid(160, 90, { cx: 0.28, cy: -0.02, r: 0.33 }), IMG_V = makeGrid(120, 100, { cx: 0.1, cy: 0.0, r: 0.31 });
+const pc = x => (x * 100).toFixed(1) + '%';
+const FIRST_FLIP = (function (g) { for (let p = 1; p < g.w; p++) if (g.fs[p] !== g.fs[p - 1]) return p; return 1; })(IMG_L);
+
+// ---- timeline -------------------------------------------------------------------------------
+function buildTL(o, g) {
+  const T = Object.assign({}, o);
+  T.th1 = T.th0 + T.wipe; T.slow1 = T.fs0 + T.slowN * T.slowT; T.fs1 = T.slow1 + T.fastT;
+  T.sq0 = T.fs1 + T.gapT; T.calm = T.sq0 + T.sqT; T.end = Math.round(T.calm + T.calmT);
+  T.caps = [
+    [T.g0, T.th0 - 2, `A grey picture, ${g.w} × ${g.h} pixels,|and only two inks to print it with.`],
+    [T.th0, T.fs0 - 2, `Round every pixel to the nearer ink:|the shading collapses into flat bands.`],
+    [T.fs0, T.slow1 + 20, 'Floyd–Steinberg rounds too, but keeps the error|and hands it on: 7/16 right, 3/16, 5/16, 1/16 below.'],
+    [T.slow1 + 20, T.fs1 - 2, 'Row by row the error is paid back by pixels|not yet drawn, so no brightness is lost.'],
+    [T.fs1, T.sq0 + 8, `${pc(g.fsW)} of the dots are white;|the picture is ${pc(g.mean)} grey.`],
+    [T.sq0 + 8, T.calm - 2, `Squint: each ${BLK} × ${BLK} patch is within ${pc(g.errF)} of its grey,|where plain rounding misses by ${pc(g.errT)}.`],
+  ];
+  return T;
+}
+/** Pixels processed by the sweep at frame f. */
+function doneAt(T, g, f) {
+  if (f < T.fs0) return 0;
+  if (f < T.slow1) return Math.min(T.slowN, Math.floor((f - T.fs0) / T.slowT) + 1);
+  const u = prog(f, T.slow1, T.fs1), k = u * u * (1.6 - 0.6 * u);   // speeds up, then settles
+  return Math.min(g.N, Math.round(T.slowN + (g.N - T.slowN) * k));
+}
+
+// ---- drawing ------------------------------------------------------------------------------
+function picture(g, G, f) {
+  const T = G.TL, gd = G.g, [a] = env(f, T.g0 - 10, T.end + 14, 16, 20);
+  if (a <= 0) return 0;
+  const n = doneAt(T, gd, f);
+  const wipe = E.inOutCubic(prog(f, T.th0, T.th1));
+  const d = gd.work.data, V = gd.imgV.data, TT = gd.imgT.data, F = gd.imgF.data;
+  const wipeRow = wipe * (gd.h + 6);
+  // before the sweep: grey, then rounded (a wipe down the rows); during it, dots behind the cursor and the rounding ahead of it
+  if (f < T.fs0) {
+    for (let y = 0; y < gd.h; y++) {
+      const src = y < wipeRow ? TT : V, o0 = y * gd.w * 4;
+      d.set(src.subarray(o0, o0 + gd.w * 4), o0);
+    }
+  } else {
+    d.set(F.subarray(0, n * 4), 0); d.set(V.subarray(n * 4), n * 4);
+  }
+  const back = f < T.fs0 - 12 ? 1 : E.inOutCubic(prog(f, T.fs0 - 12, T.fs0 + 6));   // the rounded bands melt back to grey as the sweep starts
+  gd.cx.putImageData(gd.work, 0, 0);
+  const W0 = gd.w * G.px, H0 = gd.h * G.px;
+  g.save(); g.globalAlpha = a; g.imageSmoothingEnabled = false;
+  if (back < 1) { g.drawImage(gd.cvsT, G.ix, G.iy, W0, H0); g.globalAlpha = a * back; }
+  g.drawImage(gd.cvs, G.ix, G.iy, W0, H0); g.globalAlpha = a;
+  // squint: a blurred copy of the dots fades in over them
+  const sq = E.inOutCubic(prog(f, T.sq0, T.sq0 + 26)) * (1 - E.inOutCubic(prog(f, T.calm - 6, T.calm + 20)));
+  if (sq > 0) {                                  // the squint comes after the sweep, so it always blurs the finished dots: made once, then reused
+    if (!G.blur) {
+      const fc = document.createElement('canvas'); fc.width = gd.w; fc.height = gd.h; fc.getContext('2d', { willReadFrequently: true }).putImageData(gd.imgF, 0, 0);
+      gd.sx.imageSmoothingEnabled = true; gd.sx.imageSmoothingQuality = 'high'; gd.sx.clearRect(0, 0, gd.small.width, gd.small.height); gd.sx.drawImage(fc, 0, 0, gd.small.width, gd.small.height);
+      G.blur = document.createElement('canvas'); G.blur.width = W0; G.blur.height = H0;
+      const bx = G.blur.getContext('2d', { willReadFrequently: true }); bx.imageSmoothingEnabled = true; bx.imageSmoothingQuality = 'high'; bx.drawImage(gd.small, 0, 0, W0, H0);
+    }
+    g.globalAlpha = a * sq; g.drawImage(G.blur, G.ix, G.iy);
+  }
+  g.restore();
+  g.save(); g.globalAlpha = a; g.strokeStyle = 'rgba(241,238,230,0.35)'; g.lineWidth = 2; g.strokeRect(G.ix - 1, G.iy - 1, W0 + 2, H0 + 2); g.restore();
+  // the cursor
+  if (f >= T.fs0 && n < gd.N) {
+    const x = n % gd.w, y = Math.floor(n / gd.w), ca = a * (1 - prog(f, T.fs1 - 6, T.fs1));
+    g.save(); g.globalAlpha = ca; g.fillStyle = `rgba(${C.accentRGB},0.25)`; g.fillRect(G.ix, G.iy + y * G.px, W0, G.px);
+    g.strokeStyle = C.accent; g.lineWidth = 3; g.strokeRect(G.ix + x * G.px - 3, G.iy + y * G.px - 3, G.px + 6, G.px + 6); g.restore();
+  }
+  // squint label
+  if (sq > 0) text(g, `blurred ${gd.w / gd.small.width}×`, G.ix + W0 - 16, G.iy + H0 - 18, { size: 28, weight: 800, color: C.accent, align: 'right', alpha: a * sq, fam: MONO });
+  return n;
+}
+/** The magnified neighbourhood of the pixel being rounded, with its error and the four shares. */
+function inset(g, G, f, n) {
+  const T = G.TL, gd = G.g, I = G.I, [a, dy] = env(f, T.fs0, T.slow1 + 24, 12, 12);
+  if (a <= 0) return;
+  const p = Math.min(T.slowN, Math.max(1, n)) - 1, x = p % gd.w, y = Math.floor(p / gd.w);
+  const adj = gd.adj[p], o = gd.fs[p], e = adj - o, cs = I.cs;
+  if (I.box) { g.save(); g.globalAlpha = a * 0.92; g.fillStyle = C.bg; g.beginPath(); g.roundRect(I.x - 24, I.y - 64, cs * 3 + 48, cs * 2 + 250, 16); g.fill(); g.strokeStyle = 'rgba(241,238,230,0.25)'; g.lineWidth = 2; g.stroke(); g.restore(); }
+  text(g, `PIXEL ${p + 1}  ·  ROW 1`, I.x, I.y - 20 + dy, { size: 28, weight: 800, color: C.dim, spacing: 3, alpha: a });
+  for (let r = 0; r < 2; r++) for (let c = -1; c <= 1; c++) {
+    const X = x + c, Y = y + r, cx = I.x + (c + 1) * cs, cy = I.y + r * cs + dy;
+    if (X < 0) { g.save(); g.globalAlpha = a * 0.3; g.strokeStyle = C.faint; g.setLineDash([6, 6]); g.strokeRect(cx + 4, cy + 4, cs - 8, cs - 8); g.restore(); continue; }
+    const q = Y * gd.w + X, isCur = r === 0 && c === 0, done = r === 0 && c < 0;
+    const val = done ? gd.fs[q] : isCur ? o : gd.v[q];
+    const t = isCur ? E.outCubic(prog(f, T.fs0 + p * T.slowT + 4, T.fs0 + p * T.slowT + 10)) : 1;
+    const shade = isCur ? lerp(adj, o, t) : val;
+    g.save(); g.globalAlpha = a; g.fillStyle = `rgb(${lerp(INK0[0], INK1[0], shade)},${lerp(INK0[1], INK1[1], shade)},${lerp(INK0[2], INK1[2], shade)})`;
+    g.fillRect(cx + 4, cy + 4, cs - 8, cs - 8);
+    if (isCur) { g.strokeStyle = C.accent; g.lineWidth = 4; g.strokeRect(cx + 2, cy + 2, cs - 4, cs - 4); }
+    g.restore();
+    const k = KER.find(([dx, dyy]) => dx === c && dyy === r);
+    if (k) {
+      const share = e * k[2] / 16, s = (share >= 0 ? '+' : '−') + Math.abs(share).toFixed(2), ka = a * E.outBack(prog(f, T.fs0 + p * T.slowT + 5, T.fs0 + p * T.slowT + 11));
+      text(g, `${k[2]}/16`, cx + cs / 2, cy + cs / 2 - 14, { size: 28, weight: 800, color: shade > 0.55 ? C.bg : C.paper, align: 'center', base: 'middle', fam: MONO, alpha: a });
+      g.save(); g.globalAlpha = clamp(ka) * 0.9; g.fillStyle = C.bg; g.beginPath(); g.roundRect(cx + cs / 2 - 48, cy + cs / 2 + 2, 96, 36, 8); g.fill(); g.restore();   // a dark pill, readable on any grey
+      text(g, s, cx + cs / 2, cy + cs / 2 + 21, { size: 28, weight: 900, color: share >= 0 ? C.go : C.no, align: 'center', base: 'middle', fam: MONO, alpha: clamp(ka) });
+    }
+    if (isCur) text(g, adj.toFixed(2), cx + cs / 2, cy + cs / 2 + 2, { size: 34, weight: 900, color: shade > 0.55 ? C.bg : C.paper, align: 'center', base: 'middle', fam: MONO, alpha: a });
+  }
+  const ly = I.y + 2 * cs + 52 + dy;
+  text(g, `${adj.toFixed(2)} → ${o ? 'white' : 'black'}`, I.x, ly, { size: 34, weight: 850, color: C.paper, fam: MONO, alpha: a });
+  text(g, `error ${(e >= 0 ? '+' : '−') + Math.abs(e).toFixed(2)}`, I.x, ly + 46, { size: 34, weight: 850, color: e >= 0 ? C.go : C.no, fam: MONO, alpha: a });
+}
+/** Brightness bookkeeping: the grey, the rounding, the dots (live during the sweep), and the squint error. */
+function stats(g, G, f, n) {
+  const T = G.TL, gd = G.g, S = G.S;
+  if (!S) return;
+  const rows = [
+    [T.g0 + 20, 'grey', pc(gd.mean), C.paper],
+    [T.th0 + 10, 'rounded', pc(gd.thW) + ' white', C.no],
+    [T.fs0, 'dithered', n ? `${pc(gd.cf[n] / n)} white` : '—', C.go],
+  ];
+  const [a0] = env(f, T.g0 + 20, T.calm, 12, 10), [ia] = env(f, T.fs0 - 10, T.slow1 + 34, 12, 12), a = a0 * (1 - ia);   // steps aside for the inset
+  if (a <= 0) return;
+  text(g, 'BRIGHTNESS', S.x, S.y, { size: 28, weight: 800, color: C.dim, spacing: 4, alpha: a });
+  rows.forEach(([t0, lab, val, col], k) => {
+    const ka = a * E.outCubic(prog(f, t0, t0 + 12)); if (ka <= 0) return;
+    const y = S.y + 56 + k * 52;
+    text(g, lab, S.x, y, { size: 32, weight: 750, color: C.paper, fam: MONO, alpha: ka });
+    text(g, val, S.x + S.w, y, { size: 32, weight: 850, color: col, fam: MONO, align: 'right', alpha: ka });
+  });
+  const la = a * E.outCubic(prog(f, T.fs0, T.fs0 + 12)) * (1 - prog(f, T.fs1 - 6, T.fs1));
+  if (n > 0 && la > 0) {                       // the grey of the very pixels drawn so far: the dots keep pace with it
+    text(g, 'their grey', S.x, S.y + 56 + 3 * 52, { size: 32, weight: 750, color: C.dim, fam: MONO, alpha: la });
+    text(g, pc(gd.cv[n] / n), S.x + S.w, S.y + 56 + 3 * 52, { size: 32, weight: 850, color: C.dim, fam: MONO, align: 'right', alpha: la });
+  }
+  const sa = a * E.outCubic(prog(f, T.sq0 + 8, T.sq0 + 20));
+  if (sa > 0) {
+    const y = S.y + 56 + 3 * 52 + 40;
+    text(g, `PATCH ERROR, ${BLK} × ${BLK}`, S.x, y, { size: 28, weight: 800, color: C.dim, spacing: 4, alpha: sa });
+    text(g, 'rounded', S.x, y + 52, { size: 32, weight: 750, color: C.paper, fam: MONO, alpha: sa });
+    text(g, pc(gd.errT), S.x + S.w, y + 52, { size: 32, weight: 850, color: C.no, fam: MONO, align: 'right', alpha: sa });
+    text(g, 'dithered', S.x, y + 104, { size: 32, weight: 750, color: C.paper, fam: MONO, alpha: sa });
+    text(g, pc(gd.errF), S.x + S.w, y + 104, { size: 32, weight: 850, color: C.go, fam: MONO, align: 'right', alpha: sa });
+  }
+}
+function caption(g, G, f) {
+  for (const [t0, t1, str] of G.TL.caps) {
+    const [a, dy] = env(f, t0, t1, 10, 8); if (a <= 0) continue;
+    const [p1, p2] = str.split('|');
+    if (G.capTwo) {
+      text(g, p1, G.capX, G.capY + dy, { size: G.cap, weight: 850, color: C.paper, spacing: -1, alpha: a, max: G.capMax });
+      text(g, p2, G.capX, G.capY + G.cap * 1.14 + dy, { size: G.cap, weight: 850, color: C.accent, spacing: -1, alpha: a, max: G.capMax });
+    } else {
+      const w1 = measure(g, p1 + ' ', G.cap, 850, FONT, -1), w2 = measure(g, p2, G.cap, 850, FONT, -1), sc = Math.min(1, G.capMax / (w1 + w2));
+      const w = text(g, p1 + ' ', G.capX, G.capY + dy, { size: G.cap * sc, weight: 850, color: C.paper, spacing: -1, alpha: a });
+      text(g, p2, G.capX + w, G.capY + dy, { size: G.cap * sc, weight: 850, color: C.accent, spacing: -1, alpha: a });
+    }
+  }
+}
+function readout(g, G, f, n) {
+  const T = G.TL, gd = G.g, [a] = env(f, T.g0 + 20, T.calm, 12, 10);
+  if (a <= 0) return;
+  const s = G.foShort ? `pixels ${n} / ${gd.N}  ·  white ${n ? pc(gd.cf[n] / n) : '—'}  ·  grey ${n ? pc(gd.cv[n] / n) : pc(gd.mean)}`
+    : `pixels ${n} / ${gd.N}  ·  2 inks  ·  error kernel 7, 3, 5, 1 sixteenths`;
+  text(g, s, G.foX, G.foY, { size: G.fo, weight: 700, color: C.paper, fam: MONO, alpha: a, max: G.foMax });
+}
+function finale(g, G, f) {
+  const T = G.TL, gd = G.g, k1 = E.outCubic(prog(f, T.calm, T.calm + 18)), k2 = E.outCubic(prog(f, T.calm + 10, T.calm + 28));
+  if (k1 <= 0) return;
+  const out = 1 - E.inCubic(prog(f, T.end - 6, T.end + 12));
+  g.save(); g.fillStyle = `rgba(${C.bgRGB},${0.86 * k1 * out})`; g.fillRect(0, G.fnBand[0], G.w, G.fnBand[1] - G.fnBand[0]); g.restore();
+  text(g, 'Two inks, every grey.', G.fnX, G.fnY, { size: G.fn, weight: 900, color: C.paper, spacing: -2, align: G.fnAlign, alpha: k1 * out, max: G.fnMax });
+  if (G.fnTwo) {
+    text(g, `${pc(gd.fsW)} white dots`, G.fnX, G.fnY + G.fn * 1.05, { size: G.fn * 0.55, weight: 850, color: C.accent, spacing: -1, align: G.fnAlign, alpha: k2 * out, max: G.fnMax });
+    text(g, `for a ${pc(gd.mean)} grey.`, G.fnX, G.fnY + G.fn * 1.75, { size: G.fn * 0.55, weight: 850, color: C.accent, spacing: -1, align: G.fnAlign, alpha: k2 * out, max: G.fnMax });
+  } else text(g, `${pc(gd.fsW)} white dots for a ${pc(gd.mean)} grey  ·  patches within ${pc(gd.errF)}, not ${pc(gd.errT)}`, G.fnX, G.fnY + G.fn * 1.05, { size: G.fn * 0.5, weight: 850, color: C.accent, spacing: -1, align: G.fnAlign, alpha: k2 * out, max: G.fnMax });
+}
+function scene(g, G, f) {
+  const n = picture(g, G, f);
+  inset(g, G, f, n); stats(g, G, f, n);
+  caption(g, G, f); readout(g, G, f, n); finale(g, G, f);
+}
+
+// ---- landscape picture ------------------------------------------------------------------
+const TLL = buildTL({ g0: 34, th0: 150, wipe: 24, fs0: 262, slowN: 6, slowT: 14, fastT: 230, gapT: 20, sqT: 96, calmT: 36 }, IMG_L);
+const FRAMES = TLL.end + 72;
+const GL = { TL: TLL, g: IMG_L, w: W, h: H, ix: 120, iy: 300, px: 7,
+  I: { x: 1336, y: 380, cs: 128, box: false },
+  S: { x: 1336, y: 380, w: 460 },
+  capX: 120, capY: 216, cap: 50, capTwo: false, capMax: 1680,
+  fo: 30, foX: 120, foY: 1012, foMax: 1680,
+  fn: 100, fnX: W / 2, fnY: 600, fnAlign: 'center', fnMax: 1680, fnBand: [290, 944] };
+// the stats panel waits until the inset is gone
+GL.S.y = 380;
+function hookL(f) {
+  const o = 1 - E.inCubic(prog(f, TLL.g0 - 14, TLL.g0 + 4));
+  if (o <= 0) return;
+  const k = E.outExpo(prog(f, -8, 10)), k2 = E.outBack(prog(f, -6, 12));
+  ctx.save(); ctx.fillStyle = `rgba(${C.bgRGB},${0.8 * o})`; ctx.fillRect(0, 400, W, 330); ctx.restore();
+  text(ctx, 'Black and white only.', W / 2, 540 + (1 - k) * 30, { size: 108, weight: 900, color: C.paper, spacing: -3, align: 'center', alpha: o * Math.max(0.3, k), max: 1700 });
+  text(ctx, 'So where does the grey come from?', W / 2, 670 + (1 - clamp(k2)) * 30, { size: 108, weight: 900, color: C.accent, spacing: -3, align: 'center', alpha: o * Math.max(0.3, clamp(k2)), max: 1700 });
+}
+function draw(f) {
+  if (ctx.reset) ctx.reset();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; ctx.filter = 'none'; ctx.shadowBlur = 0;
+  ctx.fillStyle = C.bg; ctx.fillRect(0, 0, W, H);
+  const T = TLL, endK = E.inOutCubic(prog(f, T.end, T.end + 20)), a = 1 - endK;
+  scene(ctx, GL, f);
+  text(ctx, 'GRAPHICS  ·  ERROR DIFFUSION', 120, 104, { size: 26, weight: 600, color: C.dim, spacing: 5, alpha: a });
+  text(ctx, 'BYTEPATTERNS', 1800, 104, { size: 26, weight: 600, color: C.dim, spacing: 5, align: 'right', alpha: a });
+  hookL(f);
+  if (endK > 0) {
+    ctx.fillStyle = `rgba(${C.bgRGB},${0.86 * endK})`; ctx.fillRect(0, 0, W, H);
+    const k1 = E.outCubic(prog(f, T.end + 6, T.end + 28)), k2 = E.outCubic(prog(f, T.end + 16, T.end + 38)), k3 = E.outCubic(prog(f, T.end + 26, T.end + 48));
+    text(ctx, 'Floyd–Steinberg: Two Inks, Every Grey', W / 2, 500 + (1 - k1) * 30, { size: 112, weight: 850, color: C.paper, spacing: -3, align: 'center', alpha: k1, max: 1680 });
+    text(ctx, `${IMG_L.N} pixels  ·  ${pc(IMG_L.mean)} grey  ·  ${pc(IMG_L.fsW)} white dots  ·  ${BLK} × ${BLK} patches within ${pc(IMG_L.errF)}`, W / 2, 580 + (1 - k2) * 20, { size: 42, weight: 500, color: C.accent, align: 'center', alpha: k2, max: 1680 });
+    text(ctx, 'drawn in code  ·  bytepatterns.com', W / 2, 1000, { size: 32, weight: 600, color: C.paper, spacing: 3, align: 'center', alpha: k3 * 0.8 });
+  }
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.letterSpacing = '0px';
+}
+
+// ---- sound: a tone per slow pixel (high for white, low for black), then a hiss of dots that brightens with the rows ----
+async function renderAudio(G = GL, frames = FRAMES) {
+  const TL = G.TL, gd = G.g;
+  const SR = 48000, dur = frames / FPS, LEN = Math.round(SR * dur);
+  const ac = new OfflineAudioContext(2, LEN, SR);
+  const at = fr => fr / FPS;
+  const comp = ac.createDynamicsCompressor();
+  comp.threshold.value = -16; comp.ratio.value = 3; comp.attack.value = 0.005; comp.release.value = 0.25;
+  const master = ac.createGain(); master.gain.value = 0.9; master.connect(comp).connect(ac.destination);
+  master.gain.setValueAtTime(0.9, dur - 1.0); master.gain.linearRampToValueAtTime(0.0001, dur - 0.02);
+  const rnd = mulberry32(0x72AD);
+  const ir = ac.createBuffer(2, SR * 2, SR);
+  for (let c = 0; c < 2; c++) { const d = ir.getChannelData(c); for (let k = 0; k < d.length; k++) d[k] = (rnd() * 2 - 1) * Math.pow(1 - k / d.length, 3); }
+  const verb = ac.createConvolver(); verb.buffer = ir; const vg = ac.createGain(); vg.gain.value = 0.28; verb.connect(vg).connect(master);
+  const hz = m => 440 * Math.pow(2, (m - 69) / 12);
+  const pluck = (t0, m, amp, pan, dec = 0.35, type = 'triangle') => {
+    const o = ac.createOscillator(), g = ac.createGain(), p = ac.createStereoPanner(); o.type = type; o.frequency.value = hz(m);
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(amp, t0 + 0.004); g.gain.exponentialRampToValueAtTime(0.0001, t0 + dec);
+    p.pan.value = pan; o.connect(g).connect(p); p.connect(master); p.connect(verb); o.start(t0); o.stop(t0 + dec + 0.05);
+  };
+  const pad = (t0, t1, notes, amp, cutoff) => {
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = cutoff; lp.Q.value = 1; lp.connect(master); lp.connect(verb);
+    notes.forEach((m, i) => { for (const det of [-6, 6]) {
+      const o = ac.createOscillator(), g = ac.createGain(), p = ac.createStereoPanner(); o.type = 'sawtooth'; o.frequency.value = hz(m); o.detune.value = det;
+      p.pan.value = (i / Math.max(1, notes.length - 1) - 0.5) * 0.8 * Math.sign(det);
+      g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(amp, t0 + 0.8); g.gain.setValueAtTime(amp, Math.max(t0 + 0.8, t1 - 0.6)); g.gain.exponentialRampToValueAtTime(0.0001, t1 + 0.4);
+      o.connect(g).connect(p).connect(lp); o.start(t0); o.stop(t1 + 0.45); } });
+  };
+  pad(0, at(TL.th0 + 4), [45, 52, 57, 60, 64], 0.011, 900);
+  pad(at(TL.th0), at(TL.fs0 + 4), [44, 51, 56, 59, 63], 0.011, 700);
+  pad(at(TL.fs0), at(TL.calm + 4), [41, 48, 53, 57, 60], 0.011, 1100);
+  pad(at(TL.calm), at(TL.end + 50), [48, 55, 60, 64, 67], 0.012, 1300);
+  // the rounding wipe: a falling sweep
+  { const o = ac.createOscillator(), g = ac.createGain(); o.type = 'sine'; o.frequency.setValueAtTime(hz(76), at(TL.th0)); o.frequency.exponentialRampToValueAtTime(hz(52), at(TL.th1));
+    g.gain.setValueAtTime(0.0001, at(TL.th0)); g.gain.exponentialRampToValueAtTime(0.03, at(TL.th0) + 0.05); g.gain.exponentialRampToValueAtTime(0.0001, at(TL.th1) + 0.3);
+    o.connect(g).connect(master); o.start(at(TL.th0)); o.stop(at(TL.th1) + 0.35); }
+  for (let p = 0; p < TL.slowN; p++) pluck(at(TL.fs0 + p * TL.slowT + 5), gd.fs[p] ? 79 : 67, 0.05, -0.3 + p * 0.1, 0.4);
+  // the sweep: a tick every 2 frames, pitched by the share of white dots in the pixels just drawn
+  for (let fr = TL.slow1; fr < TL.fs1; fr += 2) {
+    const n0 = doneAt(TL, gd, fr), n1 = doneAt(TL, gd, fr + 2); if (n1 <= n0) continue;
+    const wr = (gd.cf[n1] - gd.cf[n0]) / (n1 - n0), row = Math.floor(n1 / gd.w) / gd.h;
+    pluck(at(fr), 60 + Math.round(wr * 24), 0.018, (row - 0.5) * 1.2, 0.09, 'sine');
+  }
+  [55, 62, 67, 71].forEach((m, i) => pluck(at(TL.sq0) + i * 0.12, m + 12, 0.035, -0.3 + i * 0.2, 1.6, 'sine'));
+  [60, 64, 67, 72].forEach((m, i) => pluck(at(TL.calm) + i * 0.09, m, 0.05, -0.3 + i * 0.2, 1.6, 'sine'));
+  [76, 81, 84, 88].forEach((m, i) => pluck(at(TL.end + 10 + i * 6), m, 0.05, -0.45 + i * 0.3, 1.8, 'sine'));
+  const buf = await ac.startRendering();
+  let peak = 0; for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let k = 0; k < d.length; k++) peak = Math.max(peak, Math.abs(d[k])); }
+  const norm = 0.85 / Math.max(peak, 1e-6);                          // every piece peaks at the same level
+  for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let k = 0; k < d.length; k++) d[k] *= norm; }
+  return buf;
+}
+
+/* ==========================================================================
+   VERTICAL CUT — shared block, identical in every piece.
+   1080x1920 for Reels, Shorts and TikTok (__motion.variants.vertical). The
+   piece's own scene code is re-used and recomposed for a phone: everything a
+   viewer must read stays inside the area no platform covers (x 60..900,
+   y 230..1400); outside it there is only dimmed texture.
+   ========================================================================== */
+const VW = 1080, VH = 1920, SAFE = { x: 60, y: 230, w: 840, h: 1170, r: 900, b: 1400 };
+const vcv = document.createElement('canvas'); vcv.width = VW; vcv.height = VH;
+const vx = vcv.getContext('2d', { willReadFrequently: true });   // CPU raster: identical pixels on every redraw
+const VL = 96, VR = 864;                                          // text column inside the safe area
+
+function vReset() {
+  vx.setTransform(1, 0, 0, 1, 0, 0); vx.globalAlpha = 1; vx.globalCompositeOperation = 'source-over';
+  vx.filter = 'none'; vx.shadowBlur = 0; vx.shadowColor = 'transparent'; vx.letterSpacing = '0px'; vx.setLineDash([]);
+  vx.textAlign = 'left'; vx.textBaseline = 'alphabetic'; vx.lineCap = 'butt'; vx.lineJoin = 'miter';
+}
+/** Canvas text on the vertical frame; `max` shrinks the size until the line fits. */
+function vText(str, x, y, { size = 40, weight = 700, color = '#FFFFFF', align = 'left', spacing = 0, alpha = 1, fam = FONT, max = 0 } = {}) {
+  if (alpha <= 0.002 || !str) return size;
+  vx.font = `${weight} ${size}px ${fam}`; vx.letterSpacing = spacing + 'px';
+  if (max) { const w = vx.measureText(str).width; if (w > max) { size = size * max / w; vx.font = `${weight} ${size}px ${fam}`; } }
+  vx.textAlign = align; vx.textBaseline = 'alphabetic';
+  const a0 = vx.globalAlpha; vx.globalAlpha = a0 * alpha; vx.fillStyle = color;
+  vx.fillText(str, x + (align === 'center' ? spacing / 2 : align === 'right' ? spacing : 0), y);   // tracking is added after the last glyph too
+  vx.globalAlpha = a0; vx.letterSpacing = '0px';
+  return size;
+}
+/** Word-wraps with the given font; returns the lines. */
+function vWrap(str, maxW, size, weight = 700, fam = FONT) {
+  vx.font = `${weight} ${size}px ${fam}`; vx.letterSpacing = '0px';
+  const words = str.split(' '), lines = []; let cur = '';
+  for (const w of words) { const t = cur ? cur + ' ' + w : w; if (vx.measureText(t).width > maxW && cur) { lines.push(cur); cur = w; } else cur = t; }
+  if (cur) lines.push(cur);
+  return lines;
+}
+/** Fade envelope with a small rise: [alpha, dy]. */
+function vEnv(v, a, b, fin = 8, fout = 8) {
+  const i = E.outCubic(prog(v, a, a + fin)), o = 1 - E.inCubic(prog(v, b - fout, b));
+  return [Math.min(i, o), (1 - i) * 22 - (1 - o) * 10];
+}
+/** Which segment of a cut list a vertical frame is in: segs = [{ at, src, len }] in frames. */
+function vSeg(segs, v) {
+  let k = 0; while (k < segs.length - 1 && v >= segs[k + 1].at) k++;
+  const s = segs[k];
+  return { k, s, local: v - s.at, src: s.src + (v - s.at) };
+}
+/** Dims everything outside the safe area to a quiet texture (brightness x 0.2), with a soft inner edge. */
+function vShade(rgb, a = 0.8, feather = 40) {
+  vx.save(); vx.setTransform(1, 0, 0, 1, 0, 0); vx.globalAlpha = 1; vx.globalCompositeOperation = 'source-over';
+  vx.fillStyle = `rgba(${rgb},${a})`;
+  vx.beginPath(); vx.rect(0, 0, VW, VH); vx.rect(SAFE.x, SAFE.y, SAFE.w, SAFE.h); vx.fill('evenodd');
+  const strip = (x0, y0, x1, y1, rx, ry, rw, rh) => {
+    const g = vx.createLinearGradient(x0, y0, x1, y1);
+    g.addColorStop(0, `rgba(${rgb},${a})`); g.addColorStop(1, `rgba(${rgb},0)`);
+    vx.fillStyle = g; vx.fillRect(rx, ry, rw, rh);
+  };
+  strip(SAFE.x, 0, SAFE.x + feather, 0, SAFE.x, SAFE.y, feather, SAFE.h);
+  strip(SAFE.r, 0, SAFE.r - feather, 0, SAFE.r - feather, SAFE.y, feather, SAFE.h);
+  strip(0, SAFE.y, 0, SAFE.y + feather, SAFE.x, SAFE.y, SAFE.w, feather);
+  strip(0, SAFE.b, 0, SAFE.b - feather, SAFE.x, SAFE.b - feather, SAFE.w, feather);
+  vx.restore();
+}
+/** Series tag at the top of the safe area, e.g. MADE IN CODE · 04. */
+function vTag(label, color, alpha = 1) {
+  vText('MADE IN CODE', VL, 292, { size: 28, weight: 800, color, spacing: 5, alpha });
+  vx.font = `800 28px ${FONT}`; vx.letterSpacing = '5px';
+  const w = vx.measureText('MADE IN CODE').width; vx.letterSpacing = '0px';
+  vText('·  ' + label, VL + w + 14, 292, { size: 28, weight: 600, color: 'rgba(255,255,255,0.72)', spacing: 3, alpha, max: VR - VL - w - 14 });
+}
+/** Big hook lines, left-aligned from y0; visible from frame 0, settles in a few frames. */
+function vHook(v, lines, y0, { size = 84, lh = 1.08, color = '#FFFFFF', accent = null, weight = 800, spacing = -1.5, alpha = 1 } = {}) {
+  const k = E.outExpo(prog(v, -6, 12));
+  lines.forEach((ln, i) => {
+    const kk = E.outExpo(prog(v, -12 + i * 2, 8 + i * 2));
+    vText(ln, VL, y0 + i * size * lh + (1 - kk) * 30, { size, weight, spacing, color: accent && i === lines.length - 1 ? accent : color, alpha: alpha * Math.max(0.25, kk), max: VR - VL });
+  });
+  return k;
+}
+/** Closing card, the last 60 frames: piece title, "drawn in code · bytepatterns.com". l = frames into the card. */
+function vEndCard(l, { title, line = '', ink = '#FFFFFF', dim = 'rgba(255,255,255,0.66)', accent = '#FFFFFF', scrim = '0,0,0', a = 0.84 }) {
+  const k = E.outCubic(prog(l, 0, 12));
+  vx.save(); vx.setTransform(1, 0, 0, 1, 0, 0);
+  vx.fillStyle = `rgba(${scrim},${a * k})`; vx.fillRect(0, 0, VW, VH);
+  vx.restore();
+  const t1 = E.outExpo(prog(l, 3, 19)), t2 = E.outExpo(prog(l, 11, 27)), t3 = E.outExpo(prog(l, 19, 35));
+  vx.fillStyle = accent; vx.globalAlpha = t1; vx.fillRect(VL, 742, 88 * t1, 7); vx.globalAlpha = 1;
+  const size = vText(title, VL, 850 + (1 - t1) * 40, { size: 92, weight: 800, color: ink, spacing: -2, alpha: t1, max: VR - VL });
+  const y2 = 850 + Math.max(size, 60) * 0.25 + 70;
+  vx.font = `600 44px ${FONT}`;
+  const lead = 'drawn in code  ·  ', lw = vx.measureText(lead).width;
+  vText(lead, VL, y2 + (1 - t2) * 24, { size: 44, weight: 600, color: dim, alpha: t2 });
+  vText('bytepatterns.com', VL + lw, y2 + (1 - t2) * 24, { size: 44, weight: 800, color: accent, alpha: t2 });
+  if (line) vText(line, VL, y2 + 72 + (1 - t3) * 18, { size: 32, weight: 500, color: dim, alpha: t3, max: VR - VL });
+}
+/** Seeks a cut. The first frame a page draws is drawn twice: the very first read of a
+ *  GPU-backed source canvas can come out a shade different from every later one. */
+let vWarm = false;
+function vSeek(draw, i, frames) {
+  const f = Math.max(0, Math.min(frames - 1, Math.floor(i)));
+  if (!vWarm) { vWarm = true; draw(f); }
+  draw(f);
+}
+/** The soundtrack of a cut: the piece's own audio() spliced to the same segments as the picture. */
+async function vAudio(segs, frames, { xf = 0.025, fadeOut = 0.6, extra = null } = {}) {
+  const src = await renderAudio();
+  const SR = 48000, dur = frames / FPS, ac = new OfflineAudioContext(2, Math.round(SR * dur), SR);
+  const out = ac.createGain(); out.connect(ac.destination);
+  out.gain.setValueAtTime(1, 0); out.gain.setValueAtTime(1, dur - fadeOut); out.gain.linearRampToValueAtTime(0, dur - 0.01);
+  segs.forEach((s, k) => {
+    const at = s.at / FPS, off = s.src / FPS, d = s.len / FPS;
+    const pre = k === 0 ? 0 : Math.min(xf, off), post = k === segs.length - 1 ? 0 : xf;
+    const b = ac.createBufferSource(), g = ac.createGain(); b.buffer = src;
+    g.gain.setValueAtTime(pre ? 0 : 1, at - pre);
+    if (pre) g.gain.linearRampToValueAtTime(1, at + pre);
+    if (post) { g.gain.setValueAtTime(1, at + d - post); g.gain.linearRampToValueAtTime(0, at + d + post); }
+    b.connect(g).connect(out); b.start(at - pre, off - pre, d + pre + post);
+  });
+  if (extra) extra(ac, out);
+  const buf = await ac.startRendering();
+  let peak = 0; for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) peak = Math.max(peak, Math.abs(d[i])); }
+  if (peak > 0.9) for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) d[i] *= 0.9 / peak; }
+  return buf;
+}
+/** A soft three-partial bell, for the closing card. */
+function vChime(ac, dest, at, freq, vol = 0.08) {
+  for (const [mul, v, dec] of [[1, 1, 1.8], [2.01, 0.35, 0.8], [3.02, 0.12, 0.4]]) {
+    const o = ac.createOscillator(), g = ac.createGain(); o.type = 'sine'; o.frequency.value = freq * mul;
+    g.gain.setValueAtTime(0.0001, at); g.gain.exponentialRampToValueAtTime(vol * v, at + 0.006); g.gain.exponentialRampToValueAtTime(0.0001, at + dec);
+    o.connect(g).connect(dest); o.start(at); o.stop(at + dec + 0.05);
+  }
+}
+
+/* VERTICAL CUT — this piece */
+// A 120 x 100 picture of the same scene on a 1080 x 1920 stage and a faster clock; its own numbers, computed the same way.
+const TLV = buildTL({ g0: 30, th0: 104, wipe: 18, fs0: 186, slowN: 6, slowT: 11, fastT: 160, gapT: 14, sqT: 70, calmT: 26 }, IMG_V);
+const VFR = TLV.end + 60, VEND = VFR - 60;
+const GV = { TL: TLV, g: IMG_V, w: VW, h: VH, ix: 60, iy: 520, px: 7,
+  I: { x: 170, y: 780, cs: 120, box: true },
+  S: null,
+  capX: VL, capY: 390, cap: 42, capTwo: true, capMax: VR - VL,
+  fo: 28, foX: VL, foY: 1300, foMax: VR - VL, foShort: true,
+  fn: 76, fnX: VL, fnY: 800, fnAlign: 'left', fnMax: VR - VL, fnTwo: true, fnBand: [660, 1010] };
+function vStats(v, n) {
+  const T = TLV, gd = IMG_V, [a] = env(v, T.fs1, T.calm, 12, 10);
+  if (a <= 0) return;
+  const sa = E.outCubic(prog(v, T.sq0 + 8, T.sq0 + 20));
+  vText(`grey ${pc(gd.mean)}  ·  rounded ${pc(gd.thW)}  ·  dots ${pc(gd.fsW)}`, VL, 1346, { size: 28, weight: 700, color: C.paper, fam: MONO, alpha: a, max: VR - VL });
+  vText(`patch error: rounded ${pc(gd.errT)}  ·  dots ${pc(gd.errF)}`, VL, 1392, { size: 28, weight: 700, color: C.accent, fam: MONO, alpha: a * sa, max: VR - VL });
+}
+function hookV(v) {
+  const o = 1 - E.inCubic(prog(v, TLV.g0 - 10, TLV.g0 + 4));
+  if (o <= 0) return;
+  vx.save(); vx.fillStyle = `rgba(${C.bgRGB},${0.86 * o})`; vx.fillRect(SAFE.x, 400, SAFE.w, 560); vx.restore();
+  vHook(v, ['Black and', 'white only.', 'So where is', 'the grey?'], 510, { size: 104, accent: C.accent, color: C.paper, weight: 900, spacing: -2, alpha: o });
+}
+function vDraw(v) {
+  if (vx.reset) vx.reset();
+  vReset();
+  vx.fillStyle = C.bg; vx.fillRect(0, 0, VW, VH);
+  scene(vx, GV, v);
+  vStats(v, doneAt(TLV, IMG_V, v));
+  hookV(v);
+  vReset();
+  vShade(C.bgRGB, 0.86);
+  vTag('DITHERING', C.accent);
+  if (v >= VEND) vEndCard(v - VEND, { title: 'Floyd–Steinberg: Two Inks, Every Grey', line: `${pc(IMG_V.fsW)} white dots for a ${pc(IMG_V.mean)} grey  ·  patches within ${pc(IMG_V.errF)}`,
+    ink: C.paper, dim: 'rgba(241,238,230,0.72)', accent: C.accent, scrim: C.bgRGB, a: 0.88 });
+  vReset();
+}
+
+// The player asks for a frame on every display refresh; at 30 fps on a 60 Hz screen every other call
+// asks for the frame already on the canvas, which is then left as it is (same frame, same pixels).
+const shown = { L: -1, V: -1 };
+const gL = IMG_L;
+window.__motion = {
+  title: 'Floyd–Steinberg: Two Inks, Every Grey',
+  description: `A ${gL.w} × ${gL.h} grey picture of a lit sphere, ${pc(gL.mean)} grey on average, printed with two inks: rounding each pixel makes ${pc(gL.thW)} of them white and flattens the shading into bands, while Floyd–Steinberg passes each rounding error on (7/16 right, 3/16, 5/16 and 1/16 below) and makes ${pc(gL.fsW)} white, so every ${BLK} × ${BLK} patch averages within ${pc(gL.errF)} of its grey instead of ${pc(gL.errT)}.`,
+  fps: FPS, width: W, height: H, frames: FRAMES,
+  poster: Math.round(TLL.slow1 + TLL.fastT * 0.62),
+  gifStart: Math.floor(TLL.slow1 / FPS),
+  seek(i) { const f = Math.max(0, Math.min(FRAMES - 1, Math.floor(i))); if (f !== shown.L) { shown.L = f; draw(f); } },
+  audio: () => renderAudio(GL, FRAMES),
+  variants: {
+    vertical: {
+      width: VW, height: VH, frames: VFR, canvas: vcv,
+      poster: Math.round(TLV.slow1 + TLV.fastT * 0.62), gifStart: Math.floor(TLV.slow1 / FPS),
+      seek(i) { const v = Math.max(0, Math.min(VFR - 1, Math.floor(i))); if (v !== shown.V) { shown.V = v; vSeek(vDraw, v, VFR); } },
+      audio: () => renderAudio(GV, VFR),
+    },
+  },
+};
+
+
+/* ==========================================================================
+   PLAYER — identical in every piece; keep as is.
+   Autoplays and loops, starts sound on the first click, ?frame=N pauses on a
+   frame, ?variant=vertical plays the vertical cut (if the piece has one).
+   When the renderer sets window.__MOTION_RENDER__ it stays out of the way.
+   ========================================================================== */
+(function player() {
+  const btn = document.getElementById('sound'), q = new URLSearchParams(location.search);
+  let M = window.__motion;
+  const V = !window.__MOTION_RENDER__ && M.variants && M.variants[q.get('variant')];
+  if (V) {                                                // show the variant's own canvas instead
+    M = Object.assign({}, M, V);
+    V.canvas.style.cssText = `width:min(100vw,calc(100vh*${V.width}/${V.height}));height:auto;aspect-ratio:${V.width}/${V.height}`;
+    document.querySelector('canvas').replaceWith(V.canvas);
+  }
+  const dur = M.frames / M.fps;
+  if (window.__MOTION_RENDER__) { btn.hidden = true; M.seek(0); return; }
+  if (q.has('frame')) { btn.hidden = true; M.seek(+q.get('frame') || 0); return; }
+  let t0 = performance.now(), ac = null, src = null, buf = null, paused = false, pausedAt = 0;
+  const clock = () => ac && src ? (ac.currentTime - t0) : (performance.now() - t0) / 1000;
+  function loop() {
+    if (!paused) M.seek(Math.floor(((clock() % dur) + dur) % dur * M.fps));
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+  btn.addEventListener('click', async () => {
+    if (src) { src.stop(); src = null; btn.textContent = 'Click for sound'; t0 = performance.now(); return; }
+    btn.textContent = 'Loading sound…';
+    ac = ac || new AudioContext({ sampleRate: 48000 });
+    buf = buf || await M.audio();
+    await ac.resume();
+    src = ac.createBufferSource(); src.buffer = buf; src.loop = true; src.connect(ac.destination);
+    t0 = ac.currentTime + 0.05; src.start(t0);        // picture restarts from frame 0 in sync with the sound
+    btn.textContent = 'Sound on — click to mute';
+  });
+  addEventListener('keydown', e => {
+    if (e.code !== 'Space') return;
+    e.preventDefault(); paused = !paused;
+    if (ac) paused ? ac.suspend() : ac.resume();
+    if (!ac) { if (paused) pausedAt = performance.now(); else t0 += performance.now() - pausedAt; }
+  });
+})();
+</script>
+</body>
+</html>
