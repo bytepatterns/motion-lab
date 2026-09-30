@@ -570,6 +570,71 @@ Click a preview to open the piece live in your browser (click once more there fo
 <br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/43-hilbert-curve/?variant=vertical">open</a> · <a href="out/43-hilbert-curve.vertical.png">still</a></sub>
 </td>
 </tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/44-lru-cache/"><img src="out/44-lru-cache.gif" width="100%" alt="Least Recently Used — animated preview"></a>
+<br><b>44 · Least Recently Used</b> <sub>27 s</sub>
+<br>An LRU cache with 4 slots serves 30 requests: a hit moves its entry to the front, a miss puts the new entry there and, once the cache is full, evicts the one at the back. Request 7 is the first eviction; by the end LRU has 15 hits (50%), while a FIFO cache of the same size on the same requests has 8 (27%), because it evicts by arrival, hot or not.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/44-lru-cache/">open in browser</a> · <a href="out/44-lru-cache.png">still</a> · <a href="projects/44-lru-cache/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/44-lru-cache/?variant=vertical"><img src="out/44-lru-cache.vertical.gif" width="100%" alt="Least Recently Used — vertical cut, animated preview"></a>
+<br><sub>9:16 · 19 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/44-lru-cache/?variant=vertical">open</a> · <a href="out/44-lru-cache.vertical.png">still</a></sub>
+</td>
+</tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/45-b-tree-splits/"><img src="out/45-b-tree-splits.gif" width="100%" alt="B-Tree Page Splits — animated preview"></a>
+<br><b>45 · B-Tree Page Splits</b> <sub>27 s</sub>
+<br>A real B-tree with pages of at most 3 keys takes 18 shuffled inserts: each key walks down from the root to a leaf (58 comparisons in all), a page that reaches 4 keys splits and pushes its middle key up, 9 splits in all, 2 of them at the root, so the tree grows at the top to 3 levels and 12 pages with every leaf at the same depth; with 500-key pages, 3 levels would hold 125,751,500 keys.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/45-b-tree-splits/">open in browser</a> · <a href="out/45-b-tree-splits.png">still</a> · <a href="projects/45-b-tree-splits/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/45-b-tree-splits/?variant=vertical"><img src="out/45-b-tree-splits.vertical.gif" width="100%" alt="B-Tree Page Splits — vertical cut, animated preview"></a>
+<br><sub>9:16 · 19 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/45-b-tree-splits/?variant=vertical">open</a> · <a href="out/45-b-tree-splits.vertical.png">still</a></sub>
+</td>
+</tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/46-bresenham-line/"><img src="out/46-bresenham-line.gif" width="100%" alt="Bresenham's Line — animated preview"></a>
+<br><b>46 · Bresenham's Line</b> <sub>26 s</sub>
+<br>Bresenham's line algorithm draws a line from (0, 0) to (13, 5) as 14 squares, each chosen by a running integer error (D += 10; when D &gt; 0, step up and D −= 26); then 24 lines in every direction, a radius-12 midpoint circle computed for one eighth (9 squares) and mirrored into 68, and 30 rings as the camera pulls back: 8,507 squares for 6,746 integer adds and 0 multiplies, all counted as they run.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/46-bresenham-line/">open in browser</a> · <a href="out/46-bresenham-line.png">still</a> · <a href="projects/46-bresenham-line/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/46-bresenham-line/?variant=vertical"><img src="out/46-bresenham-line.vertical.gif" width="100%" alt="Bresenham's Line — vertical cut, animated preview"></a>
+<br><sub>9:16 · 19 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/46-bresenham-line/?variant=vertical">open</a> · <a href="out/46-bresenham-line.vertical.png">still</a></sub>
+</td>
+</tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/47-contour-lines/"><img src="out/47-contour-lines.gif" width="100%" alt="Contour Lines — animated preview"></a>
+<br><b>47 · Contour Lines</b> <sub>27 s</sub>
+<br>Generative: seeded Perlin noise becomes terrain on a 240 × 135 grid of squares; marching squares traces one height (1,226 segments), then 23 of them (15,021 segments) over a shaded relief tint; then a sea rises from 0.08 to 0.62, its coastline traced every frame and the land flood-filled into islands: at most 10, at sea level 0.59.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/47-contour-lines/">open in browser</a> · <a href="out/47-contour-lines.png">still</a> · <a href="projects/47-contour-lines/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/47-contour-lines/?variant=vertical"><img src="out/47-contour-lines.vertical.gif" width="100%" alt="Contour Lines — vertical cut, animated preview"></a>
+<br><sub>9:16 · 19 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/47-contour-lines/?variant=vertical">open</a> · <a href="out/47-contour-lines.vertical.png">still</a></sub>
+</td>
+</tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/48-three-body-eight/"><img src="out/48-three-body-eight.gif" width="100%" alt="Three Bodies, One Eight — animated preview"></a>
+<br><b>48 · Three Bodies, One Eight</b> <sub>27 s</sub>
+<br>Three equal masses under Newton's gravity share one figure-eight path, each a third of a lap behind the next (to within 6.7e-8); the simulation measures one lap as 6.3259 time units and holds energy to a drift of 7.3e-12. A 1% kick to one body only makes the eight wobble (closest pass 0.691 before, 0.664 after); a 30% kick breaks it into a chaotic tangle with passes as close as 0.035. Each body's tone follows its own speed.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/48-three-body-eight/">open in browser</a> · <a href="out/48-three-body-eight.png">still</a> · <a href="projects/48-three-body-eight/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/48-three-body-eight/?variant=vertical"><img src="out/48-three-body-eight.vertical.gif" width="100%" alt="Three Bodies, One Eight — vertical cut, animated preview"></a>
+<br><sub>9:16 · 19 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/48-three-body-eight/?variant=vertical">open</a> · <a href="out/48-three-body-eight.vertical.png">still</a></sub>
+</td>
+</tr>
 </table>
 <!-- gallery:end -->
 
