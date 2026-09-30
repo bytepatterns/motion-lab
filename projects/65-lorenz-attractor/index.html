@@ -1,0 +1,700 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="author" content="teambytepatterns">
+<meta name="description" content="Generative: the Lorenz equations with σ = 10, ρ = 28, β = 8/3, integrated for real, draw a butterfly that circles one wing then the other in no set pattern, 18 loops and 9 switches in the first 14 time units; the tops of 437 loops, each plotted against the next, fall on one thin curve whose slopes of about +1.5 and −1.5 stretch every error, and a thousand points released in a box 0.001 wide spread over both wings.">
+<title>The Lorenz Butterfly — motion-lab</title>
+<style>
+  /* Player chrome. The piece itself lives entirely in the canvas. */
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  body { display: grid; place-items: center; font: 500 15px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #fff; }
+  canvas { display: block; width: min(100vw, calc(100vh * 16 / 9)); height: auto; aspect-ratio: 16 / 9; }
+  #sound { position: fixed; left: 16px; bottom: 16px; padding: 8px 14px; border: 1px solid rgba(255,255,255,.35); border-radius: 999px;
+           background: rgba(0,0,0,.55); color: #fff; font: inherit; cursor: pointer; }
+  #sound[hidden] { display: none; }
+</style>
+</head>
+<body>
+<canvas id="stage" width="1920" height="1080" aria-label="A glowing point traces a two-winged butterfly curve in three dimensions that slowly turns, a row of L and R squares logging which wing each loop went round; then the tops of the loops drop onto a chart where they form a thin peaked curve; then a tiny cluster of points smears out along the curve until it covers both wings"></canvas>
+<button id="sound" type="button">Click for sound</button>
+<script>
+'use strict';
+/* ==========================================================================
+   PIECE — The Lorenz Butterfly.
+   dx/dt = σ(y − x),  dy/dt = x(ρ − z) − y,  dz/dt = xy − βz,  with the
+   classic σ = 10, ρ = 28, β = 8/3, integrated with fourth-order Runge-Kutta
+   (step 0.002) from (1, 1, 1), after 45 time units so the point is already
+   on the attractor. Every loop has one top (a maximum of z); the side of
+   the loop (x < 0: L, x > 0: R) is logged. Lorenz's own discovery follows:
+   plotting each top z(n) against the next z(n + 1) gives one thin cusp, a
+   map whose slopes are steeper than 1 on both sides, so every error grows.
+   Last, a cube of points 0.001 wide is integrated side by side and its
+   width is measured as it spreads; the fitted growth rate is close to the
+   largest Lyapunov exponent. All of it is computed once at load; a frame
+   maps to a model time, so seek(i) is pure in i.
+   ========================================================================== */
+const W = 1920, H = 1080, FPS = 30;
+const cv = document.getElementById('stage');
+const ctx = cv.getContext('2d', { willReadFrequently: true });   // CPU raster: identical pixels on every redraw
+const FONT = 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
+const MONO = 'ui-monospace, "Cascadia Code", Consolas, Menlo, monospace';
+
+// ---- helpers -------------------------------------------------------------
+function mulberry32(a) { return function () { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a);
+  t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const lerp = (a, b, t) => a + (b - a) * t;
+const prog = (f, a, b) => clamp((f - a) / (b - a));
+const smooth = t => t * t * (3 - 2 * t);
+const E = {
+  inCubic: t => t * t * t,
+  outCubic: t => 1 - Math.pow(1 - t, 3),
+  inOutCubic: t => t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2,
+  outExpo: t => t === 1 ? 1 : 1 - Math.pow(2, -10 * t),
+  inExpo: t => t === 0 ? 0 : Math.pow(2, 10 * t - 10),
+  inOutExpo: t => t === 0 ? 0 : t === 1 ? 1 : t < .5 ? Math.pow(2, 20 * t - 10) / 2 : (2 - Math.pow(2, -20 * t + 10)) / 2,
+  outBack: t => 1 + 2.70158 * Math.pow(t - 1, 3) + 1.70158 * Math.pow(t - 1, 2),
+};
+/** Canvas text; `max` shrinks the size until the line fits. Returns the width drawn. */
+function text(g, str, x, y, { size = 40, weight = 600, color = '#fff', alpha = 1, spacing = 0, align = 'left', fam = FONT, base = 'alphabetic', max = 0 } = {}) {
+  if (alpha <= 0.002 || !str) return 0;
+  g.font = `${weight} ${size}px ${fam}`; g.letterSpacing = spacing + 'px';
+  if (max) { const w0 = g.measureText(str).width; if (w0 > max) { size *= max / w0; g.font = `${weight} ${size}px ${fam}`; } }
+  g.textAlign = align; g.textBaseline = base;
+  const a0 = g.globalAlpha; g.globalAlpha = a0 * alpha; g.fillStyle = color;
+  g.fillText(str, x, y);
+  const w = g.measureText(str).width;
+  g.globalAlpha = a0; g.letterSpacing = '0px';
+  return w;
+}
+const measure = (g, str, size, weight = 800, fam = FONT, spacing = 0) => { g.font = `${weight} ${size}px ${fam}`; g.letterSpacing = spacing + 'px'; const w = g.measureText(str).width; g.letterSpacing = '0px'; return w; };
+const env = (f, a, b, fin = 12, fout = 10) => {
+  const i = E.outCubic(prog(f, a, a + fin)), o = 1 - E.inCubic(prog(f, b - fout, b));
+  return [Math.min(i, o), (1 - i) * 24 - (1 - o) * 10];
+};
+
+
+// ---- palette -------------------------------------------------------------
+const C = {
+  bg: '#0B0D14', bgRGB: '11,13,20', paper: '#F1EEE6', paperRGB: '241,238,230', dim: 'rgba(241,238,230,0.62)', faint: 'rgba(241,238,230,0.16)',
+  accent: '#FFC857', accentRGB: '255,200,87', go: '#5CD6CB', goRGB: '92,214,203', node: '#151A28',
+};
+const WING = { L: C.go, R: C.accent }, WRGB = { L: C.goRGB, R: C.accentRGB };
+
+// ---- the system, the trajectory, the loop tops, the spreading cube --------------------------
+const SIG = 10, RHO = 28, BET = 8 / 3, DT = 0.002, BURN = 45, T1 = 14, T2 = 28, TLONG = 300;
+const kk = new Float64Array(12);
+function rk4(s, h) {
+  const x = s[0], y = s[1], z = s[2];
+  const d = (x, y, z, o) => { kk[o] = SIG * (y - x); kk[o + 1] = x * (RHO - z) - y; kk[o + 2] = x * y - BET * z; };
+  d(x, y, z, 0); d(x + h / 2 * kk[0], y + h / 2 * kk[1], z + h / 2 * kk[2], 3);
+  d(x + h / 2 * kk[3], y + h / 2 * kk[4], z + h / 2 * kk[5], 6); d(x + h * kk[6], y + h * kk[7], z + h * kk[8], 9);
+  s[0] = x + h / 6 * (kk[0] + 2 * kk[3] + 2 * kk[6] + kk[9]);
+  s[1] = y + h / 6 * (kk[1] + 2 * kk[4] + 2 * kk[7] + kk[10]);
+  s[2] = z + h / 6 * (kk[2] + 2 * kk[5] + 2 * kk[8] + kk[11]);
+}
+const NS = Math.round(T2 / DT) + 1;
+const TX = new Float32Array(NS), TY = new Float32Array(NS), TZ = new Float32Array(NS);
+const PK = [];                                          // loop tops: { i (sample), t, z, w: 'L' | 'R' }
+const END = new Float64Array(3);
+(function () {
+  const s = new Float64Array([1, 1, 1]);
+  for (let i = 0; i < BURN / DT; i++) rk4(s, DT);
+  let z1 = NaN, z2 = NaN, x1 = 0;
+  const total = Math.round((T2 + TLONG) / DT);
+  for (let i = 0; i <= total; i++) {
+    if (i < NS) { TX[i] = s[0]; TY[i] = s[1]; TZ[i] = s[2]; }
+    if (i === NS - 1) END.set(s);
+    if (z1 > z2 && z1 >= s[2]) PK.push({ i: i - 1, t: (i - 1) * DT, z: z1, w: x1 < 0 ? 'L' : 'R' });
+    z2 = z1; z1 = s[2]; x1 = s[0];
+    rk4(s, DT);
+  }
+})();
+const PK1 = PK.filter(p => p.t <= T1), PK2 = PK.filter(p => p.t <= T2);
+const runs = seq => { let sw = 0, best = 1, cur = 1; for (let k = 1; k < seq.length; k++) { if (seq[k].w !== seq[k - 1].w) { sw++; cur = 1; } else best = Math.max(best, ++cur); } return { sw, best }; };
+const R1 = runs(PK1), R2 = runs(PK2);
+// the return map: every top against the next
+const PAIRS = PK.slice(0, -1).map((p, k) => [p.z, PK[k + 1].z]);
+const NPK = PAIRS.length, NLIVE = PK2.length - 1;
+const ZMIN = Math.min(...PK.map(p => p.z)), ZMAX = Math.max(...PK.map(p => p.z));
+const CUSP = PAIRS.reduce((b, p) => p[1] > b[1] ? p : b, PAIRS[0])[0];
+function slope(a) { const n = a.length, mx = a.reduce((s, p) => s + p[0], 0) / n, my = a.reduce((s, p) => s + p[1], 0) / n; let sxy = 0, sxx = 0; for (const p of a) { sxy += (p[0] - mx) * (p[1] - my); sxx += (p[0] - mx) ** 2; } return sxy / sxx; }
+const SL = slope(PAIRS.filter(p => p[0] < CUSP - 0.5)), SR = slope(PAIRS.filter(p => p[0] > CUSP + 0.5));
+const STEEP = Math.abs(SL) > 1 && Math.abs(SR) > 1;
+const sgn = v => (v >= 0 ? '+' : '−') + Math.abs(v).toFixed(1);
+// the cube: NB points in a cube of side W0 around the trajectory's last point, integrated side by side
+const NB = 1000, W0 = 0.001, T3 = 12, CG = 240, CDT = 0.005;
+const CUBE = new Float32Array(NB * (CG + 1) * 3), WID = new Float64Array(CG + 1);
+(function () {
+  const R = mulberry32(0x65C0), S = [], s = new Float64Array(3);
+  for (let b = 0; b < NB; b++) S.push([END[0] + (R() - 0.5) * W0, END[1] + (R() - 0.5) * W0, END[2] + (R() - 0.5) * W0]);
+  const per = Math.round(T3 / CG / CDT);
+  for (let gI = 0; gI <= CG; gI++) {
+    let mn = [1e9, 1e9, 1e9], mx = [-1e9, -1e9, -1e9];
+    for (let b = 0; b < NB; b++) {
+      const p = S[b], o = (gI * NB + b) * 3;
+      CUBE[o] = p[0]; CUBE[o + 1] = p[1]; CUBE[o + 2] = p[2];
+      for (let a = 0; a < 3; a++) { mn[a] = Math.min(mn[a], p[a]); mx[a] = Math.max(mx[a], p[a]); }
+      if (gI < CG) { s[0] = p[0]; s[1] = p[1]; s[2] = p[2]; for (let q = 0; q < per; q++) rk4(s, CDT); p[0] = s[0]; p[1] = s[1]; p[2] = s[2]; }
+    }
+    WID[gI] = Math.max(mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2]);
+  }
+})();
+const WEND = WID[CG];
+// growth rate: a straight line through log(width) while the cube is still small
+const LAM = (function () {
+  const pts = []; for (let gI = 0; gI <= CG; gI++) if (WID[gI] > 0.003 && WID[gI] < 3) pts.push([gI / CG * T3, Math.log(WID[gI])]);
+  return slope(pts);
+})();
+const T_WIDE = (function () { for (let gI = 0; gI <= CG; gI++) if (WID[gI] >= 1) return gI / CG * T3; return T3; })();
+const fmtW = w => w < 0.0995 ? w.toFixed(Math.max(3, -Math.floor(Math.log10(w)) + 1)) : w < 9.95 ? w.toFixed(2) : w.toFixed(1);
+
+// ---- timeline -------------------------------------------------------------------------------
+function buildTL(o) {
+  const T = Object.assign({}, o);
+  T.m1 = T.a1 + T.map; T.fl0 = T.a1 + Math.round(T.map * 0.5); T.fl1 = T.fl0 + Math.round(T.map * 0.3);
+  T.c0 = T.m1 + T.gapC; T.c1 = T.c0 + T.cube; T.calm = T.c1 + T.hold; T.end = Math.round(T.calm + T.calmT);
+  T.caps = [
+    [T.g0, Math.round(T.a1 * 0.42) - 2, 'Three equations, no randomness:|the point never settles and never repeats.'],
+    [Math.round(T.a1 * 0.42), T.a1 - 2, `One wing, then the other, in no set pattern:|${PK1.length} loops and ${R1.sw} switches by t = ${T1}.`],
+    [T.a1, T.fl0 - 2, 'Mark the top of every loop and plot it|against the top of the next one.'],
+    [T.fl0, T.m1 - 2, `${NPK} tops fall on one thin curve; its slopes,|${sgn(SL)} and ${sgn(SR)}, ${STEEP ? 'stretch every error.' : 'decide the next top.'}`],
+    [T.c0, Math.round(T.c0 + T.cube * 0.5) - 2, `${fmt(NB)} points start in a box ${W0} wide.|Watch the box.`],
+    [Math.round(T.c0 + T.cube * 0.5), T.calm - 2, `About ×${Math.exp(LAM).toFixed(1)} wider per time unit: 1 wide by t = ${T_WIDE.toFixed(1)},|${fmtW(WEND)} wide by t = ${T3}, both wings covered.`],
+  ];
+  return T;
+}
+function fmt(n) { return Math.round(n).toLocaleString('en-US'); }
+/** Model time of the head at frame f (0..T2). */
+function simT(T, f) {
+  if (f <= T.a1) { const u = prog(f, T.g0, T.a1); return T1 * (0.4 * u + 0.6 * u * u); }
+  return T1 + (T2 - T1) * prog(f, T.a1, T.m1);
+}
+const cubeT = (T, f) => T3 * prog(f, T.c0, T.c1);
+
+// ---- camera ----------------------------------------------------------------------------------
+function cam(G, f) {
+  const th = -0.12 + 0.36 * Math.sin(2 * Math.PI * f / G.TL.end), ph = 0.3;           // sways and comes back: the loop is seamless
+  return { c: Math.cos(th), s: Math.sin(th), cp: Math.cos(ph), sp: Math.sin(ph), cx: G.cx, cy: G.cy, k: G.sc };
+}
+const PX = (P, x, y) => P.cx + P.k * (x * P.c - y * P.s);
+const PY = (P, x, y, z) => P.cy - P.k * ((z - 25) * P.cp + (x * P.s + y * P.c) * P.sp);
+
+// ---- drawing ------------------------------------------------------------------------------
+function trail(g, G, f, P) {
+  const T = G.TL, ts = simT(T, f), up = Math.min(NS - 1, Math.floor(ts / DT));
+  const fade = f < T.c0 - 10 ? 1 : 0.22 + 0.78 * (1 - E.inOutCubic(prog(f, T.c0 - 10, T.c0 + 16)));
+  const [a] = env(f, -30, T.end + 14, 1, 20);
+  if (up < 2 || a <= 0) return;
+  const ST = 3, CH = 30;
+  g.save(); g.lineCap = 'round'; g.lineJoin = 'round'; g.lineWidth = G.lw;
+  for (let s0 = 0; s0 < up; s0 += ST * CH) {
+    const s1 = Math.min(up, s0 + ST * CH), mid = (s0 + s1) >> 1, age = ts - s1 * DT;
+    const al = (0.2 + 0.8 * Math.exp(-age / 2.2)) * fade * a;
+    g.strokeStyle = `rgba(${TX[mid] < 0 ? C.goRGB : C.accentRGB},${al})`;
+    g.beginPath(); g.moveTo(PX(P, TX[s0], TY[s0]), PY(P, TX[s0], TY[s0], TZ[s0]));
+    for (let s = s0 + ST; s < s1; s += ST) g.lineTo(PX(P, TX[s], TY[s]), PY(P, TX[s], TY[s], TZ[s]));
+    g.lineTo(PX(P, TX[s1], TY[s1]), PY(P, TX[s1], TY[s1], TZ[s1]));
+    g.stroke();
+  }
+  g.restore();
+  // the head
+  if (f < T.c0) {
+    const hx = PX(P, TX[up], TY[up]), hy = PY(P, TX[up], TY[up], TZ[up]), ha = a * (1 - prog(f, T.c0 - 14, T.c0));
+    const gr = g.createRadialGradient(hx, hy, 0, hx, hy, 34);
+    gr.addColorStop(0, `rgba(255,255,255,${0.9 * ha})`); gr.addColorStop(0.25, `rgba(${TX[up] < 0 ? C.goRGB : C.accentRGB},${0.5 * ha})`); gr.addColorStop(1, 'rgba(0,0,0,0)');
+    g.fillStyle = gr; g.fillRect(hx - 34, hy - 34, 68, 68);
+    g.fillStyle = `rgba(255,255,255,${ha})`; g.beginPath(); g.arc(hx, hy, 5, 0, Math.PI * 2); g.fill();
+  }
+}
+/** Loop tops on the attractor during the map act, and their flight onto the chart. */
+function tops(g, G, f, P) {
+  const T = G.TL; if (f < T.a1 - 6 || f >= T.c0) return;
+  const ts = simT(T, f), a = E.outCubic(prog(f, T.a1 - 6, T.a1 + 8)) * (1 - prog(f, T.m1 - 6, T.c0));
+  const K = G.K;
+  for (let k = 0; k < PK2.length; k++) {
+    const p = PK2[k]; if (p.t > ts) break;
+    const x = PX(P, TX[p.i], TY[p.i]), y = PY(P, TX[p.i], TY[p.i], TZ[p.i]);
+    g.fillStyle = `rgba(${C.paperRGB},${0.75 * a})`; g.beginPath(); g.arc(x, y, 5, 0, Math.PI * 2); g.fill();
+    // the pair (k-1, k) flies to the chart when top k is reached
+    if (k > 0) {
+      const fk = frameOfT(T, p.t), m = E.inOutCubic(prog(f, fk, fk + 14));
+      if (m > 0 && m < 1) {
+        const [cx, cy] = chartXY(K, PK2[k - 1].z, p.z), bx = lerp(x, cx, m), by = lerp(y, cy, m) - Math.sin(Math.PI * m) * 60;
+        g.fillStyle = C.accent; g.beginPath(); g.arc(bx, by, 7, 0, Math.PI * 2); g.fill();
+      }
+    }
+  }
+}
+function frameOfT(T, t) { let lo = 0, hi = T.m1; for (let q = 0; q < 30; q++) { const mid = (lo + hi) / 2; if (simT(T, mid) < t) lo = mid; else hi = mid; } return hi; }
+const Z0 = Math.floor(ZMIN) - 1, Z1 = Math.ceil(ZMAX) + 1;
+function chartXY(K, zn, zn1) { return [K.x + (zn - Z0) / (Z1 - Z0) * K.w, K.y + K.h - (zn1 - Z0) / (Z1 - Z0) * K.h]; }
+function axes(g, K, a, xl, yl, xt, yt, xv, yv) {
+  g.save(); g.globalAlpha = a; g.strokeStyle = 'rgba(241,238,230,0.4)'; g.lineWidth = 1.5;
+  g.beginPath(); g.moveTo(K.x, K.y); g.lineTo(K.x, K.y + K.h); g.lineTo(K.x + K.w, K.y + K.h); g.stroke();
+  g.strokeStyle = C.faint; for (const v of yt) { const y = yv(v); g.beginPath(); g.moveTo(K.x, y); g.lineTo(K.x + K.w, y); g.stroke(); }
+  g.restore();
+  for (const v of yt) text(g, String(v), K.x - 12, yv(v) + 10, { size: 28, weight: 700, color: C.dim, align: 'right', fam: MONO, alpha: a });
+  for (const v of xt) text(g, String(v), xv(v), K.y + K.h + 36, { size: 28, weight: 700, color: C.dim, align: 'center', fam: MONO, alpha: a });
+  text(g, yl, K.x + 14, K.y + 28, { size: 28, weight: 800, color: C.paper, fam: MONO, alpha: a });
+  text(g, xl, K.x + K.w, K.y + K.h - 14, { size: 28, weight: 800, color: C.paper, align: 'right', fam: MONO, alpha: a });
+}
+function mapChart(g, G, f) {
+  const T = G.TL, K = G.K, [a] = env(f, T.a1, T.c0 + 4, 16, 14);
+  if (a <= 0) return;
+  const ticks = []; for (let v = Math.ceil(Z0 / 5) * 5; v <= Z1; v += 5) ticks.push(v);
+  axes(g, K, a, 'top n', 'top n+1', ticks, ticks, v => chartXY(K, v, Z0)[0], v => chartXY(K, Z0, v)[1]);
+  // the diagonal: where the next top would equal this one
+  g.save(); g.globalAlpha = a * 0.5; g.setLineDash([8, 10]); g.strokeStyle = C.faint; g.lineWidth = 2;
+  const d0 = chartXY(K, Z0, Z0), d1 = chartXY(K, Z1, Z1); g.beginPath(); g.moveTo(d0[0], d0[1]); g.lineTo(d1[0], d1[1]); g.stroke(); g.restore();
+  // the flood of later tops
+  const nf = Math.round((NPK - NLIVE) * E.inCubic(prog(f, T.fl0, T.fl1)));
+  g.save(); g.globalAlpha = a; g.fillStyle = `rgba(${C.paperRGB},0.75)`;
+  for (let k = NLIVE; k < NLIVE + nf; k++) { const [x, y] = chartXY(K, PAIRS[k][0], PAIRS[k][1]); g.fillRect(x - 3, y - 3, 6, 6); }
+  g.restore();
+  // the live tops (landed after their flight)
+  const ts = simT(T, f);
+  for (let k = 1; k < PK2.length; k++) {
+    if (PK2[k].t > ts) break;
+    const fk = frameOfT(T, PK2[k].t); if (f < fk + 14) continue;
+    const [x, y] = chartXY(K, PK2[k - 1].z, PK2[k].z), hot = 1 - prog(f, fk + 14, fk + 30);
+    g.save(); g.globalAlpha = a; g.fillStyle = C.accent; g.beginPath(); g.arc(x, y, 7 + 5 * hot, 0, Math.PI * 2); g.fill(); g.restore();
+  }
+  const shown = Math.min(NPK, (function () { let n = 0; for (let k = 1; k < PK2.length; k++) if (PK2[k].t <= ts && f >= frameOfT(T, PK2[k].t) + 14) n++; return n; })() + nf);
+  text(g, `${shown} ${shown === 1 ? 'pair' : 'pairs'}`, K.x + K.w, K.y + 28, { size: 30, weight: 850, color: C.accent, align: 'right', fam: MONO, alpha: a });
+}
+function cubeView(g, G, f, P) {
+  const T = G.TL; if (f < T.c0 - 4) return;
+  const [a] = env(f, T.c0 - 4, T.end + 14, 10, 20);
+  const u = cubeT(T, f) / T3 * CG, i0 = Math.min(CG - 1, Math.floor(u)), fr = u - i0;
+  g.save(); g.globalAlpha = a;
+  for (let b = 0; b < NB; b++) {
+    const o0 = (i0 * NB + b) * 3, o1 = o0 + NB * 3;
+    const x = lerp(CUBE[o0], CUBE[o1], fr), y = lerp(CUBE[o0 + 1], CUBE[o1 + 1], fr), z = lerp(CUBE[o0 + 2], CUBE[o1 + 2], fr);
+    g.fillStyle = x < 0 ? C.go : C.accent;
+    g.fillRect(PX(P, x, y) - 2, PY(P, x, y, z) - 2, 4, 4);
+  }
+  g.restore();
+  // the width chart, on a log scale
+  const K = G.K, [ka] = env(f, T.c0, T.end + 14, 16, 20);
+  if (ka <= 0) return;
+  const L0 = -3, L1 = 3, xv = t => K.x + t / T3 * K.w, yv = l => K.y + K.h - (l - L0) / (L1 - L0) * K.h;
+  axes(g, K, ka, 'time', 'width', [0, 3, 6, 9, 12], [0.001, 0.01, 0.1, 1, 10, 100, 1000], xv, v => yv(Math.log10(v)));
+  const tc = cubeT(T, f), n = Math.min(CG, Math.floor(tc / T3 * CG));
+  // the fitted growth line
+  const lk = E.outCubic(prog(f, T.c0 + T.cube * 0.5, T.c0 + T.cube * 0.5 + 16)) * ka;
+  if (lk > 0) {
+    const b = Math.log10(W0), t1 = (Math.log10(1000) - b) / (LAM / Math.LN10);
+    g.save(); g.globalAlpha = lk * 0.8; g.setLineDash([10, 10]); g.strokeStyle = C.go; g.lineWidth = 2.5;
+    g.beginPath(); g.moveTo(xv(0), yv(b)); g.lineTo(xv(Math.min(T3, t1)), yv(b + LAM / Math.LN10 * Math.min(T3, t1))); g.stroke(); g.restore();
+  }
+  g.save(); g.globalAlpha = ka; g.strokeStyle = C.accent; g.lineWidth = 4.5; g.lineJoin = 'round'; g.beginPath();
+  for (let q = 0; q <= n; q++) { const x = xv(q / CG * T3), y = yv(Math.log10(WID[q])); q ? g.lineTo(x, y) : g.moveTo(x, y); }
+  g.stroke(); g.restore();
+  const wn = WID[n];
+  text(g, `width ${fmtW(wn)}`, K.x + K.w, K.y + 28, { size: 32, weight: 850, color: C.accent, align: 'right', fam: MONO, alpha: ka });
+}
+function equations(g, G, f) {
+  const T = G.TL, [a] = env(f, T.g0 + 20, T.a1 + 4, 16, 14);
+  if (a <= 0) return;
+  const Q = G.Q, lines = ['dx/dt = σ(y − x)', 'dy/dt = x(ρ − z) − y', 'dz/dt = xy − βz'];
+  lines.forEach((s, k) => { const ka = a * E.outCubic(prog(f, T.g0 + 20 + k * 6, T.g0 + 36 + k * 6)); text(g, s, Q.x, Q.y + k * Q.lh + (1 - ka) * 16, { size: Q.size, weight: 700, color: C.paper, fam: MONO, alpha: ka }); });
+  text(g, 'σ = 10   ρ = 28   β = 8/3', Q.x, Q.y + 3 * Q.lh + 6, { size: Q.size * 0.8, weight: 700, color: C.dim, fam: MONO, alpha: a * E.outCubic(prog(f, T.g0 + 40, T.g0 + 56)) });
+  const ts = simT(T, f), up = Math.min(NS - 1, Math.floor(ts / DT)), w = TX[up] < 0 ? 'L' : 'R';
+  const sa = a * E.outCubic(prog(f, T.g0 + 50, T.g0 + 66));
+  text(g, `t = ${ts.toFixed(2)}`, Q.x, Q.sy, { size: Q.size, weight: 800, color: C.paper, fam: MONO, alpha: sa });
+  const ww = text(g, 'wing ', Q.x + Q.wx, Q.sy, { size: Q.size, weight: 800, color: C.dim, fam: MONO, alpha: sa });
+  text(g, w, Q.x + Q.wx + ww, Q.sy, { size: Q.size, weight: 900, color: WING[w], fam: MONO, alpha: sa });
+}
+function ribbon(g, G, f) {
+  const T = G.TL, B = G.Rb, [a] = env(f, T.g0 + 30, T.c0 + 4, 12, 12);
+  if (a <= 0) return;
+  const ts = simT(T, f), n = PK2.filter(p => p.t <= ts).length, off = Math.max(0, n - B.max);
+  for (let k = off; k < n; k++) {
+    const p = PK2[k], fk = frameOfT(T, p.t), ka = a * E.outBack(prog(f, fk, fk + 10));
+    const x = B.x + (k - off) * (B.cw + B.gap);
+    g.save(); g.globalAlpha = clamp(ka); g.fillStyle = WING[p.w]; g.beginPath(); g.roundRect(x, B.y, B.cw, B.ch, 6); g.fill(); g.restore();
+    text(g, p.w, x + B.cw / 2, B.y + B.ch / 2 + 2, { size: 28, weight: 900, color: C.bg, align: 'center', base: 'middle', fam: MONO, alpha: clamp(ka) });
+  }
+}
+function caption(g, G, f) {
+  for (const [t0, t1, str] of G.TL.caps) {
+    const [a, dy] = env(f, t0, t1, 10, 8); if (a <= 0) continue;
+    const [p1, p2] = str.split('|');
+    if (G.capTwo) {
+      text(g, p1, G.capX, G.capY + dy, { size: G.cap, weight: 850, color: C.paper, spacing: -1, alpha: a, max: G.capMax });
+      text(g, p2, G.capX, G.capY + G.cap * 1.14 + dy, { size: G.cap, weight: 850, color: C.accent, spacing: -1, alpha: a, max: G.capMax });
+    } else {
+      const w1 = measure(g, p1 + ' ', G.cap, 850, FONT, -1), w2 = measure(g, p2, G.cap, 850, FONT, -1), sc = Math.min(1, G.capMax / (w1 + w2));
+      const w = text(g, p1 + ' ', G.capX, G.capY + dy, { size: G.cap * sc, weight: 850, color: C.paper, spacing: -1, alpha: a });
+      text(g, p2, G.capX + w, G.capY + dy, { size: G.cap * sc, weight: 850, color: C.accent, spacing: -1, alpha: a });
+    }
+  }
+}
+function readout(g, G, f) {
+  const T = G.TL, [a] = env(f, T.g0 + 30, T.calm, 12, 10);
+  if (a <= 0) return;
+  const ts = simT(T, f), seen = PK2.filter(p => p.t <= ts), r = runs(seen);
+  const s1 = f < T.c0 ? `loops ${seen.length}  ·  switches ${r.sw}  ·  longest run ${seen.length ? r.best : 0}` : `${fmt(NB)} points  ·  width ${fmtW(WID[Math.min(CG, Math.floor(cubeT(T, f) / T3 * CG))])}${G.foY2 ? '' : '  ·  t = ' + cubeT(T, f).toFixed(1)}`;
+  text(g, s1, G.foX, G.foY, { size: G.fo, weight: 700, color: C.paper, fam: MONO, alpha: a, align: G.foAlign });
+  if (G.foY2) text(g, `RK4, step ${DT}  ·  t = ${(f < T.c0 ? ts : cubeT(T, f)).toFixed(2)}`, G.foX2, G.foY2, { size: G.fo, weight: 700, color: C.dim, fam: MONO, alpha: a, align: G.foAlign2 });
+}
+function finale(g, G, f) {
+  const T = G.TL, k1 = E.outCubic(prog(f, T.calm, T.calm + 18)), k2 = E.outCubic(prog(f, T.calm + 10, T.calm + 28));
+  if (k1 <= 0) return;
+  const out = 1 - E.inCubic(prog(f, T.end - 6, T.end + 12));
+  g.save(); g.fillStyle = `rgba(${C.bgRGB},${0.86 * k1 * out})`; g.fillRect(0, G.fnY - G.fn * 1.2, G.w, G.fn * (G.fnTwo ? 3.9 : 2.9)); g.restore();
+  text(g, 'Determined. Never repeated.', G.fnX, G.fnY, { size: G.fn, weight: 900, color: C.paper, spacing: -2, align: G.fnAlign, alpha: k1 * out, max: G.fnMax });
+  if (G.fnTwo) {
+    text(g, `${NPK} tops on one curve;`, G.fnX, G.fnY + G.fn * 1.05, { size: G.fn * 0.55, weight: 850, color: C.accent, spacing: -1, align: G.fnAlign, alpha: k2 * out, max: G.fnMax });
+    text(g, `a ${W0} box grows ${fmtW(WEND)} wide.`, G.fnX, G.fnY + G.fn * 1.75, { size: G.fn * 0.55, weight: 850, color: C.accent, spacing: -1, align: G.fnAlign, alpha: k2 * out, max: G.fnMax });
+  } else text(g, `${NPK} tops on one curve  ·  a ${W0} box grows ${fmtW(WEND)} wide`, G.fnX, G.fnY + G.fn * 1.05, { size: G.fn * 0.5, weight: 850, color: C.accent, spacing: -1, align: G.fnAlign, alpha: k2 * out, max: G.fnMax });
+}
+function scene(g, G, f) {
+  const P = cam(G, f);
+  trail(g, G, f, P); tops(g, G, f, P); cubeView(g, G, f, P);
+  equations(g, G, f); mapChart(g, G, f); ribbon(g, G, f);
+  caption(g, G, f); readout(g, G, f); finale(g, G, f);
+}
+
+// ---- landscape picture ------------------------------------------------------------------
+const TLL = buildTL({ g0: 0, a1: 300, map: 220, gapC: 10, cube: 156, hold: 14, calmT: 29 });
+const FRAMES = TLL.end + 72;
+const GL = { TL: TLL, w: W, h: H, cx: 640, cy: 585, sc: 13.5, lw: 2.2,
+  Q: { x: 1150, y: 390, lh: 62, size: 40, sy: 700, wx: 330 },
+  K: { x: 1210, y: 330, w: 570, h: 470 },
+  Rb: { x: 120, y: 890, cw: 34, ch: 44, gap: 5, max: 42 },
+  capX: 120, capY: 216, cap: 50, capTwo: false, capMax: 1680,
+  fo: 30, foX: 120, foY: 1012, foAlign: 'left', foX2: 1800, foY2: 1012, foAlign2: 'right',
+  fn: 100, fnX: W / 2, fnY: 600, fnAlign: 'center', fnMax: 1680 };
+function hookL(f) {
+  const o = 1 - E.inCubic(prog(f, 26, 44));
+  if (o <= 0) return;
+  const k = E.outExpo(prog(f, -8, 10)), k2 = E.outBack(prog(f, -6, 12));
+  ctx.save(); ctx.fillStyle = `rgba(${C.bgRGB},${0.8 * o})`; ctx.fillRect(0, 400, W, 330); ctx.restore();
+  text(ctx, 'Three equations.', W / 2, 540 + (1 - k) * 30, { size: 108, weight: 900, color: C.paper, spacing: -3, align: 'center', alpha: o * Math.max(0.3, k), max: 1700 });
+  text(ctx, 'It never repeats.', W / 2, 670 + (1 - clamp(k2)) * 30, { size: 108, weight: 900, color: C.accent, spacing: -3, align: 'center', alpha: o * Math.max(0.3, clamp(k2)) });
+}
+function draw(f) {
+  if (ctx.reset) ctx.reset();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; ctx.filter = 'none'; ctx.shadowBlur = 0;
+  ctx.fillStyle = C.bg; ctx.fillRect(0, 0, W, H);
+  const T = TLL, endK = E.inOutCubic(prog(f, T.end, T.end + 20)), a = 1 - endK;
+  scene(ctx, GL, f);
+  text(ctx, 'GENERATIVE  ·  STRANGE ATTRACTOR', 120, 104, { size: 26, weight: 600, color: C.dim, spacing: 5, alpha: a });
+  text(ctx, 'BYTEPATTERNS', 1800, 104, { size: 26, weight: 600, color: C.dim, spacing: 5, align: 'right', alpha: a });
+  hookL(f);
+  if (endK > 0) {
+    ctx.fillStyle = `rgba(${C.bgRGB},${0.86 * endK})`; ctx.fillRect(0, 0, W, H);
+    const k1 = E.outCubic(prog(f, T.end + 6, T.end + 28)), k2 = E.outCubic(prog(f, T.end + 16, T.end + 38)), k3 = E.outCubic(prog(f, T.end + 26, T.end + 48));
+    text(ctx, 'The Lorenz Butterfly', W / 2, 500 + (1 - k1) * 30, { size: 112, weight: 850, color: C.paper, spacing: -3, align: 'center', alpha: k1, max: 1680 });
+    text(ctx, `σ = 10, ρ = 28, β = 8/3  ·  ${PK1.length} loops, ${R1.sw} switches  ·  ${NPK} tops on one curve  ·  ${W0} → ${fmtW(WEND)}`, W / 2, 580 + (1 - k2) * 20, { size: 42, weight: 500, color: C.accent, align: 'center', alpha: k2, max: 1680 });
+    text(ctx, 'drawn in code  ·  bytepatterns.com', W / 2, 1000, { size: 32, weight: 600, color: C.paper, spacing: 3, align: 'center', alpha: k3 * 0.8 });
+  }
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.letterSpacing = '0px';
+}
+
+// ---- sound: a hum that follows the height, a pluck per loop (low for L, high for R), a rush as the box spreads ----
+async function renderAudio(TL = TLL, frames = FRAMES) {
+  const SR = 48000, dur = frames / FPS, LEN = Math.round(SR * dur);
+  const ac = new OfflineAudioContext(2, LEN, SR);
+  const at = fr => fr / FPS;
+  const comp = ac.createDynamicsCompressor();
+  comp.threshold.value = -16; comp.ratio.value = 3; comp.attack.value = 0.005; comp.release.value = 0.25;
+  const master = ac.createGain(); master.gain.value = 0.9; master.connect(comp).connect(ac.destination);
+  master.gain.setValueAtTime(0.9, dur - 1.0); master.gain.linearRampToValueAtTime(0.0001, dur - 0.02);
+  const rnd = mulberry32(0x65AD);
+  const ir = ac.createBuffer(2, SR * 2, SR);
+  for (let c = 0; c < 2; c++) { const d = ir.getChannelData(c); for (let k = 0; k < d.length; k++) d[k] = (rnd() * 2 - 1) * Math.pow(1 - k / d.length, 3); }
+  const verb = ac.createConvolver(); verb.buffer = ir; const vg = ac.createGain(); vg.gain.value = 0.3; verb.connect(vg).connect(master);
+  const hz = m => 440 * Math.pow(2, (m - 69) / 12);
+  const pluck = (t0, m, amp, pan, dec = 0.35, type = 'triangle') => {
+    const o = ac.createOscillator(), g = ac.createGain(), p = ac.createStereoPanner(); o.type = type; o.frequency.value = hz(m);
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(amp, t0 + 0.004); g.gain.exponentialRampToValueAtTime(0.0001, t0 + dec);
+    p.pan.value = pan; o.connect(g).connect(p); p.connect(master); p.connect(verb); o.start(t0); o.stop(t0 + dec + 0.05);
+  };
+  const pad = (t0, t1, notes, amp, cutoff) => {
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = cutoff; lp.Q.value = 1; lp.connect(master); lp.connect(verb);
+    notes.forEach((m, i) => { for (const det of [-6, 6]) {
+      const o = ac.createOscillator(), g = ac.createGain(), p = ac.createStereoPanner(); o.type = 'sawtooth'; o.frequency.value = hz(m); o.detune.value = det;
+      p.pan.value = (i / Math.max(1, notes.length - 1) - 0.5) * 0.8 * Math.sign(det);
+      g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(amp, t0 + 0.8); g.gain.setValueAtTime(amp, Math.max(t0 + 0.8, t1 - 0.6)); g.gain.exponentialRampToValueAtTime(0.0001, t1 + 0.4);
+      o.connect(g).connect(p).connect(lp); o.start(t0); o.stop(t1 + 0.45); } });
+  };
+  pad(0, at(TL.a1 + 4), [38, 45, 50, 53, 57], 0.010, 800);
+  pad(at(TL.a1), at(TL.c0 + 4), [41, 48, 53, 57, 60], 0.010, 1000);
+  pad(at(TL.c0), at(TL.end + 50), [36, 43, 48, 52, 55], 0.011, 1100);
+  // the hum: pitch from the height z, pan from x
+  const hum = ac.createOscillator(), hg = ac.createGain(), hp = ac.createStereoPanner(), hl = ac.createBiquadFilter();
+  hum.type = 'triangle'; hl.type = 'lowpass'; hl.frequency.value = 900;
+  hg.gain.setValueAtTime(0.0001, 0); hg.gain.exponentialRampToValueAtTime(0.03, 0.8);
+  hg.gain.setValueAtTime(0.03, at(TL.c0 - 10)); hg.gain.exponentialRampToValueAtTime(0.0001, at(TL.c0 + 10));
+  for (let f = 0; f <= TL.c0 + 10; f++) {
+    const s = Math.min(NS - 1, Math.floor(simT(TL, f) / DT));
+    hum.frequency.setTargetAtTime(110 * Math.pow(2, (TZ[s] - 25) / 30), at(f), 0.03);
+    hp.pan.setTargetAtTime(clamp(TX[s] / 20, -0.9, 0.9), at(f), 0.05);
+  }
+  hum.connect(hl).connect(hg).connect(hp); hp.connect(master); hp.connect(verb); hum.start(0); hum.stop(at(TL.c0 + 12));
+  // a pluck per loop
+  for (const p of PK2) pluck(at(frameOfT(TL, p.t)), p.w === 'L' ? 57 : 64, 0.05, p.w === 'L' ? -0.5 : 0.5, 0.6);
+  // the tops landing on the chart, then the flood
+  for (let k = 1; k < PK2.length; k++) if (PK2[k].t >= T1) pluck(at(frameOfT(TL, PK2[k].t) + 14), 72 + Math.round((PK2[k].z - 30) / 1.5), 0.03, 0.4, 0.3, 'sine');
+  let last = -1;
+  for (let f = TL.fl0; f <= TL.fl1; f++) {
+    const nf = Math.round((NPK - NLIVE) * E.inCubic(prog(f, TL.fl0, TL.fl1)));
+    if (nf > last && f % 2 === 0) { const k = Math.min(NPK - 1, NLIVE + nf); pluck(at(f), 76 + Math.round((PAIRS[k][1] - 30) / 1.5), 0.016, (rnd() - 0.5), 0.15, 'sine'); last = nf; }
+  }
+  // the box spreading: filtered noise that opens with the width
+  const nb = ac.createBuffer(1, SR * 2, SR), nd = nb.getChannelData(0); for (let k = 0; k < nd.length; k++) nd[k] = rnd() * 2 - 1;
+  const ns = ac.createBufferSource(), nf2 = ac.createBiquadFilter(), ng = ac.createGain(); ns.buffer = nb; ns.loop = true;
+  nf2.type = 'bandpass'; nf2.Q.value = 2; ng.gain.value = 0;
+  for (let f = TL.c0; f <= TL.c1; f++) {
+    const w = WID[Math.min(CG, Math.floor(cubeT(TL, f) / T3 * CG))], l = clamp((Math.log10(w) + 3) / 5);
+    nf2.frequency.setTargetAtTime(200 + 2400 * l, at(f), 0.05); ng.gain.setTargetAtTime(0.004 + 0.05 * l * l, at(f), 0.05);
+  }
+  ng.gain.setTargetAtTime(0.0001, at(TL.c1 + 6), 0.3);
+  ns.connect(nf2).connect(ng); ng.connect(master); ng.connect(verb); ns.start(at(TL.c0)); ns.stop(at(TL.calm + 30));
+  [0, 7, 12, 16].forEach((m, i) => pluck(at(TL.c0) + i * 0.02, 48 + m, 0.03, 0, 1.2, 'sine'));
+  [60, 64, 67, 72].forEach((m, i) => pluck(at(TL.calm) + i * 0.09, m, 0.05, -0.3 + i * 0.2, 1.6, 'sine'));
+  [76, 81, 84, 88].forEach((m, i) => pluck(at(TL.end + 10 + i * 6), m, 0.05, -0.45 + i * 0.3, 1.8, 'sine'));
+  const buf = await ac.startRendering();
+  let peak = 0; for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let k = 0; k < d.length; k++) peak = Math.max(peak, Math.abs(d[k])); }
+  const norm = 0.85 / Math.max(peak, 1e-6);                          // every piece peaks at the same level
+  for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let k = 0; k < d.length; k++) d[k] *= norm; }
+  return buf;
+}
+
+/* ==========================================================================
+   VERTICAL CUT — shared block, identical in every piece.
+   1080x1920 for Reels, Shorts and TikTok (__motion.variants.vertical). The
+   piece's own scene code is re-used and recomposed for a phone: everything a
+   viewer must read stays inside the area no platform covers (x 60..900,
+   y 230..1400); outside it there is only dimmed texture.
+   ========================================================================== */
+const VW = 1080, VH = 1920, SAFE = { x: 60, y: 230, w: 840, h: 1170, r: 900, b: 1400 };
+const vcv = document.createElement('canvas'); vcv.width = VW; vcv.height = VH;
+const vx = vcv.getContext('2d', { willReadFrequently: true });   // CPU raster: identical pixels on every redraw
+const VL = 96, VR = 864;                                          // text column inside the safe area
+
+function vReset() {
+  vx.setTransform(1, 0, 0, 1, 0, 0); vx.globalAlpha = 1; vx.globalCompositeOperation = 'source-over';
+  vx.filter = 'none'; vx.shadowBlur = 0; vx.shadowColor = 'transparent'; vx.letterSpacing = '0px'; vx.setLineDash([]);
+  vx.textAlign = 'left'; vx.textBaseline = 'alphabetic'; vx.lineCap = 'butt'; vx.lineJoin = 'miter';
+}
+/** Canvas text on the vertical frame; `max` shrinks the size until the line fits. */
+function vText(str, x, y, { size = 40, weight = 700, color = '#FFFFFF', align = 'left', spacing = 0, alpha = 1, fam = FONT, max = 0 } = {}) {
+  if (alpha <= 0.002 || !str) return size;
+  vx.font = `${weight} ${size}px ${fam}`; vx.letterSpacing = spacing + 'px';
+  if (max) { const w = vx.measureText(str).width; if (w > max) { size = size * max / w; vx.font = `${weight} ${size}px ${fam}`; } }
+  vx.textAlign = align; vx.textBaseline = 'alphabetic';
+  const a0 = vx.globalAlpha; vx.globalAlpha = a0 * alpha; vx.fillStyle = color;
+  vx.fillText(str, x + (align === 'center' ? spacing / 2 : align === 'right' ? spacing : 0), y);   // tracking is added after the last glyph too
+  vx.globalAlpha = a0; vx.letterSpacing = '0px';
+  return size;
+}
+/** Word-wraps with the given font; returns the lines. */
+function vWrap(str, maxW, size, weight = 700, fam = FONT) {
+  vx.font = `${weight} ${size}px ${fam}`; vx.letterSpacing = '0px';
+  const words = str.split(' '), lines = []; let cur = '';
+  for (const w of words) { const t = cur ? cur + ' ' + w : w; if (vx.measureText(t).width > maxW && cur) { lines.push(cur); cur = w; } else cur = t; }
+  if (cur) lines.push(cur);
+  return lines;
+}
+/** Fade envelope with a small rise: [alpha, dy]. */
+function vEnv(v, a, b, fin = 8, fout = 8) {
+  const i = E.outCubic(prog(v, a, a + fin)), o = 1 - E.inCubic(prog(v, b - fout, b));
+  return [Math.min(i, o), (1 - i) * 22 - (1 - o) * 10];
+}
+/** Which segment of a cut list a vertical frame is in: segs = [{ at, src, len }] in frames. */
+function vSeg(segs, v) {
+  let k = 0; while (k < segs.length - 1 && v >= segs[k + 1].at) k++;
+  const s = segs[k];
+  return { k, s, local: v - s.at, src: s.src + (v - s.at) };
+}
+/** Dims everything outside the safe area to a quiet texture (brightness x 0.2), with a soft inner edge. */
+function vShade(rgb, a = 0.8, feather = 40) {
+  vx.save(); vx.setTransform(1, 0, 0, 1, 0, 0); vx.globalAlpha = 1; vx.globalCompositeOperation = 'source-over';
+  vx.fillStyle = `rgba(${rgb},${a})`;
+  vx.beginPath(); vx.rect(0, 0, VW, VH); vx.rect(SAFE.x, SAFE.y, SAFE.w, SAFE.h); vx.fill('evenodd');
+  const strip = (x0, y0, x1, y1, rx, ry, rw, rh) => {
+    const g = vx.createLinearGradient(x0, y0, x1, y1);
+    g.addColorStop(0, `rgba(${rgb},${a})`); g.addColorStop(1, `rgba(${rgb},0)`);
+    vx.fillStyle = g; vx.fillRect(rx, ry, rw, rh);
+  };
+  strip(SAFE.x, 0, SAFE.x + feather, 0, SAFE.x, SAFE.y, feather, SAFE.h);
+  strip(SAFE.r, 0, SAFE.r - feather, 0, SAFE.r - feather, SAFE.y, feather, SAFE.h);
+  strip(0, SAFE.y, 0, SAFE.y + feather, SAFE.x, SAFE.y, SAFE.w, feather);
+  strip(0, SAFE.b, 0, SAFE.b - feather, SAFE.x, SAFE.b - feather, SAFE.w, feather);
+  vx.restore();
+}
+/** Series tag at the top of the safe area, e.g. MADE IN CODE · 04. */
+function vTag(label, color, alpha = 1) {
+  vText('MADE IN CODE', VL, 292, { size: 28, weight: 800, color, spacing: 5, alpha });
+  vx.font = `800 28px ${FONT}`; vx.letterSpacing = '5px';
+  const w = vx.measureText('MADE IN CODE').width; vx.letterSpacing = '0px';
+  vText('·  ' + label, VL + w + 14, 292, { size: 28, weight: 600, color: 'rgba(255,255,255,0.72)', spacing: 3, alpha, max: VR - VL - w - 14 });
+}
+/** Big hook lines, left-aligned from y0; visible from frame 0, settles in a few frames. */
+function vHook(v, lines, y0, { size = 84, lh = 1.08, color = '#FFFFFF', accent = null, weight = 800, spacing = -1.5, alpha = 1 } = {}) {
+  const k = E.outExpo(prog(v, -6, 12));
+  lines.forEach((ln, i) => {
+    const kk = E.outExpo(prog(v, -12 + i * 2, 8 + i * 2));
+    vText(ln, VL, y0 + i * size * lh + (1 - kk) * 30, { size, weight, spacing, color: accent && i === lines.length - 1 ? accent : color, alpha: alpha * Math.max(0.25, kk), max: VR - VL });
+  });
+  return k;
+}
+/** Closing card, the last 60 frames: piece title, "drawn in code · bytepatterns.com". l = frames into the card. */
+function vEndCard(l, { title, line = '', ink = '#FFFFFF', dim = 'rgba(255,255,255,0.66)', accent = '#FFFFFF', scrim = '0,0,0', a = 0.84 }) {
+  const k = E.outCubic(prog(l, 0, 12));
+  vx.save(); vx.setTransform(1, 0, 0, 1, 0, 0);
+  vx.fillStyle = `rgba(${scrim},${a * k})`; vx.fillRect(0, 0, VW, VH);
+  vx.restore();
+  const t1 = E.outExpo(prog(l, 3, 19)), t2 = E.outExpo(prog(l, 11, 27)), t3 = E.outExpo(prog(l, 19, 35));
+  vx.fillStyle = accent; vx.globalAlpha = t1; vx.fillRect(VL, 742, 88 * t1, 7); vx.globalAlpha = 1;
+  const size = vText(title, VL, 850 + (1 - t1) * 40, { size: 92, weight: 800, color: ink, spacing: -2, alpha: t1, max: VR - VL });
+  const y2 = 850 + Math.max(size, 60) * 0.25 + 70;
+  vx.font = `600 44px ${FONT}`;
+  const lead = 'drawn in code  ·  ', lw = vx.measureText(lead).width;
+  vText(lead, VL, y2 + (1 - t2) * 24, { size: 44, weight: 600, color: dim, alpha: t2 });
+  vText('bytepatterns.com', VL + lw, y2 + (1 - t2) * 24, { size: 44, weight: 800, color: accent, alpha: t2 });
+  if (line) vText(line, VL, y2 + 72 + (1 - t3) * 18, { size: 32, weight: 500, color: dim, alpha: t3, max: VR - VL });
+}
+/** Seeks a cut. The first frame a page draws is drawn twice: the very first read of a
+ *  GPU-backed source canvas can come out a shade different from every later one. */
+let vWarm = false;
+function vSeek(draw, i, frames) {
+  const f = Math.max(0, Math.min(frames - 1, Math.floor(i)));
+  if (!vWarm) { vWarm = true; draw(f); }
+  draw(f);
+}
+/** The soundtrack of a cut: the piece's own audio() spliced to the same segments as the picture. */
+async function vAudio(segs, frames, { xf = 0.025, fadeOut = 0.6, extra = null } = {}) {
+  const src = await renderAudio();
+  const SR = 48000, dur = frames / FPS, ac = new OfflineAudioContext(2, Math.round(SR * dur), SR);
+  const out = ac.createGain(); out.connect(ac.destination);
+  out.gain.setValueAtTime(1, 0); out.gain.setValueAtTime(1, dur - fadeOut); out.gain.linearRampToValueAtTime(0, dur - 0.01);
+  segs.forEach((s, k) => {
+    const at = s.at / FPS, off = s.src / FPS, d = s.len / FPS;
+    const pre = k === 0 ? 0 : Math.min(xf, off), post = k === segs.length - 1 ? 0 : xf;
+    const b = ac.createBufferSource(), g = ac.createGain(); b.buffer = src;
+    g.gain.setValueAtTime(pre ? 0 : 1, at - pre);
+    if (pre) g.gain.linearRampToValueAtTime(1, at + pre);
+    if (post) { g.gain.setValueAtTime(1, at + d - post); g.gain.linearRampToValueAtTime(0, at + d + post); }
+    b.connect(g).connect(out); b.start(at - pre, off - pre, d + pre + post);
+  });
+  if (extra) extra(ac, out);
+  const buf = await ac.startRendering();
+  let peak = 0; for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) peak = Math.max(peak, Math.abs(d[i])); }
+  if (peak > 0.9) for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) d[i] *= 0.9 / peak; }
+  return buf;
+}
+/** A soft three-partial bell, for the closing card. */
+function vChime(ac, dest, at, freq, vol = 0.08) {
+  for (const [mul, v, dec] of [[1, 1, 1.8], [2.01, 0.35, 0.8], [3.02, 0.12, 0.4]]) {
+    const o = ac.createOscillator(), g = ac.createGain(); o.type = 'sine'; o.frequency.value = freq * mul;
+    g.gain.setValueAtTime(0.0001, at); g.gain.exponentialRampToValueAtTime(vol * v, at + 0.006); g.gain.exponentialRampToValueAtTime(0.0001, at + dec);
+    o.connect(g).connect(dest); o.start(at); o.stop(at + dec + 0.05);
+  }
+}
+
+/* VERTICAL CUT — this piece */
+// The same model times on a 1080 x 1920 stage and a faster clock: the butterfly above, the panel below.
+const TLV = buildTL({ g0: 0, a1: 200, map: 156, gapC: 8, cube: 120, hold: 10, calmT: 24 });
+const VFR = TLV.end + 60, VEND = VFR - 60;
+const GV = { TL: TLV, w: VW, h: VH, cx: 480, cy: 705, sc: 9.6, lw: 2,
+  Q: { x: VL, y: 1000, lh: 50, size: 34, sy: 1250, wx: 290 },
+  K: { x: VL + 130, y: 972, w: VR - VL - 150, h: 250 },
+  Rb: { x: VL, y: 1296, cw: 30, ch: 40, gap: 4, max: 22 },
+  capX: VL, capY: 390, cap: 42, capTwo: true, capMax: VR - VL,
+  fo: 28, foX: VL, foY: 1390, foAlign: 'left', foX2: 0, foY2: 0,
+  fn: 76, fnX: VL, fnY: 760, fnAlign: 'left', fnMax: VR - VL, fnTwo: true };
+function hookV(v) {
+  const o = 1 - E.inCubic(prog(v, 22, 36));
+  if (o <= 0) return;
+  vx.save(); vx.fillStyle = `rgba(${C.bgRGB},${0.86 * o})`; vx.fillRect(SAFE.x, 400, SAFE.w, 560); vx.restore();
+  vHook(v, ['Three', 'equations.', 'It never', 'repeats.'], 510, { size: 104, accent: C.accent, color: C.paper, weight: 900, spacing: -2, alpha: o });
+}
+function vDraw(v) {
+  if (vx.reset) vx.reset();
+  vReset();
+  vx.fillStyle = C.bg; vx.fillRect(0, 0, VW, VH);
+  scene(vx, GV, v);
+  hookV(v);
+  vReset();
+  vShade(C.bgRGB, 0.86);
+  vTag('LORENZ ATTRACTOR', C.accent);
+  if (v >= VEND) vEndCard(v - VEND, { title: 'The Lorenz Butterfly', line: `${NPK} tops on one curve  ·  a ${W0} box grows ${fmtW(WEND)} wide`,
+    ink: C.paper, dim: 'rgba(241,238,230,0.72)', accent: C.accent, scrim: C.bgRGB, a: 0.88 });
+  vReset();
+}
+
+// The player asks for a frame on every display refresh; at 30 fps on a 60 Hz screen every other call
+// asks for the frame already on the canvas, which is then left as it is (same frame, same pixels).
+const shown = { L: -1, V: -1 };
+window.__motion = {
+  title: 'The Lorenz Butterfly',
+  description: `Generative: the Lorenz equations with σ = 10, ρ = 28, β = 8/3, integrated with RK4 at step ${DT}, draw a butterfly that circles one wing then the other in no set pattern, ${PK1.length} loops and ${R1.sw} switches in the first ${T1} time units; the tops of ${NPK + 1} loops, each plotted against the next, fall on one thin curve with slopes of ${sgn(SL)} and ${sgn(SR)}, and ${fmt(NB)} points released in a box ${W0} wide grow about ${Math.exp(LAM).toFixed(1)}× wider per time unit, to ${fmtW(WEND)} across both wings by t = ${T3}.`,
+  fps: FPS, width: W, height: H, frames: FRAMES,
+  poster: Math.round(TLL.fl1 + 10),
+  gifStart: Math.floor(TLL.a1 * 0.5 / FPS),
+  seek(i) { const f = Math.max(0, Math.min(FRAMES - 1, Math.floor(i))); if (f !== shown.L) { shown.L = f; draw(f); } },
+  audio: () => renderAudio(TLL, FRAMES),
+  variants: {
+    vertical: {
+      width: VW, height: VH, frames: VFR, canvas: vcv,
+      poster: Math.round(TLV.fl1 + 8), gifStart: Math.floor(TLV.a1 * 0.5 / FPS),
+      seek(i) { const v = Math.max(0, Math.min(VFR - 1, Math.floor(i))); if (v !== shown.V) { shown.V = v; vSeek(vDraw, v, VFR); } },
+      audio: () => renderAudio(TLV, VFR),
+    },
+  },
+};
+
+
+/* ==========================================================================
+   PLAYER — identical in every piece; keep as is.
+   Autoplays and loops, starts sound on the first click, ?frame=N pauses on a
+   frame, ?variant=vertical plays the vertical cut (if the piece has one).
+   When the renderer sets window.__MOTION_RENDER__ it stays out of the way.
+   ========================================================================== */
+(function player() {
+  const btn = document.getElementById('sound'), q = new URLSearchParams(location.search);
+  let M = window.__motion;
+  const V = !window.__MOTION_RENDER__ && M.variants && M.variants[q.get('variant')];
+  if (V) {                                                // show the variant's own canvas instead
+    M = Object.assign({}, M, V);
+    V.canvas.style.cssText = `width:min(100vw,calc(100vh*${V.width}/${V.height}));height:auto;aspect-ratio:${V.width}/${V.height}`;
+    document.querySelector('canvas').replaceWith(V.canvas);
+  }
+  const dur = M.frames / M.fps;
+  if (window.__MOTION_RENDER__) { btn.hidden = true; M.seek(0); return; }
+  if (q.has('frame')) { btn.hidden = true; M.seek(+q.get('frame') || 0); return; }
+  let t0 = performance.now(), ac = null, src = null, buf = null, paused = false, pausedAt = 0;
+  const clock = () => ac && src ? (ac.currentTime - t0) : (performance.now() - t0) / 1000;
+  function loop() {
+    if (!paused) M.seek(Math.floor(((clock() % dur) + dur) % dur * M.fps));
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+  btn.addEventListener('click', async () => {
+    if (src) { src.stop(); src = null; btn.textContent = 'Click for sound'; t0 = performance.now(); return; }
+    btn.textContent = 'Loading sound…';
+    ac = ac || new AudioContext({ sampleRate: 48000 });
+    buf = buf || await M.audio();
+    await ac.resume();
+    src = ac.createBufferSource(); src.buffer = buf; src.loop = true; src.connect(ac.destination);
+    t0 = ac.currentTime + 0.05; src.start(t0);        // picture restarts from frame 0 in sync with the sound
+    btn.textContent = 'Sound on — click to mute';
+  });
+  addEventListener('keydown', e => {
+    if (e.code !== 'Space') return;
+    e.preventDefault(); paused = !paused;
+    if (ac) paused ? ac.suspend() : ac.resume();
+    if (!ac) { if (paused) pausedAt = performance.now(); else t0 += performance.now() - pausedAt; }
+  });
+})();
+</script>
+</body>
+</html>

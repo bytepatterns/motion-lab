@@ -830,6 +830,71 @@ Click a preview to open the piece live in your browser (click once more there fo
 <br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/63-wave-function-collapse/?variant=vertical">open</a> · <a href="out/63-wave-function-collapse.vertical.png">still</a></sub>
 </td>
 </tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/64-topological-sort/"><img src="out/64-topological-sort.gif" width="100%" alt="Build Order: Kahn's Algorithm — animated preview"></a>
+<br><b>64 · Build Order: Kahn's Algorithm</b> <sub>26 s</sub>
+<br>12 build targets and 16 dependencies go through Kahn's algorithm: count what each target waits for, queue the 3 that wait for nothing (config, utils, proto), build the front of the queue and cross off its arrows, 12 pops and 16 crossings until all 12 are in order, 7 waves deep if independent targets build in parallel (3, 3, 1, 2, 1, 1, 1); then one extra arrow, logger on auth, closes the loop logger → db → auth → logger, the queue runs dry after 5 and 7 targets are never built.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/64-topological-sort/">open in browser</a> · <a href="out/64-topological-sort.png">still</a> · <a href="projects/64-topological-sort/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/64-topological-sort/?variant=vertical"><img src="out/64-topological-sort.vertical.gif" width="100%" alt="Build Order: Kahn's Algorithm — vertical cut, animated preview"></a>
+<br><sub>9:16 · 19 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/64-topological-sort/?variant=vertical">open</a> · <a href="out/64-topological-sort.vertical.png">still</a></sub>
+</td>
+</tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/65-lorenz-attractor/"><img src="out/65-lorenz-attractor.gif" width="100%" alt="The Lorenz Butterfly — animated preview"></a>
+<br><b>65 · The Lorenz Butterfly</b> <sub>27 s</sub>
+<br>Generative: the Lorenz equations with σ = 10, ρ = 28, β = 8/3, integrated with RK4 at step 0.002, draw a butterfly that circles one wing then the other in no set pattern, 18 loops and 9 switches in the first 14 time units; the tops of 437 loops, each plotted against the next, fall on one thin curve with slopes of +1.5 and −1.5, and 1,000 points released in a box 0.001 wide grow about 2.1× wider per time unit, to 42.6 across both wings by t = 12.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/65-lorenz-attractor/">open in browser</a> · <a href="out/65-lorenz-attractor.png">still</a> · <a href="projects/65-lorenz-attractor/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/65-lorenz-attractor/?variant=vertical"><img src="out/65-lorenz-attractor.vertical.gif" width="100%" alt="The Lorenz Butterfly — vertical cut, animated preview"></a>
+<br><sub>9:16 · 19 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/65-lorenz-attractor/?variant=vertical">open</a> · <a href="out/65-lorenz-attractor.vertical.png">still</a></sub>
+</td>
+</tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/66-avl-rotations/"><img src="out/66-avl-rotations.gif" width="100%" alt="AVL: Rotate to Stay Short — animated preview"></a>
+<br><b>66 · AVL: Rotate to Stay Short</b> <sub>26 s</sub>
+<br>15 keys arriving almost in order (4 3 5 1 6 7 2 8 11 12 13 10 15 9 14) go into a plain search tree and an AVL tree: the plain tree grows 10 levels deep in 64 comparisons, while AVL fixes every node whose two sides differ in height by 2, 8 times (1 LL, 5 RR, 1 LR, 1 RL: 10 rotations), and stays 4 levels deep in 42, so a search costs 3.3 comparisons on average instead of 5.3.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/66-avl-rotations/">open in browser</a> · <a href="out/66-avl-rotations.png">still</a> · <a href="projects/66-avl-rotations/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/66-avl-rotations/?variant=vertical"><img src="out/66-avl-rotations.vertical.gif" width="100%" alt="AVL: Rotate to Stay Short — vertical cut, animated preview"></a>
+<br><sub>9:16 · 19 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/66-avl-rotations/?variant=vertical">open</a> · <a href="out/66-avl-rotations.vertical.png">still</a></sub>
+</td>
+</tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/67-truchet-tiles/"><img src="out/67-truchet-tiles.gif" width="100%" alt="Truchet Tiles: Two Arcs, One Coin — animated preview"></a>
+<br><b>67 · Truchet Tiles: Two Arcs, One Coin</b> <sub>26 s</sub>
+<br>Generative: 640 square tiles on a 40 by 16 grid, each with two quarter circles joining the midpoints of its sides, turned one of two ways: all alike they draw 56 open waves and no loop, every other one turned closes 293 circles, a coin per tile gives 57 loops and 56 open paths that never cross, the longest path 190 arcs long, and each of 6 single turns joins two curves or splits one, found by union-find.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/67-truchet-tiles/">open in browser</a> · <a href="out/67-truchet-tiles.png">still</a> · <a href="projects/67-truchet-tiles/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/67-truchet-tiles/?variant=vertical"><img src="out/67-truchet-tiles.vertical.gif" width="100%" alt="Truchet Tiles: Two Arcs, One Coin — vertical cut, animated preview"></a>
+<br><sub>9:16 · 18 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/67-truchet-tiles/?variant=vertical">open</a> · <a href="out/67-truchet-tiles.vertical.png">still</a></sub>
+</td>
+</tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/68-two-phase-commit-saga/"><img src="out/68-two-phase-commit-saga.gif" width="100%" alt="Two-Phase Commit vs Saga — animated preview"></a>
+<br><b>68 · Two-Phase Commit vs Saga</b> <sub>26 s</sub>
+<br>One order touches Orders, Payments and Stock, and Stock is sold out: two-phase commit prepares all three at once, holds their locks for 153 ms in all while the votes come in, aborts on the one no and is done in 101 ms with 10 messages, but a read of Payments waits 54 ms; a saga commits each step at once and undoes the charge and the order with 2 compensating steps, 10 messages in 287 ms, never holding a lock longer than 33 ms, but its $40 charge stands for 121 ms before the refund.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/68-two-phase-commit-saga/">open in browser</a> · <a href="out/68-two-phase-commit-saga.png">still</a> · <a href="projects/68-two-phase-commit-saga/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/68-two-phase-commit-saga/?variant=vertical"><img src="out/68-two-phase-commit-saga.vertical.gif" width="100%" alt="Two-Phase Commit vs Saga — vertical cut, animated preview"></a>
+<br><sub>9:16 · 19 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/68-two-phase-commit-saga/?variant=vertical">open</a> · <a href="out/68-two-phase-commit-saga.vertical.png">still</a></sub>
+</td>
+</tr>
 </table>
 <!-- gallery:end -->
 

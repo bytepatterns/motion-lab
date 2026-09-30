@@ -1,0 +1,643 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="author" content="teambytepatterns">
+<meta name="description" content="One order touches Orders, Payments and Stock, and Stock is sold out. Two-phase commit prepares all three at once, holds their locks while the votes come in and aborts on the one no, so a read of Payments has to wait; a saga commits every step on its own right away and undoes the charge and the order with two compensating steps, holding no lock across services but leaving a charge visible for a while before the refund.">
+<title>Two-Phase Commit vs Saga — motion-lab</title>
+<style>
+  /* Player chrome. The piece itself lives entirely in the canvas. */
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  body { display: grid; place-items: center; font: 500 15px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #fff; }
+  canvas { display: block; width: min(100vw, calc(100vh * 16 / 9)); height: auto; aspect-ratio: 16 / 9; }
+  #sound { position: fixed; left: 16px; bottom: 16px; padding: 8px 14px; border: 1px solid rgba(255,255,255,.35); border-radius: 999px;
+           background: rgba(0,0,0,.55); color: #fff; font: inherit; cursor: pointer; }
+  #sound[hidden] { display: none; }
+</style>
+</head>
+<body>
+<canvas id="stage" width="1920" height="1080" aria-label="Two timelines, one above the other, each with four horizontal lanes: a coordinator and three services. A playhead sweeps right; arrows fly between the lanes. In the upper one red lock bars stretch across all three services until an abort arrives; in the lower one short teal commit bars follow one another, a red failure, then pink undo bars, and a yellow band marks how long a charge stood before its refund"></canvas>
+<button id="sound" type="button">Click for sound</button>
+<script>
+'use strict';
+/* ==========================================================================
+   PIECE — Two-Phase Commit vs Saga.
+   One order: create it in Orders, charge 40 dollars in Payments, reserve
+   the item in Stock. Stock is sold out, so the whole thing must be undone.
+   Two-phase commit: the coordinator sends PREPARE to all three; each one
+   does its work, locks what it touched and votes. A single NO makes the
+   coordinator send ABORT; the others roll back and release their locks.
+   Nothing was ever visible, but the locks were held for the whole vote:
+   anyone reading Payments meanwhile waits.
+   Saga (orchestrated): each step is a local transaction that commits at
+   once. When Stock fails, the orchestrator runs compensating steps in
+   reverse order: refund the charge, cancel the order. No lock spans two
+   services, but for a while the charge is real and anyone can see it.
+   Message latencies and work times come from a fixed seed; both runs, the
+   locks, the reads and every count are computed once at load. A frame maps
+   to a simulated millisecond, so seek(i) is pure in i.
+   ========================================================================== */
+const W = 1920, H = 1080, FPS = 30;
+const cv = document.getElementById('stage');
+const ctx = cv.getContext('2d', { willReadFrequently: true });   // CPU raster: identical pixels on every redraw
+const FONT = 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
+const MONO = 'ui-monospace, "Cascadia Code", Consolas, Menlo, monospace';
+
+// ---- helpers -------------------------------------------------------------
+function mulberry32(a) { return function () { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a);
+  t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const lerp = (a, b, t) => a + (b - a) * t;
+const prog = (f, a, b) => clamp((f - a) / (b - a));
+const smooth = t => t * t * (3 - 2 * t);
+const E = {
+  inCubic: t => t * t * t,
+  outCubic: t => 1 - Math.pow(1 - t, 3),
+  inOutCubic: t => t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2,
+  outExpo: t => t === 1 ? 1 : 1 - Math.pow(2, -10 * t),
+  inExpo: t => t === 0 ? 0 : Math.pow(2, 10 * t - 10),
+  inOutExpo: t => t === 0 ? 0 : t === 1 ? 1 : t < .5 ? Math.pow(2, 20 * t - 10) / 2 : (2 - Math.pow(2, -20 * t + 10)) / 2,
+  outBack: t => 1 + 2.70158 * Math.pow(t - 1, 3) + 1.70158 * Math.pow(t - 1, 2),
+};
+/** Canvas text; `max` shrinks the size until the line fits. Returns the width drawn. */
+function text(g, str, x, y, { size = 40, weight = 600, color = '#fff', alpha = 1, spacing = 0, align = 'left', fam = FONT, base = 'alphabetic', max = 0 } = {}) {
+  if (alpha <= 0.002 || !str) return 0;
+  g.font = `${weight} ${size}px ${fam}`; g.letterSpacing = spacing + 'px';
+  if (max) { const w0 = g.measureText(str).width; if (w0 > max) { size *= max / w0; g.font = `${weight} ${size}px ${fam}`; } }
+  g.textAlign = align; g.textBaseline = base;
+  const a0 = g.globalAlpha; g.globalAlpha = a0 * alpha; g.fillStyle = color;
+  g.fillText(str, x, y);
+  const w = g.measureText(str).width;
+  g.globalAlpha = a0; g.letterSpacing = '0px';
+  return w;
+}
+const measure = (g, str, size, weight = 800, fam = FONT, spacing = 0) => { g.font = `${weight} ${size}px ${fam}`; g.letterSpacing = spacing + 'px'; const w = g.measureText(str).width; g.letterSpacing = '0px'; return w; };
+const env = (f, a, b, fin = 12, fout = 10) => {
+  const i = E.outCubic(prog(f, a, a + fin)), o = 1 - E.inCubic(prog(f, b - fout, b));
+  return [Math.min(i, o), (1 - i) * 24 - (1 - o) * 10];
+};
+
+
+// ---- palette -------------------------------------------------------------
+const C = {
+  bg: '#0B0D14', bgRGB: '11,13,20', paper: '#F1EEE6', paperRGB: '241,238,230', dim: 'rgba(241,238,230,0.62)', faint: 'rgba(241,238,230,0.16)',
+  accent: '#FFC857', accentRGB: '255,200,87', go: '#5CD6CB', goRGB: '92,214,203', no: '#FF5E6C', noRGB: '255,94,108', node: '#151A28',
+  undo: '#FF8FA3', undoRGB: '255,143,163',
+};
+
+// ---- the two runs ----------------------------------------------------------------------------
+const CO = 0, OR = 1, PA = 2, ST = 3, AMOUNT = 40;
+const R = mulberry32(0x68A0);
+const lat = () => 10 + Math.round(R() * 14);             // one network hop, ms
+const work = () => 18 + Math.round(R() * 16);            // local work, ms
+// two-phase commit
+const TPC = (function () {
+  const msgs = [], locks = [], votes = [];
+  const prep = [OR, PA, ST].map(i => { const l = lat(), w = work(); return { i, recv: l, vote: l + w, ok: i !== ST }; });
+  prep.forEach(p => { msgs.push({ a: CO, b: p.i, t0: 0, t1: p.recv, k: 'prepare' }); });
+  prep.forEach(p => { const l = lat(); msgs.push({ a: p.i, b: CO, t0: p.vote, t1: p.vote + l, k: p.ok ? 'yes' : 'no' }); votes.push({ i: p.i, t: p.vote, ok: p.ok, arrive: p.vote + l }); });
+  const dec = votes.find(v => !v.ok).arrive;              // one NO is enough: abort at once
+  let done = dec;
+  const release = {};
+  prep.forEach(p => {
+    if (!p.ok) { release[p.i] = p.vote; return; }         // the NO voter rolls back as it votes
+    const l = lat(), recv = Math.max(dec + l, p.vote + 1), l2 = lat();
+    msgs.push({ a: CO, b: p.i, t0: dec, t1: recv, k: 'abort' });
+    msgs.push({ a: p.i, b: CO, t0: recv + 2, t1: recv + 2 + l2, k: 'ack' });
+    release[p.i] = recv + 2; done = Math.max(done, recv + 2 + l2);
+  });
+  prep.forEach(p => locks.push({ i: p.i, t0: p.recv, t1: release[p.i] }));
+  const held = locks.reduce((s, l) => s + l.t1 - l.t0, 0);
+  const pl = locks.find(l => l.i === PA), read = pl.t0 + 8;
+  msgs.sort((x, y) => x.t0 - y.t0);
+  return { msgs, locks, votes, dec, done, held, read, wait: pl.t1 - read };
+})();
+// saga, orchestrated
+const SAGA = (function () {
+  const msgs = [], tx = [];
+  let t = 0;
+  const step = (i, k, ok, undo = false, sh = k) => {
+    const l = lat(), recv = t + l, w = work(), commit = recv + w, l2 = lat();
+    msgs.push({ a: CO, b: i, t0: t, t1: recv, k });
+    tx.push({ i, t0: recv, t1: commit, k: ok ? k : k + ': sold out', s: ok ? sh : 'sold out', ok, undo });
+    msgs.push({ a: i, b: CO, t0: commit, t1: commit + l2, k: ok ? 'done' : 'sold out' });
+    t = commit + l2; return commit;
+  };
+  step(OR, 'create order', true, false, 'create');
+  const charged = step(PA, `charge $${AMOUNT}`, true, false, 'charge');
+  step(ST, 'reserve', false);
+  const refunded = step(PA, `refund $${AMOUNT}`, true, true, 'refund');
+  step(OR, 'cancel order', true, true, 'cancel');
+  const longest = Math.max(...tx.map(x => x.t1 - x.t0));
+  return { msgs, tx, done: t, charged, refunded, visible: refunded - charged, read: Math.round((charged + refunded) / 2), comp: tx.filter(x => x.undo).length, longest };
+})();
+const MSA = Math.ceil((TPC.done + 10) / 20) * 20, MSB = Math.ceil((SAGA.done + 10) / 50) * 50;
+
+// ---- timeline -------------------------------------------------------------------------------
+// 2PC plays first on its own time axis, then the saga on its own, then the two side by side in a table.
+function buildTL(o) {
+  const T = Object.assign({}, o);
+  T.a1 = T.a0 + T.sweepA; T.b0 = T.a1 + T.gap; T.b1 = T.b0 + T.sweepB;
+  T.t0 = T.b1 + 10; T.calm = T.t0 + T.table; T.end = Math.round(T.calm + T.calmT);
+  const FA = ms => Math.round(fA(T, ms)), FB = ms => Math.round(fB(T, ms));
+  T.caps = [
+    [T.g0, FA(TPC.read) - 2, '2PC: every service prepares and locks,|then votes; one no aborts them all.'],
+    [FA(TPC.read), T.b0 - 2, `A read of Payments during the vote|waits ${TPC.wait} ms for the lock.`],
+    [T.b0, FB(SAGA.read) - 2, 'Saga: each step commits on its own at once;|a failure is undone by compensating steps.'],
+    [FB(SAGA.read), T.t0 - 2, `A read in the saga sees the $${AMOUNT} charge,|refunded ${SAGA.visible} ms later.`],
+    [T.t0, T.calm - 2, 'Same order, same outcome, two prices:|locks and waiting, or a window of wrong data.'],
+  ];
+  return T;
+}
+const fA = (T, ms) => T.a0 + ms / MSA * T.sweepA, fB = (T, ms) => T.b0 + ms / MSB * T.sweepB;
+const msA = (T, f) => MSA * prog(f, T.a0, T.a1), msB = (T, f) => MSB * prog(f, T.b0, T.b1);
+/** The closing table: long label, short label, 2PC, saga, and which cell is the cost (1 or 2). */
+const ROWS = [
+  ['finished after', 'finished', `${TPC.done} ms`, `${SAGA.done} ms`, SAGA.done > TPC.done ? 2 : 1],
+  ['messages', 'messages', `${TPC.msgs.length}`, `${SAGA.msgs.length}`, 0],
+  ['locks held across services', 'shared locks', `${TPC.held} ms`, '0 ms', 1],
+  ['a read of Payments waits', 'read waits', `${TPC.wait} ms`, '0 ms', 1],
+  ['wrong balance visible for', 'wrong data', '0 ms', `${SAGA.visible} ms`, 2],
+];
+
+// ---- drawing ------------------------------------------------------------------------------
+const X = (G, span, ms) => G.x0 + ms / span * (G.x1 - G.x0);
+function lanes(g, G, P, f, names, title, a) {
+  const T = G.TL;
+  text(g, title, G.lx, P.ty, { size: 28, weight: 800, color: P.col, spacing: 4, alpha: a });
+  P.y.forEach((y, k) => {
+    const ka = a * E.outCubic(prog(f, T.g0 + k * 3, T.g0 + 16 + k * 3));
+    text(g, names[k], G.lx, y + 10, { size: 28, weight: k ? 700 : 800, color: k ? C.paper : C.dim, fam: MONO, alpha: ka });
+    g.save(); g.globalAlpha = ka; g.strokeStyle = k ? 'rgba(241,238,230,0.3)' : 'rgba(241,238,230,0.18)'; g.lineWidth = 2;
+    g.beginPath(); g.moveTo(G.x0, y); g.lineTo(G.x0 + (G.x1 - G.x0) * E.inOutCubic(prog(f, T.g0 + k * 3, T.g0 + 30 + k * 3)), y); g.stroke(); g.restore();
+  });
+}
+function arrow(g, G, P, sp, m, ms, a, col) {
+  if (ms <= m.t0) return;
+  const u = clamp((ms - m.t0) / (m.t1 - m.t0)), x0 = X(G, sp, m.t0), y0 = P.y[m.a], x1 = X(G, sp, m.t1), y1 = P.y[m.b];
+  const x = lerp(x0, x1, u), y = lerp(y0, y1, u);
+  g.save(); g.globalAlpha = a; g.strokeStyle = col; g.fillStyle = col; g.lineWidth = 2.5; g.lineCap = 'round';
+  g.beginPath(); g.moveTo(x0, y0); g.lineTo(x, y); g.stroke();
+  if (u >= 1) { const ang = Math.atan2(y1 - y0, x1 - x0); g.beginPath(); g.moveTo(x1, y1); g.lineTo(x1 - 12 * Math.cos(ang - 0.5), y1 - 12 * Math.sin(ang - 0.5)); g.lineTo(x1 - 12 * Math.cos(ang + 0.5), y1 - 12 * Math.sin(ang + 0.5)); g.closePath(); g.fill(); }
+  else { g.beginPath(); g.arc(x, y, 5, 0, Math.PI * 2); g.fill(); }
+  g.restore();
+}
+/** A bar on a lane from t0 to the playhead (or t1), with the first label that fits inside it. */
+function bar(g, G, sp, y, t0, t1, ms, fill, stroke, a, inner = [], h = 24) {
+  if (ms <= t0) return;
+  const x0 = X(G, sp, t0), x1 = X(G, sp, Math.min(ms, t1)), w = x1 - x0;
+  g.save(); g.globalAlpha = a; g.fillStyle = fill; g.strokeStyle = stroke; g.lineWidth = 2;
+  g.beginPath(); g.roundRect(x0, y - h / 2, Math.max(2, w), h, 6); g.fill(); g.stroke(); g.restore();
+  for (const s of inner) { if (measure(g, s, 28, 800, MONO) + 16 <= w) { text(g, s, x0 + 8, y + 2, { size: 28, weight: 800, color: C.paper, base: 'middle', fam: MONO, alpha: a }); break; } }
+}
+/** A short label on a dark chip, so it reads over lines and bars. */
+function tag(g, s, x, y, col, a) {
+  if (a <= 0.002) return;
+  const w = measure(g, s, 28, 850, MONO) + 12;
+  g.save(); g.globalAlpha = a; g.fillStyle = `rgba(${C.bgRGB},0.88)`; g.beginPath(); g.roundRect(x, y - 18, w, 36, 8); g.fill(); g.restore();
+  text(g, s, x + 6, y + 2, { size: 28, weight: 850, color: col, base: 'middle', fam: MONO, alpha: a });
+}
+function axis(g, G, P, sp, step, a, ms, live) {
+  for (let v = 0; v <= sp; v += step) text(g, v === sp ? `${v} ms` : String(v), X(G, sp, v), P.ax, { size: 28, weight: 700, color: C.dim, align: v === sp ? 'right' : v === 0 ? 'left' : 'center', fam: MONO, alpha: a * 0.9 });
+  if (live <= 0) return;
+  const x = X(G, sp, ms);
+  g.save(); g.globalAlpha = live * 0.6; g.strokeStyle = C.accent; g.lineWidth = 2; g.beginPath(); g.moveTo(x, P.y[0] - 30); g.lineTo(x, P.y[3] + 30); g.stroke(); g.restore();
+}
+function focus(T, f) {
+  const tb = E.inOutCubic(prog(f, T.t0, T.t0 + 14)) * (1 - E.inOutCubic(prog(f, T.calm + 20, T.end + 10)));
+  return { A: (1 - 0.5 * E.inOutCubic(prog(f, T.a1 + 4, T.b0 + 8))) * (1 - 0.8 * tb), B: (0.5 + 0.5 * E.inOutCubic(prog(f, T.a1, T.b0))) * (1 - 0.8 * tb) };
+}
+function tpcPanel(g, G, f, a0) {
+  const T = G.TL, ms = msA(T, f), P = G.A, sp = MSA, S = G.short, a = a0 * focus(T, f).A;
+  lanes(g, G, P, f, G.namesA, 'TWO-PHASE COMMIT', a);
+  for (const l of TPC.locks) {
+    const d = l.t1 - l.t0, done = ms >= l.t1;
+    bar(g, G, sp, P.y[l.i], l.t0, l.t1, ms, `rgba(${C.noRGB},0.22)`, `rgba(${C.noRGB},0.8)`, a, done ? (S ? [`${d} ms`] : [`locked ${d} ms`, `${d} ms`]) : (S ? [] : ['locked']));
+  }
+  for (const m of TPC.msgs) arrow(g, G, P, sp, m, ms, a * (m.k === 'ack' ? 0.6 : 1), m.k === 'no' ? C.no : m.k === 'abort' ? C.undo : m.k === 'ack' ? C.dim : m.k === 'yes' ? C.go : C.paper);
+  for (const v of TPC.votes) if (ms >= v.t) tag(g, v.ok ? 'yes' : 'no', X(G, sp, v.t) + 10, P.y[v.i], v.ok ? C.go : C.no, a * E.outCubic(prog(ms, v.t, v.t + 4)));
+  if (ms > 0) text(g, 'prepare ×3', G.x0 + 6, P.y[CO] - 16, { size: 28, weight: 800, color: C.paper, fam: MONO, alpha: a * E.outCubic(prog(ms, 0, 4)) });
+  if (ms >= TPC.dec) text(g, 'abort ×2', X(G, sp, TPC.dec) + 6, P.y[CO] - 16, { size: 28, weight: 800, color: C.undo, fam: MONO, alpha: a * E.outCubic(prog(ms, TPC.dec, TPC.dec + 4)) });
+  if (ms >= TPC.done) {
+    const da = a * E.outCubic(prog(ms, TPC.done, TPC.done + 6));
+    if (S) text(g, `done ${TPC.done} ms`, G.x1, P.y[CO] - 16, { size: 28, weight: 800, color: C.go, fam: MONO, align: 'right', alpha: da });
+    else text(g, `done at ${TPC.done} ms`, X(G, sp, TPC.done) + 10, P.y[CO] + 10, { size: 28, weight: 800, color: C.go, fam: MONO, alpha: da });
+  }
+  reader(g, G, P, sp, ms, a, TPC.read, TPC.read + TPC.wait, S ? `waits ${TPC.wait} ms` : `read waits ${TPC.wait} ms`, true);
+  axis(g, G, P, sp, G.stepA, a, ms, f >= T.a0 - 2 && f < T.b0 ? a * (1 - prog(f, T.a1, T.a1 + 10)) : 0);
+  const nm = TPC.msgs.filter(m => ms >= m.t1).length, held = Math.round(TPC.locks.reduce((s, l) => s + clamp(ms - l.t0, 0, l.t1 - l.t0), 0));
+  text(g, S ? `${Math.round(ms)} ms  ·  locks ${held}` : `t = ${Math.round(ms)} ms  ·  ${nm} message${nm === 1 ? '' : 's'}  ·  locks held ${held} ms`, G.x1, P.ty, { size: 28, weight: 700, color: C.paper, fam: MONO, align: 'right', alpha: a });
+}
+function sagaPanel(g, G, f, a0) {
+  const T = G.TL, ms = msB(T, f), P = G.B, sp = MSB, S = G.short, a = a0 * focus(T, f).B;
+  lanes(g, G, P, f, G.namesB, 'SAGA', a);
+  // the charge that stands until its refund
+  if (ms > SAGA.charged) {
+    const x0 = X(G, sp, SAGA.charged), x1 = X(G, sp, Math.min(ms, SAGA.refunded)), xr = X(G, sp, SAGA.tx[3].t0);
+    g.save(); g.globalAlpha = a; g.fillStyle = `rgba(${C.accentRGB},0.14)`; g.fillRect(x0, P.y[PA] - 20, x1 - x0, 40);
+    g.strokeStyle = `rgba(${C.accentRGB},0.7)`; g.setLineDash([6, 6]); g.lineWidth = 2; g.strokeRect(x0, P.y[PA] - 20, x1 - x0, 40); g.restore();
+    const room = Math.min(x1, xr) - x0 - 16, opts = ms >= SAGA.refunded ? [`charge visible ${SAGA.visible} ms`, `visible ${SAGA.visible} ms`, 'visible'] : [`$${AMOUNT} charged, visible`, 'visible'];
+    const lab = opts.find(s => measure(g, s, 28, 800, MONO) <= room);
+    if (lab) tag(g, lab, x0 + 4, P.y[PA], C.accent, a * E.outCubic(prog(ms, SAGA.charged, SAGA.charged + 6)));
+  }
+  for (const x of SAGA.tx) {
+    const fill = !x.ok ? `rgba(${C.noRGB},0.3)` : x.undo ? `rgba(${C.undoRGB},0.3)` : `rgba(${C.goRGB},0.25)`;
+    const st = !x.ok ? C.no : x.undo ? C.undo : C.go;
+    bar(g, G, sp, P.y[x.i], x.t0, x.t1, ms, fill, st, a, []);
+    if (ms > x.t0) text(g, S ? x.s : x.k, X(G, sp, x.t0), P.y[x.i] + 44, { size: 28, weight: 800, color: st, fam: MONO, alpha: a * E.outCubic(prog(ms, x.t0, x.t0 + 4)) });
+  }
+  for (const m of SAGA.msgs) arrow(g, G, P, sp, m, ms, a * (m.k === 'done' ? 0.6 : 1), m.k === 'sold out' ? C.no : m.k === 'done' ? C.dim : m.k.startsWith('refund') || m.k.startsWith('cancel') ? C.undo : C.paper);
+  if (ms >= SAGA.done) text(g, S ? `done ${SAGA.done} ms` : `done at ${SAGA.done} ms`, X(G, sp, SAGA.done) - 10, P.y[CO] - 16, { size: 28, weight: 800, color: C.go, fam: MONO, align: 'right', alpha: a * E.outCubic(prog(ms, SAGA.done, SAGA.done + 6)) });
+  reader(g, G, P, sp, ms, a, SAGA.read, SAGA.read, S ? `sees $${AMOUNT}` : 'read sees the charge', false);
+  axis(g, G, P, sp, G.stepB, a, ms, f >= T.b0 - 2 && f < T.t0 + 10 ? a * (1 - prog(f, T.b1, T.b1 + 10)) : 0);
+  const nm = SAGA.msgs.filter(m => ms >= m.t1).length, nc = SAGA.tx.filter(x => x.undo && ms >= x.t1).length;
+  text(g, S ? `${Math.round(ms)} ms  ·  undo ${nc}` : `t = ${Math.round(ms)} ms  ·  ${nm} message${nm === 1 ? '' : 's'}  ·  ${nc} compensation${nc === 1 ? '' : 's'}`, G.x1, P.ty, { size: 28, weight: 700, color: C.paper, fam: MONO, align: 'right', alpha: a });
+}
+/** A read of Payments: a marker, and a wait line when it has to wait. */
+function reader(g, G, P, sp, ms, a, t0, t1, lab, waits) {
+  if (ms < t0) return;
+  const y = P.y[PA] + P.ry, x0 = X(G, sp, t0), ka = clamp(a * E.outBack(prog(ms, t0, t0 + 4)));
+  let xl = x0 + 22;
+  if (waits) {
+    const x1 = X(G, sp, Math.min(ms, t1)); xl = x1 + 12;
+    g.save(); g.globalAlpha = a; g.strokeStyle = C.accent; g.lineWidth = 3; g.setLineDash([8, 6]); g.beginPath(); g.moveTo(x0, y); g.lineTo(x1, y); g.stroke(); g.restore();
+  }
+  g.save(); g.globalAlpha = ka; g.fillStyle = C.accent; g.beginPath(); g.arc(x0, y, 14, 0, Math.PI * 2); g.fill(); g.restore();
+  text(g, 'R', x0, y + 2, { size: 28, weight: 900, color: C.bg, align: 'center', base: 'middle', fam: MONO, alpha: ka });
+  const s = !waits || ms >= t1 ? lab : 'waits…';
+  tag(g, s, xl - 6, y, C.accent, ka);
+}
+function table(g, G, f) {
+  const T = G.TL, B = G.tbl, k0 = E.outCubic(prog(f, T.t0, T.t0 + 14)) * (1 - E.inCubic(prog(f, T.calm - 4, T.calm + 10)));
+  if (k0 <= 0) return;
+  g.save(); g.globalAlpha = k0; g.fillStyle = `rgba(${C.bgRGB},0.92)`; g.strokeStyle = C.faint; g.lineWidth = 1.5;
+  g.beginPath(); g.roundRect(B.x - B.pad, B.y - B.pad - B.hs, B.w + 2 * B.pad, B.hs + ROWS.length * B.rh + 2 * B.pad, 18); g.fill(); g.stroke(); g.restore();
+  text(g, '2PC', B.c2, B.y, { size: B.hs, weight: 900, color: C.no, align: 'right', spacing: 3, alpha: k0 });
+  text(g, 'SAGA', B.c3, B.y, { size: B.hs, weight: 900, color: C.go, align: 'right', spacing: 3, alpha: k0 });
+  ROWS.forEach((r, k) => {
+    const ka = k0 * E.outCubic(prog(f, T.t0 + 8 + k * 10, T.t0 + 22 + k * 10)), y = B.y + (k + 1) * B.rh, dy = (1 - ka) * 14;
+    g.save(); g.globalAlpha = ka * 0.6; g.strokeStyle = C.faint; g.beginPath(); g.moveTo(B.x, y - B.rh + 26); g.lineTo(B.x + B.w, y - B.rh + 26); g.stroke(); g.restore();
+    text(g, G.short ? r[1] : r[0], B.x, y + dy, { size: B.ls, weight: 700, color: C.paper, alpha: ka });
+    text(g, r[2], B.c2, y + dy, { size: B.vs, weight: 850, color: r[4] === 1 ? C.accent : C.paper, align: 'right', fam: MONO, alpha: ka });
+    text(g, r[3], B.c3, y + dy, { size: B.vs, weight: 850, color: r[4] === 2 ? C.accent : C.paper, align: 'right', fam: MONO, alpha: ka });
+  });
+}
+function caption(g, G, f) {
+  for (const [t0, t1, str] of G.TL.caps) {
+    const [a, dy] = env(f, t0, t1, 10, 8); if (a <= 0) continue;
+    const [p1, p2] = str.split('|');
+    if (G.capTwo) {
+      text(g, p1, G.capX, G.capY + dy, { size: G.cap, weight: 850, color: C.paper, spacing: -1, alpha: a, max: G.capMax });
+      text(g, p2, G.capX, G.capY + G.cap * 1.14 + dy, { size: G.cap, weight: 850, color: C.accent, spacing: -1, alpha: a, max: G.capMax });
+    } else {
+      const w1 = measure(g, p1 + ' ', G.cap, 850, FONT, -1), w2 = measure(g, p2, G.cap, 850, FONT, -1), sc = Math.min(1, G.capMax / (w1 + w2));
+      const w = text(g, p1 + ' ', G.capX, G.capY + dy, { size: G.cap * sc, weight: 850, color: C.paper, spacing: -1, alpha: a });
+      text(g, p2, G.capX + w, G.capY + dy, { size: G.cap * sc, weight: 850, color: C.accent, spacing: -1, alpha: a });
+    }
+  }
+}
+function finale(g, G, f) {
+  const T = G.TL, k1 = E.outCubic(prog(f, T.calm, T.calm + 18)), k2 = E.outCubic(prog(f, T.calm + 10, T.calm + 28));
+  if (k1 <= 0) return;
+  const out = 1 - E.inCubic(prog(f, T.end - 6, T.end + 12));
+  g.save(); g.fillStyle = `rgba(${C.bgRGB},${0.86 * k1 * out})`; g.fillRect(0, G.fnY - G.fn * 1.2, G.w, G.fn * (G.fnTwo ? 3.9 : 2.9)); g.restore();
+  text(g, 'Lock it, or undo it.', G.fnX, G.fnY, { size: G.fn, weight: 900, color: C.paper, spacing: -2, align: G.fnAlign, alpha: k1 * out, max: G.fnMax });
+  if (G.fnTwo) {
+    text(g, `2PC: locks held ${TPC.held} ms;`, G.fnX, G.fnY + G.fn * 1.05, { size: G.fn * 0.55, weight: 850, color: C.accent, spacing: -1, align: G.fnAlign, alpha: k2 * out, max: G.fnMax });
+    text(g, `saga: a charge shown ${SAGA.visible} ms.`, G.fnX, G.fnY + G.fn * 1.75, { size: G.fn * 0.55, weight: 850, color: C.accent, spacing: -1, align: G.fnAlign, alpha: k2 * out, max: G.fnMax });
+  } else text(g, `2PC holds locks ${TPC.held} ms  ·  the saga shows a charge for ${SAGA.visible} ms`, G.fnX, G.fnY + G.fn * 1.05, { size: G.fn * 0.5, weight: 850, color: C.accent, spacing: -1, align: G.fnAlign, alpha: k2 * out, max: G.fnMax });
+}
+function scene(g, G, f) {
+  const T = G.TL, [a] = env(f, T.g0 - 20, T.end + 14, 16, 20);
+  if (a > 0) { tpcPanel(g, G, f, a); sagaPanel(g, G, f, a); }
+  table(g, G, f); caption(g, G, f); finale(g, G, f);
+}
+
+// ---- landscape picture ------------------------------------------------------------------
+const TLL = buildTL({ g0: 36, a0: 70, sweepA: 170, gap: 14, sweepB: 270, table: 150, calmT: 32 });
+const FRAMES = TLL.end + 72;
+const GL = { TL: TLL, w: W, h: H, lx: 120, x0: 350, x1: 1800, short: false, stepA: 20, stepB: 50,
+  namesA: ['coordinator', 'orders', 'payments', 'stock'], namesB: ['orchestrator', 'orders', 'payments', 'stock'],
+  A: { ty: 312, y: [364, 426, 488, 550], col: C.no, ry: 34, ax: 604 },
+  B: { ty: 664, y: [716, 778, 840, 902], col: C.go, ry: -34, ax: 996 },
+  tbl: { x: 420, y: 400, w: 1080, c2: 1180, c3: 1500, rh: 88, hs: 40, ls: 42, vs: 46, pad: 36 },
+  capX: 120, capY: 216, cap: 50, capTwo: false, capMax: 1680,
+  fn: 100, fnX: W / 2, fnY: 600, fnAlign: 'center', fnMax: 1680 };
+function hookL(f) {
+  const o = 1 - E.inCubic(prog(f, TLL.g0 - 14, TLL.g0 + 4));
+  if (o <= 0) return;
+  const k = E.outExpo(prog(f, -8, 10)), k2 = E.outBack(prog(f, -6, 12));
+  ctx.save(); ctx.fillStyle = `rgba(${C.bgRGB},${0.8 * o})`; ctx.fillRect(0, 400, W, 330); ctx.restore();
+  text(ctx, `The $${AMOUNT} payment went through.`, W / 2, 540 + (1 - k) * 30, { size: 108, weight: 900, color: C.paper, spacing: -3, align: 'center', alpha: o * Math.max(0.3, k), max: 1700 });
+  text(ctx, 'Stock is sold out.', W / 2, 670 + (1 - clamp(k2)) * 30, { size: 108, weight: 900, color: C.accent, spacing: -3, align: 'center', alpha: o * Math.max(0.3, clamp(k2)) });
+}
+function draw(f) {
+  if (ctx.reset) ctx.reset();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; ctx.filter = 'none'; ctx.shadowBlur = 0;
+  ctx.fillStyle = C.bg; ctx.fillRect(0, 0, W, H);
+  const T = TLL, endK = E.inOutCubic(prog(f, T.end, T.end + 20)), a = 1 - endK;
+  scene(ctx, GL, f);
+  text(ctx, 'SYSTEMS  ·  DISTRIBUTED TRANSACTIONS', 120, 104, { size: 26, weight: 600, color: C.dim, spacing: 5, alpha: a });
+  text(ctx, 'BYTEPATTERNS', 1800, 104, { size: 26, weight: 600, color: C.dim, spacing: 5, align: 'right', alpha: a });
+  hookL(f);
+  if (endK > 0) {
+    ctx.fillStyle = `rgba(${C.bgRGB},${0.86 * endK})`; ctx.fillRect(0, 0, W, H);
+    const k1 = E.outCubic(prog(f, T.end + 6, T.end + 28)), k2 = E.outCubic(prog(f, T.end + 16, T.end + 38)), k3 = E.outCubic(prog(f, T.end + 26, T.end + 48));
+    text(ctx, 'Two-Phase Commit vs Saga', W / 2, 500 + (1 - k1) * 30, { size: 112, weight: 850, color: C.paper, spacing: -3, align: 'center', alpha: k1, max: 1680 });
+    text(ctx, `2PC: ${TPC.done} ms, locks held ${TPC.held} ms, a read waits ${TPC.wait} ms  ·  saga: ${SAGA.done} ms, ${SAGA.comp} compensations, a charge visible ${SAGA.visible} ms`, W / 2, 580 + (1 - k2) * 20, { size: 42, weight: 500, color: C.accent, align: 'center', alpha: k2, max: 1680 });
+    text(ctx, 'drawn in code  ·  bytepatterns.com', W / 2, 1000, { size: 32, weight: 600, color: C.paper, spacing: 3, align: 'center', alpha: k3 * 0.8 });
+  }
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.letterSpacing = '0px';
+}
+
+// ---- sound: a tick per message, a low hum per held lock, a pluck per commit, a falling one per undo ----
+async function renderAudio(TL = TLL, frames = FRAMES) {
+  const SR = 48000, dur = frames / FPS, LEN = Math.round(SR * dur);
+  const ac = new OfflineAudioContext(2, LEN, SR);
+  const at = fr => fr / FPS, amA = ms => at(fA(TL, ms)), amB = ms => at(fB(TL, ms));
+  const comp = ac.createDynamicsCompressor();
+  comp.threshold.value = -16; comp.ratio.value = 3; comp.attack.value = 0.005; comp.release.value = 0.25;
+  const master = ac.createGain(); master.gain.value = 0.9; master.connect(comp).connect(ac.destination);
+  master.gain.setValueAtTime(0.9, dur - 1.0); master.gain.linearRampToValueAtTime(0.0001, dur - 0.02);
+  const rnd = mulberry32(0x68AD);
+  const ir = ac.createBuffer(2, SR * 2, SR);
+  for (let c = 0; c < 2; c++) { const d = ir.getChannelData(c); for (let k = 0; k < d.length; k++) d[k] = (rnd() * 2 - 1) * Math.pow(1 - k / d.length, 3); }
+  const verb = ac.createConvolver(); verb.buffer = ir; const vg = ac.createGain(); vg.gain.value = 0.28; verb.connect(vg).connect(master);
+  const hz = m => 440 * Math.pow(2, (m - 69) / 12);
+  const pluck = (t0, m, amp, pan, dec = 0.35, type = 'triangle') => {
+    const o = ac.createOscillator(), g = ac.createGain(), p = ac.createStereoPanner(); o.type = type; o.frequency.value = hz(m);
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(amp, t0 + 0.004); g.gain.exponentialRampToValueAtTime(0.0001, t0 + dec);
+    p.pan.value = pan; o.connect(g).connect(p); p.connect(master); p.connect(verb); o.start(t0); o.stop(t0 + dec + 0.05);
+  };
+  const hold = (t0, t1, m, amp, pan) => {
+    const o = ac.createOscillator(), g = ac.createGain(), p = ac.createStereoPanner(), lp = ac.createBiquadFilter(); o.type = 'sawtooth'; o.frequency.value = hz(m);
+    lp.type = 'lowpass'; lp.frequency.value = 500;
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(amp, t0 + 0.08); g.gain.setValueAtTime(amp, Math.max(t0 + 0.08, t1 - 0.05)); g.gain.exponentialRampToValueAtTime(0.0001, t1 + 0.15);
+    p.pan.value = pan; o.connect(lp).connect(g).connect(p); p.connect(master); o.start(t0); o.stop(t1 + 0.2);
+  };
+  const pad = (t0, t1, notes, amp, cutoff) => {
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = cutoff; lp.Q.value = 1; lp.connect(master); lp.connect(verb);
+    notes.forEach((m, i) => { for (const det of [-6, 6]) {
+      const o = ac.createOscillator(), g = ac.createGain(), p = ac.createStereoPanner(); o.type = 'sawtooth'; o.frequency.value = hz(m); o.detune.value = det;
+      p.pan.value = (i / Math.max(1, notes.length - 1) - 0.5) * 0.8 * Math.sign(det);
+      g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(amp, t0 + 0.8); g.gain.setValueAtTime(amp, Math.max(t0 + 0.8, t1 - 0.6)); g.gain.exponentialRampToValueAtTime(0.0001, t1 + 0.4);
+      o.connect(g).connect(p).connect(lp); o.start(t0); o.stop(t1 + 0.45); } });
+  };
+  pad(0, at(TL.b0 + 4), [45, 52, 57, 60, 64], 0.011, 900);
+  pad(at(TL.b0 - 6), at(TL.t0 + 4), [41, 48, 53, 57, 60], 0.011, 1000);
+  pad(at(TL.t0), at(TL.end + 50), [48, 55, 60, 64, 67], 0.012, 1300);
+  const lanePan = [-0.6, -0.2, 0.2, 0.6];
+  // 2PC on the left of the stereo field, the saga on the right
+  for (const m of TPC.msgs) pluck(amA(m.t0), m.k === 'no' ? 55 : m.k === 'abort' ? 62 : 79, m.k === 'ack' ? 0.012 : 0.022, -0.5, 0.12, 'sine');
+  for (const l of TPC.locks) hold(amA(l.t0), amA(l.t1), 40 + l.i * 3, 0.018, -0.6);
+  hold(amA(TPC.read), amA(TPC.read + TPC.wait), 69, 0.01, -0.3);
+  for (const m of SAGA.msgs) pluck(amB(m.t0), m.k === 'sold out' ? 55 : 81, 0.02, 0.5, 0.12, 'sine');
+  for (const x of SAGA.tx) {
+    if (!x.ok) [43, 36].forEach((m, i) => pluck(amB(x.t1) + i * 0.04, m, 0.08, lanePan[x.i], 0.8));
+    else if (x.undo) [72, 67, 64].forEach((m, i) => pluck(amB(x.t1) + i * 0.06, m, 0.04, lanePan[x.i], 0.5, 'sine'));
+    else [64, 67, 72].forEach((m, i) => pluck(amB(x.t1) + i * 0.06, m, 0.04, lanePan[x.i], 0.5, 'sine'));
+  }
+  [0, 4, 7].forEach((m, i) => pluck(amB(SAGA.read) + i * 0.03, 76 + m, 0.03, 0.3, 0.6, 'sine'));
+  ROWS.forEach((r, k) => pluck(at(TL.t0 + 8 + k * 10), 67 + [0, 2, 4, 7, 9][k], 0.03, r[4] === 1 ? -0.4 : r[4] === 2 ? 0.4 : 0, 0.4, 'sine'));
+  [60, 64, 67, 72].forEach((m, i) => pluck(at(TL.calm) + i * 0.09, m, 0.05, -0.3 + i * 0.2, 1.6, 'sine'));
+  [76, 81, 84, 88].forEach((m, i) => pluck(at(TL.end + 10 + i * 6), m, 0.05, -0.45 + i * 0.3, 1.8, 'sine'));
+  const buf = await ac.startRendering();
+  let peak = 0; for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let k = 0; k < d.length; k++) peak = Math.max(peak, Math.abs(d[k])); }
+  const norm = 0.85 / Math.max(peak, 1e-6);                          // every piece peaks at the same level
+  for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let k = 0; k < d.length; k++) d[k] *= norm; }
+  return buf;
+}
+
+/* ==========================================================================
+   VERTICAL CUT — shared block, identical in every piece.
+   1080x1920 for Reels, Shorts and TikTok (__motion.variants.vertical). The
+   piece's own scene code is re-used and recomposed for a phone: everything a
+   viewer must read stays inside the area no platform covers (x 60..900,
+   y 230..1400); outside it there is only dimmed texture.
+   ========================================================================== */
+const VW = 1080, VH = 1920, SAFE = { x: 60, y: 230, w: 840, h: 1170, r: 900, b: 1400 };
+const vcv = document.createElement('canvas'); vcv.width = VW; vcv.height = VH;
+const vx = vcv.getContext('2d', { willReadFrequently: true });   // CPU raster: identical pixels on every redraw
+const VL = 96, VR = 864;                                          // text column inside the safe area
+
+function vReset() {
+  vx.setTransform(1, 0, 0, 1, 0, 0); vx.globalAlpha = 1; vx.globalCompositeOperation = 'source-over';
+  vx.filter = 'none'; vx.shadowBlur = 0; vx.shadowColor = 'transparent'; vx.letterSpacing = '0px'; vx.setLineDash([]);
+  vx.textAlign = 'left'; vx.textBaseline = 'alphabetic'; vx.lineCap = 'butt'; vx.lineJoin = 'miter';
+}
+/** Canvas text on the vertical frame; `max` shrinks the size until the line fits. */
+function vText(str, x, y, { size = 40, weight = 700, color = '#FFFFFF', align = 'left', spacing = 0, alpha = 1, fam = FONT, max = 0 } = {}) {
+  if (alpha <= 0.002 || !str) return size;
+  vx.font = `${weight} ${size}px ${fam}`; vx.letterSpacing = spacing + 'px';
+  if (max) { const w = vx.measureText(str).width; if (w > max) { size = size * max / w; vx.font = `${weight} ${size}px ${fam}`; } }
+  vx.textAlign = align; vx.textBaseline = 'alphabetic';
+  const a0 = vx.globalAlpha; vx.globalAlpha = a0 * alpha; vx.fillStyle = color;
+  vx.fillText(str, x + (align === 'center' ? spacing / 2 : align === 'right' ? spacing : 0), y);   // tracking is added after the last glyph too
+  vx.globalAlpha = a0; vx.letterSpacing = '0px';
+  return size;
+}
+/** Word-wraps with the given font; returns the lines. */
+function vWrap(str, maxW, size, weight = 700, fam = FONT) {
+  vx.font = `${weight} ${size}px ${fam}`; vx.letterSpacing = '0px';
+  const words = str.split(' '), lines = []; let cur = '';
+  for (const w of words) { const t = cur ? cur + ' ' + w : w; if (vx.measureText(t).width > maxW && cur) { lines.push(cur); cur = w; } else cur = t; }
+  if (cur) lines.push(cur);
+  return lines;
+}
+/** Fade envelope with a small rise: [alpha, dy]. */
+function vEnv(v, a, b, fin = 8, fout = 8) {
+  const i = E.outCubic(prog(v, a, a + fin)), o = 1 - E.inCubic(prog(v, b - fout, b));
+  return [Math.min(i, o), (1 - i) * 22 - (1 - o) * 10];
+}
+/** Which segment of a cut list a vertical frame is in: segs = [{ at, src, len }] in frames. */
+function vSeg(segs, v) {
+  let k = 0; while (k < segs.length - 1 && v >= segs[k + 1].at) k++;
+  const s = segs[k];
+  return { k, s, local: v - s.at, src: s.src + (v - s.at) };
+}
+/** Dims everything outside the safe area to a quiet texture (brightness x 0.2), with a soft inner edge. */
+function vShade(rgb, a = 0.8, feather = 40) {
+  vx.save(); vx.setTransform(1, 0, 0, 1, 0, 0); vx.globalAlpha = 1; vx.globalCompositeOperation = 'source-over';
+  vx.fillStyle = `rgba(${rgb},${a})`;
+  vx.beginPath(); vx.rect(0, 0, VW, VH); vx.rect(SAFE.x, SAFE.y, SAFE.w, SAFE.h); vx.fill('evenodd');
+  const strip = (x0, y0, x1, y1, rx, ry, rw, rh) => {
+    const g = vx.createLinearGradient(x0, y0, x1, y1);
+    g.addColorStop(0, `rgba(${rgb},${a})`); g.addColorStop(1, `rgba(${rgb},0)`);
+    vx.fillStyle = g; vx.fillRect(rx, ry, rw, rh);
+  };
+  strip(SAFE.x, 0, SAFE.x + feather, 0, SAFE.x, SAFE.y, feather, SAFE.h);
+  strip(SAFE.r, 0, SAFE.r - feather, 0, SAFE.r - feather, SAFE.y, feather, SAFE.h);
+  strip(0, SAFE.y, 0, SAFE.y + feather, SAFE.x, SAFE.y, SAFE.w, feather);
+  strip(0, SAFE.b, 0, SAFE.b - feather, SAFE.x, SAFE.b - feather, SAFE.w, feather);
+  vx.restore();
+}
+/** Series tag at the top of the safe area, e.g. MADE IN CODE · 04. */
+function vTag(label, color, alpha = 1) {
+  vText('MADE IN CODE', VL, 292, { size: 28, weight: 800, color, spacing: 5, alpha });
+  vx.font = `800 28px ${FONT}`; vx.letterSpacing = '5px';
+  const w = vx.measureText('MADE IN CODE').width; vx.letterSpacing = '0px';
+  vText('·  ' + label, VL + w + 14, 292, { size: 28, weight: 600, color: 'rgba(255,255,255,0.72)', spacing: 3, alpha, max: VR - VL - w - 14 });
+}
+/** Big hook lines, left-aligned from y0; visible from frame 0, settles in a few frames. */
+function vHook(v, lines, y0, { size = 84, lh = 1.08, color = '#FFFFFF', accent = null, weight = 800, spacing = -1.5, alpha = 1 } = {}) {
+  const k = E.outExpo(prog(v, -6, 12));
+  lines.forEach((ln, i) => {
+    const kk = E.outExpo(prog(v, -12 + i * 2, 8 + i * 2));
+    vText(ln, VL, y0 + i * size * lh + (1 - kk) * 30, { size, weight, spacing, color: accent && i === lines.length - 1 ? accent : color, alpha: alpha * Math.max(0.25, kk), max: VR - VL });
+  });
+  return k;
+}
+/** Closing card, the last 60 frames: piece title, "drawn in code · bytepatterns.com". l = frames into the card. */
+function vEndCard(l, { title, line = '', ink = '#FFFFFF', dim = 'rgba(255,255,255,0.66)', accent = '#FFFFFF', scrim = '0,0,0', a = 0.84 }) {
+  const k = E.outCubic(prog(l, 0, 12));
+  vx.save(); vx.setTransform(1, 0, 0, 1, 0, 0);
+  vx.fillStyle = `rgba(${scrim},${a * k})`; vx.fillRect(0, 0, VW, VH);
+  vx.restore();
+  const t1 = E.outExpo(prog(l, 3, 19)), t2 = E.outExpo(prog(l, 11, 27)), t3 = E.outExpo(prog(l, 19, 35));
+  vx.fillStyle = accent; vx.globalAlpha = t1; vx.fillRect(VL, 742, 88 * t1, 7); vx.globalAlpha = 1;
+  const size = vText(title, VL, 850 + (1 - t1) * 40, { size: 92, weight: 800, color: ink, spacing: -2, alpha: t1, max: VR - VL });
+  const y2 = 850 + Math.max(size, 60) * 0.25 + 70;
+  vx.font = `600 44px ${FONT}`;
+  const lead = 'drawn in code  ·  ', lw = vx.measureText(lead).width;
+  vText(lead, VL, y2 + (1 - t2) * 24, { size: 44, weight: 600, color: dim, alpha: t2 });
+  vText('bytepatterns.com', VL + lw, y2 + (1 - t2) * 24, { size: 44, weight: 800, color: accent, alpha: t2 });
+  if (line) vText(line, VL, y2 + 72 + (1 - t3) * 18, { size: 32, weight: 500, color: dim, alpha: t3, max: VR - VL });
+}
+/** Seeks a cut. The first frame a page draws is drawn twice: the very first read of a
+ *  GPU-backed source canvas can come out a shade different from every later one. */
+let vWarm = false;
+function vSeek(draw, i, frames) {
+  const f = Math.max(0, Math.min(frames - 1, Math.floor(i)));
+  if (!vWarm) { vWarm = true; draw(f); }
+  draw(f);
+}
+/** The soundtrack of a cut: the piece's own audio() spliced to the same segments as the picture. */
+async function vAudio(segs, frames, { xf = 0.025, fadeOut = 0.6, extra = null } = {}) {
+  const src = await renderAudio();
+  const SR = 48000, dur = frames / FPS, ac = new OfflineAudioContext(2, Math.round(SR * dur), SR);
+  const out = ac.createGain(); out.connect(ac.destination);
+  out.gain.setValueAtTime(1, 0); out.gain.setValueAtTime(1, dur - fadeOut); out.gain.linearRampToValueAtTime(0, dur - 0.01);
+  segs.forEach((s, k) => {
+    const at = s.at / FPS, off = s.src / FPS, d = s.len / FPS;
+    const pre = k === 0 ? 0 : Math.min(xf, off), post = k === segs.length - 1 ? 0 : xf;
+    const b = ac.createBufferSource(), g = ac.createGain(); b.buffer = src;
+    g.gain.setValueAtTime(pre ? 0 : 1, at - pre);
+    if (pre) g.gain.linearRampToValueAtTime(1, at + pre);
+    if (post) { g.gain.setValueAtTime(1, at + d - post); g.gain.linearRampToValueAtTime(0, at + d + post); }
+    b.connect(g).connect(out); b.start(at - pre, off - pre, d + pre + post);
+  });
+  if (extra) extra(ac, out);
+  const buf = await ac.startRendering();
+  let peak = 0; for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) peak = Math.max(peak, Math.abs(d[i])); }
+  if (peak > 0.9) for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) d[i] *= 0.9 / peak; }
+  return buf;
+}
+/** A soft three-partial bell, for the closing card. */
+function vChime(ac, dest, at, freq, vol = 0.08) {
+  for (const [mul, v, dec] of [[1, 1, 1.8], [2.01, 0.35, 0.8], [3.02, 0.12, 0.4]]) {
+    const o = ac.createOscillator(), g = ac.createGain(); o.type = 'sine'; o.frequency.value = freq * mul;
+    g.gain.setValueAtTime(0.0001, at); g.gain.exponentialRampToValueAtTime(vol * v, at + 0.006); g.gain.exponentialRampToValueAtTime(0.0001, at + dec);
+    o.connect(g).connect(dest); o.start(at); o.stop(at + dec + 0.05);
+  }
+}
+
+/* VERTICAL CUT — this piece */
+// The same two runs on a 1080 x 1920 stage and a faster clock: shorter lane names, the same milliseconds.
+const TLV = buildTL({ g0: 30, a0: 52, sweepA: 120, gap: 10, sweepB: 190, table: 110, calmT: 24 });
+const VFR = TLV.end + 60, VEND = VFR - 60;
+const GV = { TL: TLV, w: VW, h: VH, lx: VL, x0: VL + 120, x1: VR, short: true, stepA: 40, stepB: 100,
+  namesA: ['coord', 'orders', 'pay', 'stock'], namesB: ['orch', 'orders', 'pay', 'stock'],
+  A: { ty: 530, y: [586, 648, 710, 772], col: C.no, ry: 34, ax: 824 },
+  B: { ty: 890, y: [944, 1006, 1068, 1130], col: C.go, ry: -34, ax: 1222 },
+  tbl: { x: VL + 10, y: 620, w: VR - VL - 20, c2: VL + 540, c3: VR - 10, rh: 84, hs: 32, ls: 36, vs: 40, pad: 26 },
+  capX: VL, capY: 390, cap: 42, capTwo: true, capMax: VR - VL,
+  fn: 76, fnX: VL, fnY: 760, fnAlign: 'left', fnMax: VR - VL, fnTwo: true };
+function hookV(v) {
+  const o = 1 - E.inCubic(prog(v, TLV.g0 - 10, TLV.g0 + 4));
+  if (o <= 0) return;
+  vx.save(); vx.fillStyle = `rgba(${C.bgRGB},${0.86 * o})`; vx.fillRect(SAFE.x, 400, SAFE.w, 560); vx.restore();
+  vHook(v, ['Payment', 'went through.', 'Stock is', 'sold out.'], 510, { size: 104, accent: C.accent, color: C.paper, weight: 900, spacing: -2, alpha: o });
+}
+function vDraw(v) {
+  if (vx.reset) vx.reset();
+  vReset();
+  vx.fillStyle = C.bg; vx.fillRect(0, 0, VW, VH);
+  scene(vx, GV, v);
+  hookV(v);
+  vReset();
+  vShade(C.bgRGB, 0.86);
+  vTag('2PC VS SAGA', C.accent);
+  if (v >= VEND) vEndCard(v - VEND, { title: 'Two-Phase Commit vs Saga', line: `locks held ${TPC.held} ms  ·  or a charge visible ${SAGA.visible} ms`,
+    ink: C.paper, dim: 'rgba(241,238,230,0.72)', accent: C.accent, scrim: C.bgRGB, a: 0.88 });
+  vReset();
+}
+
+// The player asks for a frame on every display refresh; at 30 fps on a 60 Hz screen every other call
+// asks for the frame already on the canvas, which is then left as it is (same frame, same pixels).
+const shown = { L: -1, V: -1 };
+window.__motion = {
+  title: 'Two-Phase Commit vs Saga',
+  description: `One order touches Orders, Payments and Stock, and Stock is sold out: two-phase commit prepares all three at once, holds their locks for ${TPC.held} ms in all while the votes come in, aborts on the one no and is done in ${TPC.done} ms with ${TPC.msgs.length} messages, but a read of Payments waits ${TPC.wait} ms; a saga commits each step at once and undoes the charge and the order with ${SAGA.comp} compensating steps, ${SAGA.msgs.length} messages in ${SAGA.done} ms, never holding a lock longer than ${SAGA.longest} ms, but its $${AMOUNT} charge stands for ${SAGA.visible} ms before the refund.`,
+  fps: FPS, width: W, height: H, frames: FRAMES,
+  poster: Math.round(fB(TLL, SAGA.read + 20)),
+  gifStart: Math.floor(TLL.a0 / FPS),
+  seek(i) { const f = Math.max(0, Math.min(FRAMES - 1, Math.floor(i))); if (f !== shown.L) { shown.L = f; draw(f); } },
+  audio: () => renderAudio(TLL, FRAMES),
+  variants: {
+    vertical: {
+      width: VW, height: VH, frames: VFR, canvas: vcv,
+      poster: Math.round(fB(TLV, SAGA.read + 20)), gifStart: Math.floor(TLV.a0 / FPS),
+      seek(i) { const v = Math.max(0, Math.min(VFR - 1, Math.floor(i))); if (v !== shown.V) { shown.V = v; vSeek(vDraw, v, VFR); } },
+      audio: () => renderAudio(TLV, VFR),
+    },
+  },
+};
+
+
+/* ==========================================================================
+   PLAYER — identical in every piece; keep as is.
+   Autoplays and loops, starts sound on the first click, ?frame=N pauses on a
+   frame, ?variant=vertical plays the vertical cut (if the piece has one).
+   When the renderer sets window.__MOTION_RENDER__ it stays out of the way.
+   ========================================================================== */
+(function player() {
+  const btn = document.getElementById('sound'), q = new URLSearchParams(location.search);
+  let M = window.__motion;
+  const V = !window.__MOTION_RENDER__ && M.variants && M.variants[q.get('variant')];
+  if (V) {                                                // show the variant's own canvas instead
+    M = Object.assign({}, M, V);
+    V.canvas.style.cssText = `width:min(100vw,calc(100vh*${V.width}/${V.height}));height:auto;aspect-ratio:${V.width}/${V.height}`;
+    document.querySelector('canvas').replaceWith(V.canvas);
+  }
+  const dur = M.frames / M.fps;
+  if (window.__MOTION_RENDER__) { btn.hidden = true; M.seek(0); return; }
+  if (q.has('frame')) { btn.hidden = true; M.seek(+q.get('frame') || 0); return; }
+  let t0 = performance.now(), ac = null, src = null, buf = null, paused = false, pausedAt = 0;
+  const clock = () => ac && src ? (ac.currentTime - t0) : (performance.now() - t0) / 1000;
+  function loop() {
+    if (!paused) M.seek(Math.floor(((clock() % dur) + dur) % dur * M.fps));
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+  btn.addEventListener('click', async () => {
+    if (src) { src.stop(); src = null; btn.textContent = 'Click for sound'; t0 = performance.now(); return; }
+    btn.textContent = 'Loading sound…';
+    ac = ac || new AudioContext({ sampleRate: 48000 });
+    buf = buf || await M.audio();
+    await ac.resume();
+    src = ac.createBufferSource(); src.buffer = buf; src.loop = true; src.connect(ac.destination);
+    t0 = ac.currentTime + 0.05; src.start(t0);        // picture restarts from frame 0 in sync with the sound
+    btn.textContent = 'Sound on — click to mute';
+  });
+  addEventListener('keydown', e => {
+    if (e.code !== 'Space') return;
+    e.preventDefault(); paused = !paused;
+    if (ac) paused ? ac.suspend() : ac.resume();
+    if (!ac) { if (paused) pausedAt = performance.now(); else t0 += performance.now() - pausedAt; }
+  });
+})();
+</script>
+</body>
+</html>
