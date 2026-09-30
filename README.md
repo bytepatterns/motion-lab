@@ -765,6 +765,71 @@ Click a preview to open the piece live in your browser (click once more there fo
 <br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/58-de-casteljau/?variant=vertical">open</a> · <a href="out/58-de-casteljau.vertical.png">still</a></sub>
 </td>
 </tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/59-kmp-failure-table/"><img src="out/59-kmp-failure-table.gif" width="100%" alt="KMP: Never Step Back — animated preview"></a>
+<br><b>59 · KMP: Never Step Back</b> <sub>26 s</sub>
+<br>The 9-letter pattern ABABCABAB builds its failure table (0 0 1 2 0 1 2 3 4) in 9 comparisons, then both searches scan a 44-letter text: naive slides one letter and starts over, stepping its text pointer back 45 letters in 103 comparisons, while KMP slides by the table, never steps back and finds the same three matches (at 10, 15, 28, two of them overlapping) in 56.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/59-kmp-failure-table/">open in browser</a> · <a href="out/59-kmp-failure-table.png">still</a> · <a href="projects/59-kmp-failure-table/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/59-kmp-failure-table/?variant=vertical"><img src="out/59-kmp-failure-table.vertical.gif" width="100%" alt="KMP: Never Step Back — vertical cut, animated preview"></a>
+<br><sub>9:16 · 18 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/59-kmp-failure-table/?variant=vertical">open</a> · <a href="out/59-kmp-failure-table.vertical.png">still</a></sub>
+</td>
+</tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/60-union-find/"><img src="out/60-union-find.gif" width="100%" alt="Union-Find: Flatten the Forest — animated preview"></a>
+<br><b>60 · Union-Find: Flatten the Forest</b> <sub>27 s</sub>
+<br>16 elements go through the same 22 unions and finds twice: plain linking grows a chain 5 tall and ends at height 6 after 40 parent hops, while union by rank with path compression never gets taller than 3, re-points 6 nodes straight at their root and ends at height 2 after 16.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/60-union-find/">open in browser</a> · <a href="out/60-union-find.png">still</a> · <a href="projects/60-union-find/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/60-union-find/?variant=vertical"><img src="out/60-union-find.vertical.gif" width="100%" alt="Union-Find: Flatten the Forest — vertical cut, animated preview"></a>
+<br><sub>9:16 · 19 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/60-union-find/?variant=vertical">open</a> · <a href="out/60-union-find.vertical.png">still</a></sub>
+</td>
+</tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/61-hyperloglog/"><img src="out/61-hyperloglog.gif" width="100%" alt="HyperLogLog: Count Without Remembering — animated preview"></a>
+<br><b>61 · HyperLogLog: Count Without Remembering</b> <sub>27 s</sub>
+<br>40,000 visits are hashed by visitor id into 64 registers of 5 bits (40 bytes): the first 6 bits of each hash pick a register, which keeps the longest run of leading zeros it has seen, a returning visitor changes nothing, and the harmonic mean of the registers estimates 26,668 distinct visitors against the true 27,589, off by 3.3% where about ±13% is expected, while an exact list of 32-bit hashes would take 108 KB.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/61-hyperloglog/">open in browser</a> · <a href="out/61-hyperloglog.png">still</a> · <a href="projects/61-hyperloglog/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/61-hyperloglog/?variant=vertical"><img src="out/61-hyperloglog.vertical.gif" width="100%" alt="HyperLogLog: Count Without Remembering — vertical cut, animated preview"></a>
+<br><sub>9:16 · 20 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/61-hyperloglog/?variant=vertical">open</a> · <a href="out/61-hyperloglog.vertical.png">still</a></sub>
+</td>
+</tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/62-newton-basins/"><img src="out/62-newton-basins.gif" width="100%" alt="Newton's Basins — animated preview"></a>
+<br><b>62 · Newton's Basins</b> <sub>27 s</sub>
+<br>Newton's method on z³ = 1: 4 starting points reach the three roots in 5, 6, 6, 9 steps, then every point of the plane is coloured by the root it reaches, 96% of them within 12 steps (5.8 on average), and a ×64 zoom into a boundary still shows all three basins, in shares of 28.7%, 35.6%, 35.6%.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/62-newton-basins/">open in browser</a> · <a href="out/62-newton-basins.png">still</a> · <a href="projects/62-newton-basins/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/62-newton-basins/?variant=vertical"><img src="out/62-newton-basins.vertical.gif" width="100%" alt="Newton's Basins — vertical cut, animated preview"></a>
+<br><sub>9:16 · 19 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/62-newton-basins/?variant=vertical">open</a> · <a href="out/62-newton-basins.vertical.png">still</a></sub>
+</td>
+</tr>
+<tr>
+<td width="72%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/63-wave-function-collapse/"><img src="out/63-wave-function-collapse.gif" width="100%" alt="Wave Function Collapse — animated preview"></a>
+<br><b>63 · Wave Function Collapse</b> <sub>27 s</sub>
+<br>A 22 by 18 grid starts with all 7 terrains in every cell and one rule, neighbours differ by at most one level; 349 collapses of the lowest-entropy cell, each followed by propagation, remove 1,875 options, decide 47 more cells by the rule alone and end in a map that is 35% water, with no contradictions.
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/63-wave-function-collapse/">open in browser</a> · <a href="out/63-wave-function-collapse.png">still</a> · <a href="projects/63-wave-function-collapse/index.html">source</a></sub>
+</td>
+<td width="28%" valign="top">
+<a href="https://bytepatterns.github.io/motion-lab/projects/63-wave-function-collapse/?variant=vertical"><img src="out/63-wave-function-collapse.vertical.gif" width="100%" alt="Wave Function Collapse — vertical cut, animated preview"></a>
+<br><sub>9:16 · 20 s</sub>
+<br><sub><a href="https://bytepatterns.github.io/motion-lab/projects/63-wave-function-collapse/?variant=vertical">open</a> · <a href="out/63-wave-function-collapse.vertical.png">still</a></sub>
+</td>
+</tr>
 </table>
 <!-- gallery:end -->
 

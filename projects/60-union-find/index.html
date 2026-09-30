@@ -1,0 +1,625 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="author" content="teambytepatterns">
+<meta name="description" content="Sixteen elements go through the same unions and finds twice: plain linking lets a chain grow, union by rank keeps every tree short, and path compression re-points each node a find walks past straight at its root, so the second forest ends flatter after far fewer parent hops.">
+<title>Union-Find: Flatten the Forest — motion-lab</title>
+<style>
+  /* Player chrome. The piece itself lives entirely in the canvas. */
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  body { display: grid; place-items: center; font: 500 15px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #fff; }
+  canvas { display: block; width: min(100vw, calc(100vh * 16 / 9)); height: auto; aspect-ratio: 16 / 9; }
+  #sound { position: fixed; left: 16px; bottom: 16px; padding: 8px 14px; border: 1px solid rgba(255,255,255,.35); border-radius: 999px;
+           background: rgba(0,0,0,.55); color: #fff; font: inherit; cursor: pointer; }
+  #sound[hidden] { display: none; }
+</style>
+</head>
+<body>
+<canvas id="stage" width="1920" height="1080" aria-label="Two panels, each with sixteen numbered circles in a row; lines join them into trees as the same operations are applied to both: on the left a tall chain hangs down, on the right the trees stay short, and whenever a yellow path is walked up to a root, the circles on it swing up to hang straight from the root"></canvas>
+<button id="sound" type="button">Click for sound</button>
+<script>
+'use strict';
+/* ==========================================================================
+   PIECE — Union-Find: Flatten the Forest.
+   A disjoint-set forest: every element points at a parent, a root points
+   at itself and names its set. find(x) follows parent pointers up to the
+   root; union(a, b) finds both roots and hangs one under the other.
+   Left, plain linking: the root of a always goes under the root of b.
+   Right, union by rank (the root of the lower-ranked tree goes under the
+   other; equal ranks: b's root under a's, whose rank grows by one) plus
+   path compression (every node a find walked past is re-pointed straight
+   at the root it found).
+   The same list of operations runs on both forests once at load: every
+   walked path, every hop, every re-pointed node and the tree layout after
+   each operation are recorded. A frame maps to a step of that record, so
+   seek(i) is pure in i.
+   ========================================================================== */
+const W = 1920, H = 1080, FPS = 30;
+const cv = document.getElementById('stage');
+const ctx = cv.getContext('2d', { willReadFrequently: true });   // CPU raster: identical pixels on every redraw
+const FONT = 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
+const MONO = 'ui-monospace, "Cascadia Code", Consolas, Menlo, monospace';
+
+// ---- helpers -------------------------------------------------------------
+function mulberry32(a) { return function () { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a);
+  t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const lerp = (a, b, t) => a + (b - a) * t;
+const prog = (f, a, b) => clamp((f - a) / (b - a));
+const smooth = t => t * t * (3 - 2 * t);
+const E = {
+  inCubic: t => t * t * t,
+  outCubic: t => 1 - Math.pow(1 - t, 3),
+  inOutCubic: t => t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2,
+  outExpo: t => t === 1 ? 1 : 1 - Math.pow(2, -10 * t),
+  inExpo: t => t === 0 ? 0 : Math.pow(2, 10 * t - 10),
+  inOutExpo: t => t === 0 ? 0 : t === 1 ? 1 : t < .5 ? Math.pow(2, 20 * t - 10) / 2 : (2 - Math.pow(2, -20 * t + 10)) / 2,
+  outBack: t => 1 + 2.70158 * Math.pow(t - 1, 3) + 1.70158 * Math.pow(t - 1, 2),
+};
+/** Canvas text; `max` shrinks the size until the line fits. Returns the width drawn. */
+function text(g, str, x, y, { size = 40, weight = 600, color = '#fff', alpha = 1, spacing = 0, align = 'left', fam = FONT, base = 'alphabetic', max = 0 } = {}) {
+  if (alpha <= 0.002 || !str) return 0;
+  g.font = `${weight} ${size}px ${fam}`; g.letterSpacing = spacing + 'px';
+  if (max) { const w0 = g.measureText(str).width; if (w0 > max) { size *= max / w0; g.font = `${weight} ${size}px ${fam}`; } }
+  g.textAlign = align; g.textBaseline = base;
+  const a0 = g.globalAlpha; g.globalAlpha = a0 * alpha; g.fillStyle = color;
+  g.fillText(str, x, y);
+  const w = g.measureText(str).width;
+  g.globalAlpha = a0; g.letterSpacing = '0px';
+  return w;
+}
+const measure = (g, str, size, weight = 800, fam = FONT, spacing = 0) => { g.font = `${weight} ${size}px ${fam}`; g.letterSpacing = spacing + 'px'; const w = g.measureText(str).width; g.letterSpacing = '0px'; return w; };
+const env = (f, a, b, fin = 12, fout = 10) => {
+  const i = E.outCubic(prog(f, a, a + fin)), o = 1 - E.inCubic(prog(f, b - fout, b));
+  return [Math.min(i, o), (1 - i) * 24 - (1 - o) * 10];
+};
+
+
+// ---- palette -------------------------------------------------------------
+const C = {
+  bg: '#0B0D14', bgRGB: '11,13,20', paper: '#F1EEE6', paperRGB: '241,238,230', dim: 'rgba(241,238,230,0.62)', faint: 'rgba(241,238,230,0.16)',
+  accent: '#FFC857', accentRGB: '255,200,87', go: '#5CD6CB', goRGB: '92,214,203', no: '#FF5E6C', noRGB: '255,94,108', node: '#151A28',
+  plain: '#8FA8FF', plainRGB: '143,168,255',
+};
+
+// ---- the operations, run on both forests once -------------------------------------------------
+const N = 16;
+// friends arriving one after another (a chain for plain linking), two groups built pair by pair,
+// everything joined, then look-ups of the deepest members
+const OPS = [
+  ...[0, 1, 2, 3, 4].map(k => ({ t: 'u', a: k, b: k + 1, chain: true })),
+  { t: 'f', a: 0 },
+  { t: 'u', a: 6, b: 7 }, { t: 'u', a: 8, b: 9 }, { t: 'u', a: 6, b: 8 },
+  { t: 'u', a: 10, b: 11 }, { t: 'u', a: 12, b: 13 }, { t: 'u', a: 10, b: 12 }, { t: 'u', a: 14, b: 15 }, { t: 'u', a: 10, b: 14 },
+  { t: 'u', a: 6, b: 10 }, { t: 'u', a: 0, b: 6 },
+  { t: 'f', a: 0 }, { t: 'f', a: 13 }, { t: 'f', a: 11 }, { t: 'f', a: 1 }, { t: 'f', a: 15 }, { t: 'f', a: 13 },
+];
+const NOPS = OPS.length;
+const heightOf = par => { let h = 0; for (let i = 0; i < N; i++) { let x = i, d = 0; while (par[x] !== x) { x = par[x]; d++; } h = Math.max(h, d); } return h; };
+const setsOf = par => par.filter((p, i) => p === i).length;
+function run(smart) {
+  const par = [...Array(N).keys()], rank = new Array(N).fill(0), steps = [];
+  let hops = 0, rew = 0;
+  const find = (x, rw) => {
+    const path = [x]; while (par[x] !== x) { x = par[x]; path.push(x); }
+    if (smart) for (const y of path.slice(0, -2)) { par[y] = x; rw.push(y); }
+    return path;
+  };
+  for (const op of OPS) {
+    const before = par.slice(), rw = [], paths = [];
+    let link = null;
+    if (op.t === 'u') {
+      const pa = find(op.a, rw), pb = find(op.b, rw), ra = pa[pa.length - 1], rb = pb[pb.length - 1];
+      paths.push(pa, pb);
+      if (ra !== rb) {
+        if (!smart || rank[ra] < rank[rb]) link = [ra, rb];
+        else if (rank[ra] > rank[rb]) link = [rb, ra];
+        else { link = [rb, ra]; rank[ra]++; }
+        par[link[0]] = link[1];
+      }
+    } else paths.push(find(op.a, rw));
+    const h = paths.reduce((s, p) => s + p.length - 1, 0);
+    hops += h; rew += rw.length;
+    steps.push({ op, before, after: par.slice(), paths, rw, link, h, hops0: hops - h, hops, rew, height: heightOf(par), sets: setsOf(par) });
+  }
+  return { steps, hops, rew, height: heightOf(par), smart };
+}
+const PL = run(false), SM = run(true);
+// tidy layout of a forest: leaves take slots left to right, a parent sits over its children
+function layout(par) {
+  const kids = Array.from({ length: N }, () => []);
+  for (let i = 0; i < N; i++) if (par[i] !== i) kids[par[i]].push(i);
+  const x = new Array(N).fill(0), d = new Array(N).fill(0);
+  let cur = 0;
+  const dfs = (v, depth) => {
+    d[v] = depth;
+    if (!kids[v].length) { x[v] = cur++; return; }
+    for (const c of kids[v]) dfs(c, depth + 1);
+    x[v] = (x[kids[v][0]] + x[kids[v][kids[v].length - 1]]) / 2;
+  };
+  for (let i = 0; i < N; i++) if (par[i] === i) { dfs(i, 0); cur += 0.15; }
+  return { x, d, span: cur - 0.15 };
+}
+for (const S of [PL, SM]) { S.lay = [layout(S.steps[0].before), ...S.steps.map(s => layout(s.after))]; }
+const HOPS_OP = OPS.map((o, q) => Math.max(...PL.steps[q].paths.concat(SM.steps[q].paths).map(p => p.length - 1)));
+const CHAIN_N = OPS.filter(o => o.chain).length, CHAIN_H = PL.steps[CHAIN_N - 1].height, CHAIN_HS = SM.steps[CHAIN_N - 1].height;
+const FIRST_RW = SM.steps.findIndex(s => s.rw.length > 0);
+const WORDS = ['no', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten', 'eleven', 'twelve', 'thirteen', 'fourteen', 'fifteen', 'sixteen'];
+const word = n => WORDS[n] || String(n);
+const opStr = o => o.t === 'u' ? `union(${o.a}, ${o.b})` : `find(${o.a})`;
+
+// ---- timeline -------------------------------------------------------------------------------
+// the nodes appear at n0; operation q runs [op[q].a, op[q].z): its finds walk one hop per `hop`
+// frames from a + lead, then the forest moves to its new shape over `move` frames.
+function buildTL(o) {
+  const TL = Object.assign({}, o);
+  TL.op = []; let t = TL.o0;
+  for (let q = 0; q < NOPS; q++) {
+    const walk = TL.lead + HOPS_OP[q] * TL.hop, a = t, w = a + walk, z = w + TL.move;
+    TL.op.push({ a, w, z }); t = z + TL.gap;
+  }
+  TL.o1 = t; TL.calm = TL.o1 + TL.hold; TL.end = Math.round(TL.calm + TL.calmT);
+  const q6 = TL.op[CHAIN_N + 1].a, qr = TL.op[Math.max(FIRST_RW, CHAIN_N + 2)].a;
+  TL.caps = [
+    [TL.n0, TL.op[0].a - 2, `${N} elements, each its own set.|union joins two sets; find walks up to the root.`],
+    [TL.op[0].a, q6 - 2, `Plain linking hangs one root under the other:|in this order, a chain ${CHAIN_H} tall.`],
+    [q6, qr - 2, `Union by rank hangs the shorter tree under the taller:|those ${word(CHAIN_N)} unions left it ${CHAIN_HS} tall.`],
+    [qr, TL.calm - 2, `Path compression: every node a find walks past|is re-pointed straight at the root.`],
+  ];
+  return TL;
+}
+/** Where the operations are at frame f: index, phase and the eased move between layouts. */
+function opAt(TL, f) {
+  if (f < TL.op[0].a) return { q: -1, k: 0, walk: -1 };
+  let q = 0; while (q < NOPS - 1 && f >= TL.op[q + 1].a) q++;
+  const o = TL.op[q];
+  return { q, walk: (f - o.a - TL.lead) / TL.hop, k: E.inOutCubic(prog(f, o.w, o.z)), inOp: f < o.z + TL.gap, o };
+}
+
+// ---- drawing ------------------------------------------------------------------------------
+function pill(g, str, x, y, size, col, alpha, align = 'left') {
+  if (alpha <= 0.01) return;
+  const w = measure(g, str, size, 800, MONO) + 28, h = size + 18, x0 = align === 'right' ? x - w : align === 'center' ? x - w / 2 : x;
+  g.save(); g.globalAlpha = alpha; g.fillStyle = C.bg; g.beginPath(); g.roundRect(x0, y - h / 2, w, h, h / 2); g.fill(); g.strokeStyle = col; g.lineWidth = 2.5; g.stroke(); g.restore();
+  text(g, str, x0 + 14, y + 1, { size, weight: 800, color: col, base: 'middle', fam: MONO, alpha });
+}
+function forest(g, G, P, S, f, col, colRGB, name) {
+  const TL = G.TL, [a] = env(f, TL.n0, TL.end + 14, 16, 20);
+  if (a <= 0) return;
+  const st = opAt(TL, f), q = st.q;
+  const map = (L, i) => {
+    const sp = Math.min(G.slot, P.w / Math.max(1, L.span + 1.1));
+    return [P.x + P.w / 2 + (L.x[i] - L.span / 2) * sp, P.y + L.d[i] * P.dy];
+  };
+  const L0 = S.lay[Math.max(0, q)], L1 = S.lay[Math.max(0, q + 1)];
+  const k = q < 0 ? 0 : st.k;
+  const pos = i => { const p0 = map(q < 0 ? S.lay[0] : L0, i), p1 = map(q < 0 ? S.lay[0] : L1, i); return [lerp(p0[0], p1[0], k), lerp(p0[1], p1[1], k)]; };
+  const step = q >= 0 ? S.steps[q] : null;
+  const par0 = step ? step.before : [...Array(N).keys()], par1 = step ? step.after : par0;
+  const ia = a * E.outCubic(prog(f, TL.n0, TL.n0 + 20));
+  // title and counters
+  const hopsNow = !step ? 0 : step.hops0 + Math.min(step.h, step.paths.reduce((s, p) => s + clamp(Math.floor(st.walk + 1), 0, p.length - 1), 0));
+  const hNow = !step ? 0 : k >= 0.5 ? step.height : (q > 0 ? S.steps[q - 1].height : 0);
+  text(g, name, P.x, P.ty, { size: 30, weight: 850, color: col, spacing: 2, alpha: ia, max: P.w * 0.5 });
+  const w1 = text(g, `height ${hNow}`, P.x + P.w, P.ty, { size: 30, weight: 800, color: C.paper, align: 'right', fam: MONO, alpha: ia });
+  text(g, `${hopsNow} hops  ·  `, P.x + P.w - w1, P.ty, { size: 30, weight: 800, color: col, align: 'right', fam: MONO, alpha: ia });
+  // the walked paths: which edges are lit (hop index reached)
+  const lit = new Map();                               // "child" -> lit amount
+  const onPath = new Map();
+  if (step && f < st.o.z + 6) {
+    const fade = 1 - E.inCubic(prog(f, st.o.z - 6, st.o.z + 6));
+    for (const p of step.paths) p.forEach((v, j) => {
+      const on = clamp(st.walk - j + 1);
+      onPath.set(v, Math.max(onPath.get(v) || 0, (j === 0 ? clamp(st.walk + 1.5) : on) * fade));
+      if (j < p.length - 1) lit.set(v, Math.max(lit.get(v) || 0, clamp(st.walk - j) * fade));
+    });
+  }
+  const rw = step ? new Set(step.rw) : new Set();
+  // edges: child -> parent. A pointer that changes fades out while the new one grows in.
+  g.save(); g.lineCap = 'round';
+  for (let i = 0; i < N; i++) {
+    const [x, y] = pos(i);
+    const drawEdge = (p, alpha, colr, lw) => {
+      if (p === i || alpha <= 0.01) return;
+      const [px, py] = pos(p);
+      g.globalAlpha = ia * alpha; g.strokeStyle = colr; g.lineWidth = lw;
+      g.beginPath(); g.moveTo(x, y); g.lineTo(px, py); g.stroke();
+    };
+    const p0 = par0[i], p1 = par1[i];
+    if (p0 === p1) drawEdge(p0, 0.7, `rgba(${colRGB},0.8)`, 3);
+    else {
+      drawEdge(p0, 0.7 * (1 - k), `rgba(${colRGB},0.8)`, 3);
+      const isLink = step.link && step.link[0] === i;
+      const grow = k;
+      if (grow > 0) {
+        const [px, py] = pos(p1);
+        g.globalAlpha = ia * clamp(grow * 1.5); g.strokeStyle = isLink ? C.accent : C.go; g.lineWidth = 4.5;
+        g.beginPath(); g.moveTo(x, y); g.lineTo(lerp(x, px, grow), lerp(y, py, grow)); g.stroke();
+      }
+    }
+    const l = lit.get(i);
+    if (l > 0 && p0 !== i) {
+      const [px, py] = pos(p0);
+      g.globalAlpha = ia; g.strokeStyle = C.accent; g.lineWidth = 6;
+      g.beginPath(); g.moveTo(x, y); g.lineTo(lerp(x, px, l), lerp(y, py, l)); g.stroke();
+    }
+  }
+  g.restore();
+  // nodes
+  for (let i = 0; i < N; i++) {
+    const [x, y] = pos(i), root = par1[i] === i && (k >= 0.5 || par0[i] === i);
+    const on = onPath.get(i) || 0, re = rw.has(i) ? E.outCubic(prog(f, st.o.w, st.o.w + 8)) * (1 - E.inCubic(prog(f, st.o.z, st.o.z + 10))) : 0;
+    g.save(); g.globalAlpha = ia; g.fillStyle = on > 0.5 ? `rgba(${C.accentRGB},0.3)` : re > 0.3 ? `rgba(${C.goRGB},0.3)` : C.node;
+    g.beginPath(); g.arc(x, y, G.r, 0, Math.PI * 2); g.fill();
+    g.strokeStyle = on > 0.5 ? C.accent : re > 0.3 ? C.go : root ? C.paper : `rgba(${colRGB},0.7)`; g.lineWidth = root || on > 0.5 ? 3.5 : 2.5; g.stroke(); g.restore();
+    text(g, String(i), x, y + 1, { size: G.lab, weight: 800, color: C.paper, align: 'center', base: 'middle', fam: MONO, alpha: ia, spacing: -1 });
+  }
+}
+function opLabel(g, G, f) {
+  const TL = G.TL, st = opAt(TL, f);
+  if (st.q < 0 || f >= TL.o1 + 4) return;
+  const o = st.o, al = Math.min(E.outCubic(prog(f, o.a - 2, o.a + 6)), 1 - E.inCubic(prog(f, o.z + TL.gap - 4, o.z + TL.gap)));
+  const s1 = PL.steps[st.q], s2 = SM.steps[st.q];
+  let str = opStr(OPS[st.q]);
+  if (s2.rw.length && f >= o.w) str += `  ·  ${s2.rw.length} re-pointed`;
+  pill(g, str, G.opX, G.opY, G.pill, s2.rw.length && f >= o.w ? C.go : C.accent, al, G.opAlign);
+  void s1;
+}
+function caption(g, G, f) {
+  for (const [t0, t1, str] of G.TL.caps) {
+    const [a, dy] = env(f, t0, t1, 10, 8); if (a <= 0) continue;
+    const [p1, p2] = str.split('|');
+    if (G.capTwo) {
+      text(g, p1, G.capX, G.capY + dy, { size: G.cap, weight: 850, color: C.paper, spacing: -1, alpha: a, max: G.capMax });
+      text(g, p2, G.capX, G.capY + G.cap * 1.14 + dy, { size: G.cap, weight: 850, color: C.accent, spacing: -1, alpha: a, max: G.capMax });
+    } else {
+      const w1 = measure(g, p1 + ' ', G.cap, 850, FONT, -1), w2 = measure(g, p2, G.cap, 850, FONT, -1), sc = Math.min(1, G.capMax / (w1 + w2));
+      const w = text(g, p1 + ' ', G.capX, G.capY + dy, { size: G.cap * sc, weight: 850, color: C.paper, spacing: -1, alpha: a });
+      text(g, p2, G.capX + w, G.capY + dy, { size: G.cap * sc, weight: 850, color: C.accent, spacing: -1, alpha: a });
+    }
+  }
+}
+function readout(g, G, f) {
+  const TL = G.TL, [a] = env(f, TL.n0, TL.calm, 12, 10);
+  if (a <= 0) return;
+  const st = opAt(TL, f), q = st.q, sets = q < 0 ? N : (st.k >= 0.5 ? SM.steps[q].sets : (q > 0 ? SM.steps[q - 1].sets : N));
+  text(g, `operation ${Math.max(0, q + 1)} of ${NOPS}`, G.foX, G.foY, { size: G.fo, weight: 700, color: C.paper, fam: MONO, alpha: a, align: G.foAlign });
+  text(g, `${N} elements  ·  ${sets} ${sets === 1 ? 'set' : 'sets'}`, G.foX2, G.foY2, { size: G.fo, weight: 700, color: C.dim, fam: MONO, alpha: a, align: G.foAlign2 });
+}
+function finale(g, G, f) {
+  const TL = G.TL, k1 = E.outCubic(prog(f, TL.calm, TL.calm + 18)), k2 = E.outCubic(prog(f, TL.calm + 10, TL.calm + 28));
+  if (k1 <= 0) return;
+  const out = 1 - E.inCubic(prog(f, TL.end - 6, TL.end + 12));
+  g.save(); g.fillStyle = `rgba(${C.bgRGB},${0.86 * k1 * out})`; g.fillRect(0, G.fnY - G.fn * 1.2, G.w, G.fn * 2.9); g.restore();
+  text(g, `${SM.hops} hops, not ${PL.hops}.`, G.fnX, G.fnY, { size: G.fn, weight: 900, color: C.paper, spacing: -2, align: G.fnAlign, alpha: k1 * out, max: G.fnMax });
+  text(g, `height ${SM.height} against ${PL.height}  ·  ${SM.rew} pointers re-pointed on the way`, G.fnX, G.fnY + G.fn * 1.05, { size: G.fn * 0.5, weight: 850, color: C.accent, spacing: -1, align: G.fnAlign, alpha: k2 * out, max: G.fnMax });
+}
+function scene(g, G, f) {
+  forest(g, G, G.P[0], PL, f, C.plain, C.plainRGB, 'PLAIN LINKING');
+  forest(g, G, G.P[1], SM, f, C.accent, C.accentRGB, 'RANK + COMPRESSION');
+  if (G.divider) { const [a] = env(f, G.TL.n0, G.TL.end + 14, 16, 20); g.save(); g.globalAlpha = a; g.fillStyle = C.faint; g.fillRect(...G.divider); g.restore(); }
+  opLabel(g, G, f); caption(g, G, f); readout(g, G, f); finale(g, G, f);
+}
+
+// ---- landscape picture ------------------------------------------------------------------
+const TLL = buildTL({ n0: 40, o0: 80, lead: 4, hop: 4, move: 12, gap: 2, hold: 16, calmT: 70 });
+const FRAMES = TLL.end + 72;
+const GL = { TL: TLL, w: W, h: H, pill: 30, r: 21, lab: 28, slot: 52,
+  P: [{ x: 110, w: 830, y: 440, dy: 72, ty: 360 }, { x: 980, w: 830, y: 440, dy: 72, ty: 360 }],
+  divider: [959, 330, 2, 590],
+  opX: W / 2, opY: 280, opAlign: 'center',
+  capX: 120, capY: 216, cap: 50, capTwo: false, capMax: 1680,
+  fo: 30, foX: 120, foY: 1004, foAlign: 'left', foX2: 1800, foY2: 1004, foAlign2: 'right',
+  fn: 100, fnX: W / 2, fnY: 600, fnAlign: 'center', fnMax: 1680 };
+function hookL(f) {
+  const o = 1 - E.inCubic(prog(f, TLL.n0 - 14, TLL.n0 + 4));
+  if (o <= 0) return;
+  const k = E.outExpo(prog(f, -8, 10)), k2 = E.outBack(prog(f, -6, 12));
+  ctx.save(); ctx.fillStyle = `rgba(${C.bgRGB},${0.8 * o})`; ctx.fillRect(0, 400, W, 330); ctx.restore();
+  text(ctx, 'Same unions, same finds.', W / 2, 540 + (1 - k) * 30, { size: 108, weight: 900, color: C.paper, spacing: -3, align: 'center', alpha: o * Math.max(0.3, k), max: 1700 });
+  text(ctx, 'One forest stays flat.', W / 2, 670 + (1 - clamp(k2)) * 30, { size: 108, weight: 900, color: C.accent, spacing: -3, align: 'center', alpha: o * Math.max(0.3, clamp(k2)) });
+}
+function draw(f) {
+  if (ctx.reset) ctx.reset();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; ctx.filter = 'none'; ctx.shadowBlur = 0;
+  ctx.fillStyle = C.bg; ctx.fillRect(0, 0, W, H);
+  const T = TLL, endK = E.inOutCubic(prog(f, T.end, T.end + 20)), a = 1 - endK;
+  scene(ctx, GL, f);
+  text(ctx, 'DATA STRUCTURES  ·  DISJOINT SETS', 120, 104, { size: 26, weight: 600, color: C.dim, spacing: 5, alpha: a });
+  text(ctx, 'BYTEPATTERNS', 1800, 104, { size: 26, weight: 600, color: C.dim, spacing: 5, align: 'right', alpha: a });
+  hookL(f);
+  if (endK > 0) {
+    ctx.fillStyle = `rgba(${C.bgRGB},${0.86 * endK})`; ctx.fillRect(0, 0, W, H);
+    const k1 = E.outCubic(prog(f, T.end + 6, T.end + 28)), k2 = E.outCubic(prog(f, T.end + 16, T.end + 38)), k3 = E.outCubic(prog(f, T.end + 26, T.end + 48));
+    text(ctx, 'Union-Find: Flatten the Forest', W / 2, 500 + (1 - k1) * 30, { size: 124, weight: 850, color: C.paper, spacing: -3, align: 'center', alpha: k1, max: 1680 });
+    text(ctx, `${N} elements  ·  ${NOPS} operations  ·  ${SM.hops} parent hops instead of ${PL.hops}  ·  height ${SM.height}, not ${PL.height}`, W / 2, 580 + (1 - k2) * 20, { size: 42, weight: 500, color: C.accent, align: 'center', alpha: k2, max: 1680 });
+    text(ctx, 'drawn in code  ·  bytepatterns.com', W / 2, 1000, { size: 32, weight: 600, color: C.paper, spacing: 3, align: 'center', alpha: k3 * 0.8 });
+  }
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.letterSpacing = '0px';
+}
+
+// ---- sound: a step per parent hop (lower the deeper), a thud per link, a sweep per compression ----
+async function renderAudio(TL = TLL, frames = FRAMES) {
+  const SR = 48000, dur = frames / FPS, LEN = Math.round(SR * dur);
+  const ac = new OfflineAudioContext(2, LEN, SR);
+  const at = fr => fr / FPS;
+  const comp = ac.createDynamicsCompressor();
+  comp.threshold.value = -16; comp.ratio.value = 3; comp.attack.value = 0.005; comp.release.value = 0.25;
+  const master = ac.createGain(); master.gain.value = 0.9; master.connect(comp).connect(ac.destination);
+  master.gain.setValueAtTime(0.9, dur - 1.0); master.gain.linearRampToValueAtTime(0.0001, dur - 0.02);
+  const rnd = mulberry32(0x60F1D);
+  const ir = ac.createBuffer(2, SR * 2, SR);
+  for (let c = 0; c < 2; c++) { const d = ir.getChannelData(c); for (let k = 0; k < d.length; k++) d[k] = (rnd() * 2 - 1) * Math.pow(1 - k / d.length, 3); }
+  const verb = ac.createConvolver(); verb.buffer = ir; const vg = ac.createGain(); vg.gain.value = 0.28; verb.connect(vg).connect(master);
+  const hz = m => 440 * Math.pow(2, (m - 69) / 12);
+  const pluck = (t0, m, amp, pan, dec = 0.35, type = 'triangle') => {
+    const o = ac.createOscillator(), g = ac.createGain(), p = ac.createStereoPanner(); o.type = type; o.frequency.value = hz(m);
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(amp, t0 + 0.004); g.gain.exponentialRampToValueAtTime(0.0001, t0 + dec);
+    p.pan.value = pan; o.connect(g).connect(p); p.connect(master); p.connect(verb); o.start(t0); o.stop(t0 + dec + 0.05);
+  };
+  const pad = (t0, t1, notes, amp, cutoff) => {
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = cutoff; lp.Q.value = 1; lp.connect(master); lp.connect(verb);
+    notes.forEach((m, i) => { for (const det of [-6, 6]) {
+      const o = ac.createOscillator(), g = ac.createGain(), p = ac.createStereoPanner(); o.type = 'sawtooth'; o.frequency.value = hz(m); o.detune.value = det;
+      p.pan.value = (i / Math.max(1, notes.length - 1) - 0.5) * 0.8 * Math.sign(det);
+      g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(amp, t0 + 0.8); g.gain.setValueAtTime(amp, Math.max(t0 + 0.8, t1 - 0.6)); g.gain.exponentialRampToValueAtTime(0.0001, t1 + 0.4);
+      o.connect(g).connect(p).connect(lp); o.start(t0); o.stop(t1 + 0.45); } });
+  };
+  const PENTA = [0, 2, 4, 7, 9, 12, 14, 16, 19, 21, 24, 26, 28];
+  const qMid = Math.floor(NOPS / 2);
+  pad(0, at(TL.op[qMid].a + 4), [45, 52, 57, 60], 0.012, 900);
+  pad(at(TL.op[qMid].a), at(TL.calm + 4), [43, 50, 55, 59, 62], 0.012, 1100);
+  pad(at(TL.calm), at(TL.end + 50), [48, 55, 60, 64, 67], 0.014, 1400);
+  for (let i = 0; i < N; i++) pluck(at(TL.n0 + 4 + i * 0.8), 72 + PENTA[i % 8], 0.018, (i / N - 0.5) * 1.2, 0.2, 'sine');
+  for (const [S, pan, base] of [[PL, -0.6, 64], [SM, 0.6, 71]]) {
+    S.steps.forEach((s, q) => {
+      const o = TL.op[q];
+      for (const p of s.paths) for (let j = 0; j < p.length - 1; j++) pluck(at(o.a + TL.lead + (j + 0.5) * TL.hop), base + PENTA[Math.max(0, 7 - j)], 0.03, pan, 0.14);
+      if (s.link) { pluck(at(o.w + 2), base - 24, 0.06, pan, 0.3, 'sine'); pluck(at(o.w + 3), base - 12, 0.03, pan, 0.25); }
+      s.rw.forEach((v, j) => pluck(at(o.w + 3 + j * 1.5), 84 + PENTA[j + 2], 0.035, pan, 0.4, 'sine'));
+    });
+  }
+  [69, 72, 76, 81].forEach((m, i) => pluck(at(TL.calm) + i * 0.09, m, 0.06, -0.3 + i * 0.2, 1.6, 'sine'));
+  [76, 81, 84, 88].forEach((m, i) => pluck(at(TL.end + 10 + i * 6), m, 0.05, -0.45 + i * 0.3, 1.8, 'sine'));
+  const buf = await ac.startRendering();
+  let peak = 0; for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let k = 0; k < d.length; k++) peak = Math.max(peak, Math.abs(d[k])); }
+  const norm = 0.85 / Math.max(peak, 1e-6);                          // every piece peaks at the same level
+  for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let k = 0; k < d.length; k++) d[k] *= norm; }
+  return buf;
+}
+
+/* ==========================================================================
+   VERTICAL CUT — shared block, identical in every piece.
+   1080x1920 for Reels, Shorts and TikTok (__motion.variants.vertical). The
+   piece's own scene code is re-used and recomposed for a phone: everything a
+   viewer must read stays inside the area no platform covers (x 60..900,
+   y 230..1400); outside it there is only dimmed texture.
+   ========================================================================== */
+const VW = 1080, VH = 1920, SAFE = { x: 60, y: 230, w: 840, h: 1170, r: 900, b: 1400 };
+const vcv = document.createElement('canvas'); vcv.width = VW; vcv.height = VH;
+const vx = vcv.getContext('2d', { willReadFrequently: true });   // CPU raster: identical pixels on every redraw
+const VL = 96, VR = 864;                                          // text column inside the safe area
+
+function vReset() {
+  vx.setTransform(1, 0, 0, 1, 0, 0); vx.globalAlpha = 1; vx.globalCompositeOperation = 'source-over';
+  vx.filter = 'none'; vx.shadowBlur = 0; vx.shadowColor = 'transparent'; vx.letterSpacing = '0px'; vx.setLineDash([]);
+  vx.textAlign = 'left'; vx.textBaseline = 'alphabetic'; vx.lineCap = 'butt'; vx.lineJoin = 'miter';
+}
+/** Canvas text on the vertical frame; `max` shrinks the size until the line fits. */
+function vText(str, x, y, { size = 40, weight = 700, color = '#FFFFFF', align = 'left', spacing = 0, alpha = 1, fam = FONT, max = 0 } = {}) {
+  if (alpha <= 0.002 || !str) return size;
+  vx.font = `${weight} ${size}px ${fam}`; vx.letterSpacing = spacing + 'px';
+  if (max) { const w = vx.measureText(str).width; if (w > max) { size = size * max / w; vx.font = `${weight} ${size}px ${fam}`; } }
+  vx.textAlign = align; vx.textBaseline = 'alphabetic';
+  const a0 = vx.globalAlpha; vx.globalAlpha = a0 * alpha; vx.fillStyle = color;
+  vx.fillText(str, x + (align === 'center' ? spacing / 2 : align === 'right' ? spacing : 0), y);   // tracking is added after the last glyph too
+  vx.globalAlpha = a0; vx.letterSpacing = '0px';
+  return size;
+}
+/** Word-wraps with the given font; returns the lines. */
+function vWrap(str, maxW, size, weight = 700, fam = FONT) {
+  vx.font = `${weight} ${size}px ${fam}`; vx.letterSpacing = '0px';
+  const words = str.split(' '), lines = []; let cur = '';
+  for (const w of words) { const t = cur ? cur + ' ' + w : w; if (vx.measureText(t).width > maxW && cur) { lines.push(cur); cur = w; } else cur = t; }
+  if (cur) lines.push(cur);
+  return lines;
+}
+/** Fade envelope with a small rise: [alpha, dy]. */
+function vEnv(v, a, b, fin = 8, fout = 8) {
+  const i = E.outCubic(prog(v, a, a + fin)), o = 1 - E.inCubic(prog(v, b - fout, b));
+  return [Math.min(i, o), (1 - i) * 22 - (1 - o) * 10];
+}
+/** Which segment of a cut list a vertical frame is in: segs = [{ at, src, len }] in frames. */
+function vSeg(segs, v) {
+  let k = 0; while (k < segs.length - 1 && v >= segs[k + 1].at) k++;
+  const s = segs[k];
+  return { k, s, local: v - s.at, src: s.src + (v - s.at) };
+}
+/** Dims everything outside the safe area to a quiet texture (brightness x 0.2), with a soft inner edge. */
+function vShade(rgb, a = 0.8, feather = 40) {
+  vx.save(); vx.setTransform(1, 0, 0, 1, 0, 0); vx.globalAlpha = 1; vx.globalCompositeOperation = 'source-over';
+  vx.fillStyle = `rgba(${rgb},${a})`;
+  vx.beginPath(); vx.rect(0, 0, VW, VH); vx.rect(SAFE.x, SAFE.y, SAFE.w, SAFE.h); vx.fill('evenodd');
+  const strip = (x0, y0, x1, y1, rx, ry, rw, rh) => {
+    const g = vx.createLinearGradient(x0, y0, x1, y1);
+    g.addColorStop(0, `rgba(${rgb},${a})`); g.addColorStop(1, `rgba(${rgb},0)`);
+    vx.fillStyle = g; vx.fillRect(rx, ry, rw, rh);
+  };
+  strip(SAFE.x, 0, SAFE.x + feather, 0, SAFE.x, SAFE.y, feather, SAFE.h);
+  strip(SAFE.r, 0, SAFE.r - feather, 0, SAFE.r - feather, SAFE.y, feather, SAFE.h);
+  strip(0, SAFE.y, 0, SAFE.y + feather, SAFE.x, SAFE.y, SAFE.w, feather);
+  strip(0, SAFE.b, 0, SAFE.b - feather, SAFE.x, SAFE.b - feather, SAFE.w, feather);
+  vx.restore();
+}
+/** Series tag at the top of the safe area, e.g. MADE IN CODE · 04. */
+function vTag(label, color, alpha = 1) {
+  vText('MADE IN CODE', VL, 292, { size: 28, weight: 800, color, spacing: 5, alpha });
+  vx.font = `800 28px ${FONT}`; vx.letterSpacing = '5px';
+  const w = vx.measureText('MADE IN CODE').width; vx.letterSpacing = '0px';
+  vText('·  ' + label, VL + w + 14, 292, { size: 28, weight: 600, color: 'rgba(255,255,255,0.72)', spacing: 3, alpha, max: VR - VL - w - 14 });
+}
+/** Big hook lines, left-aligned from y0; visible from frame 0, settles in a few frames. */
+function vHook(v, lines, y0, { size = 84, lh = 1.08, color = '#FFFFFF', accent = null, weight = 800, spacing = -1.5, alpha = 1 } = {}) {
+  const k = E.outExpo(prog(v, -6, 12));
+  lines.forEach((ln, i) => {
+    const kk = E.outExpo(prog(v, -12 + i * 2, 8 + i * 2));
+    vText(ln, VL, y0 + i * size * lh + (1 - kk) * 30, { size, weight, spacing, color: accent && i === lines.length - 1 ? accent : color, alpha: alpha * Math.max(0.25, kk), max: VR - VL });
+  });
+  return k;
+}
+/** Closing card, the last 60 frames: piece title, "drawn in code · bytepatterns.com". l = frames into the card. */
+function vEndCard(l, { title, line = '', ink = '#FFFFFF', dim = 'rgba(255,255,255,0.66)', accent = '#FFFFFF', scrim = '0,0,0', a = 0.84 }) {
+  const k = E.outCubic(prog(l, 0, 12));
+  vx.save(); vx.setTransform(1, 0, 0, 1, 0, 0);
+  vx.fillStyle = `rgba(${scrim},${a * k})`; vx.fillRect(0, 0, VW, VH);
+  vx.restore();
+  const t1 = E.outExpo(prog(l, 3, 19)), t2 = E.outExpo(prog(l, 11, 27)), t3 = E.outExpo(prog(l, 19, 35));
+  vx.fillStyle = accent; vx.globalAlpha = t1; vx.fillRect(VL, 742, 88 * t1, 7); vx.globalAlpha = 1;
+  const size = vText(title, VL, 850 + (1 - t1) * 40, { size: 92, weight: 800, color: ink, spacing: -2, alpha: t1, max: VR - VL });
+  const y2 = 850 + Math.max(size, 60) * 0.25 + 70;
+  vx.font = `600 44px ${FONT}`;
+  const lead = 'drawn in code  ·  ', lw = vx.measureText(lead).width;
+  vText(lead, VL, y2 + (1 - t2) * 24, { size: 44, weight: 600, color: dim, alpha: t2 });
+  vText('bytepatterns.com', VL + lw, y2 + (1 - t2) * 24, { size: 44, weight: 800, color: accent, alpha: t2 });
+  if (line) vText(line, VL, y2 + 72 + (1 - t3) * 18, { size: 32, weight: 500, color: dim, alpha: t3, max: VR - VL });
+}
+/** Seeks a cut. The first frame a page draws is drawn twice: the very first read of a
+ *  GPU-backed source canvas can come out a shade different from every later one. */
+let vWarm = false;
+function vSeek(draw, i, frames) {
+  const f = Math.max(0, Math.min(frames - 1, Math.floor(i)));
+  if (!vWarm) { vWarm = true; draw(f); }
+  draw(f);
+}
+/** The soundtrack of a cut: the piece's own audio() spliced to the same segments as the picture. */
+async function vAudio(segs, frames, { xf = 0.025, fadeOut = 0.6, extra = null } = {}) {
+  const src = await renderAudio();
+  const SR = 48000, dur = frames / FPS, ac = new OfflineAudioContext(2, Math.round(SR * dur), SR);
+  const out = ac.createGain(); out.connect(ac.destination);
+  out.gain.setValueAtTime(1, 0); out.gain.setValueAtTime(1, dur - fadeOut); out.gain.linearRampToValueAtTime(0, dur - 0.01);
+  segs.forEach((s, k) => {
+    const at = s.at / FPS, off = s.src / FPS, d = s.len / FPS;
+    const pre = k === 0 ? 0 : Math.min(xf, off), post = k === segs.length - 1 ? 0 : xf;
+    const b = ac.createBufferSource(), g = ac.createGain(); b.buffer = src;
+    g.gain.setValueAtTime(pre ? 0 : 1, at - pre);
+    if (pre) g.gain.linearRampToValueAtTime(1, at + pre);
+    if (post) { g.gain.setValueAtTime(1, at + d - post); g.gain.linearRampToValueAtTime(0, at + d + post); }
+    b.connect(g).connect(out); b.start(at - pre, off - pre, d + pre + post);
+  });
+  if (extra) extra(ac, out);
+  const buf = await ac.startRendering();
+  let peak = 0; for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) peak = Math.max(peak, Math.abs(d[i])); }
+  if (peak > 0.9) for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) d[i] *= 0.9 / peak; }
+  return buf;
+}
+/** A soft three-partial bell, for the closing card. */
+function vChime(ac, dest, at, freq, vol = 0.08) {
+  for (const [mul, v, dec] of [[1, 1, 1.8], [2.01, 0.35, 0.8], [3.02, 0.12, 0.4]]) {
+    const o = ac.createOscillator(), g = ac.createGain(); o.type = 'sine'; o.frequency.value = freq * mul;
+    g.gain.setValueAtTime(0.0001, at); g.gain.exponentialRampToValueAtTime(vol * v, at + 0.006); g.gain.exponentialRampToValueAtTime(0.0001, at + dec);
+    o.connect(g).connect(dest); o.start(at); o.stop(at + dec + 0.05);
+  }
+}
+
+/* VERTICAL CUT — this piece */
+// The same operations on a 1080 x 1920 stage and a faster clock: the two forests stacked, plain on top.
+const TLV = buildTL({ n0: 32, o0: 56, lead: 3, hop: 2.6, move: 9, gap: 1, hold: 14, calmT: 52 });
+const VFR = TLV.end + 60, VEND = VFR - 60;
+const GV = { TL: TLV, w: VW, h: VH, pill: 28, r: 20, lab: 28, slot: 50,
+  P: [{ x: VL, w: VR - VL, y: 640, dy: 50, ty: 580 }, { x: VL, w: VR - VL, y: 1090, dy: 62, ty: 1030 }],
+  divider: null,
+  opX: VL, opY: 505, opAlign: 'left',
+  capX: VL, capY: 390, cap: 46, capTwo: true, capMax: VR - VL,
+  fo: 28, foX: VL, foY: 1346, foAlign: 'left', foX2: VL, foY2: 1384, foAlign2: 'left',
+  fn: 72, fnX: VL, fnY: 800, fnAlign: 'left', fnMax: VR - VL };
+function hookV(v) {
+  const o = 1 - E.inCubic(prog(v, TLV.n0 - 10, TLV.n0 + 4));
+  if (o <= 0) return;
+  vx.save(); vx.fillStyle = `rgba(${C.bgRGB},${0.86 * o})`; vx.fillRect(SAFE.x, 400, SAFE.w, 560); vx.restore();
+  vHook(v, ['Same unions,', 'same finds.', 'One forest', 'stays flat.'], 510, { size: 104, accent: C.accent, color: C.paper, weight: 900, spacing: -2, alpha: o });
+}
+function vDraw(v) {
+  if (vx.reset) vx.reset();
+  vReset();
+  vx.fillStyle = C.bg; vx.fillRect(0, 0, VW, VH);
+  scene(vx, GV, v);
+  hookV(v);
+  vReset();
+  vShade(C.bgRGB, 0.86);
+  vTag('UNION-FIND', C.accent);
+  if (v >= VEND) vEndCard(v - VEND, { title: 'Union-Find: Flatten the Forest', line: `${N} elements  ·  ${NOPS} operations  ·  ${SM.hops} hops, not ${PL.hops}`,
+    ink: C.paper, dim: 'rgba(241,238,230,0.72)', accent: C.accent, scrim: C.bgRGB, a: 0.88 });
+  vReset();
+}
+
+// The player asks for a frame on every display refresh; at 30 fps on a 60 Hz screen every other call
+// asks for the frame already on the canvas, which is then left as it is (same frame, same pixels).
+const shown = { L: -1, V: -1 };
+const POSTER_Q = Math.max(FIRST_RW, 0);
+window.__motion = {
+  title: 'Union-Find: Flatten the Forest',
+  description: `${N} elements go through the same ${NOPS} unions and finds twice: plain linking grows a chain ${CHAIN_H} tall and ends at height ${PL.height} after ${PL.hops} parent hops, while union by rank with path compression never gets taller than ${Math.max(...SM.steps.map(s => s.height))}, re-points ${SM.rew} nodes straight at their root and ends at height ${SM.height} after ${SM.hops}.`,
+  fps: FPS, width: W, height: H, frames: FRAMES,
+  poster: Math.round(TLL.op[POSTER_Q].w + 2),
+  gifStart: Math.floor(TLL.op[CHAIN_N + 1].a / FPS),
+  seek(i) { const f = Math.max(0, Math.min(FRAMES - 1, Math.floor(i))); if (f !== shown.L) { shown.L = f; draw(f); } },
+  audio: () => renderAudio(TLL, FRAMES),
+  variants: {
+    vertical: {
+      width: VW, height: VH, frames: VFR, canvas: vcv,
+      poster: Math.round(TLV.op[POSTER_Q].w + 2), gifStart: Math.floor(TLV.op[CHAIN_N + 1].a / FPS),
+      seek(i) { const v = Math.max(0, Math.min(VFR - 1, Math.floor(i))); if (v !== shown.V) { shown.V = v; vSeek(vDraw, v, VFR); } },
+      audio: () => renderAudio(TLV, VFR),
+    },
+  },
+};
+
+
+/* ==========================================================================
+   PLAYER — identical in every piece; keep as is.
+   Autoplays and loops, starts sound on the first click, ?frame=N pauses on a
+   frame, ?variant=vertical plays the vertical cut (if the piece has one).
+   When the renderer sets window.__MOTION_RENDER__ it stays out of the way.
+   ========================================================================== */
+(function player() {
+  const btn = document.getElementById('sound'), q = new URLSearchParams(location.search);
+  let M = window.__motion;
+  const V = !window.__MOTION_RENDER__ && M.variants && M.variants[q.get('variant')];
+  if (V) {                                                // show the variant's own canvas instead
+    M = Object.assign({}, M, V);
+    V.canvas.style.cssText = `width:min(100vw,calc(100vh*${V.width}/${V.height}));height:auto;aspect-ratio:${V.width}/${V.height}`;
+    document.querySelector('canvas').replaceWith(V.canvas);
+  }
+  const dur = M.frames / M.fps;
+  if (window.__MOTION_RENDER__) { btn.hidden = true; M.seek(0); return; }
+  if (q.has('frame')) { btn.hidden = true; M.seek(+q.get('frame') || 0); return; }
+  let t0 = performance.now(), ac = null, src = null, buf = null, paused = false, pausedAt = 0;
+  const clock = () => ac && src ? (ac.currentTime - t0) : (performance.now() - t0) / 1000;
+  function loop() {
+    if (!paused) M.seek(Math.floor(((clock() % dur) + dur) % dur * M.fps));
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+  btn.addEventListener('click', async () => {
+    if (src) { src.stop(); src = null; btn.textContent = 'Click for sound'; t0 = performance.now(); return; }
+    btn.textContent = 'Loading sound…';
+    ac = ac || new AudioContext({ sampleRate: 48000 });
+    buf = buf || await M.audio();
+    await ac.resume();
+    src = ac.createBufferSource(); src.buffer = buf; src.loop = true; src.connect(ac.destination);
+    t0 = ac.currentTime + 0.05; src.start(t0);        // picture restarts from frame 0 in sync with the sound
+    btn.textContent = 'Sound on — click to mute';
+  });
+  addEventListener('keydown', e => {
+    if (e.code !== 'Space') return;
+    e.preventDefault(); paused = !paused;
+    if (ac) paused ? ac.suspend() : ac.resume();
+    if (!ac) { if (paused) pausedAt = performance.now(); else t0 += performance.now() - pausedAt; }
+  });
+})();
+</script>
+</body>
+</html>

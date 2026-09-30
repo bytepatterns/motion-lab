@@ -1,0 +1,687 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="author" content="teambytepatterns">
+<meta name="description" content="A nine-letter pattern builds its failure table from its own borders, then it is searched for in a 44-letter text twice: the naive search slides one letter and starts over, KMP slides by the table and its text pointer never moves back, and both find the same three matches, KMP with about half the comparisons.">
+<title>KMP: Never Step Back — motion-lab</title>
+<style>
+  /* Player chrome. The piece itself lives entirely in the canvas. */
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  body { display: grid; place-items: center; font: 500 15px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #fff; }
+  canvas { display: block; width: min(100vw, calc(100vh * 16 / 9)); height: auto; aspect-ratio: 16 / 9; }
+  #sound { position: fixed; left: 16px; bottom: 16px; padding: 8px 14px; border: 1px solid rgba(255,255,255,.35); border-radius: 999px;
+           background: rgba(0,0,0,.55); color: #fff; font: inherit; cursor: pointer; }
+  #sound[hidden] { display: none; }
+</style>
+</head>
+<body>
+<canvas id="stage" width="1920" height="1080" aria-label="A row of nine lettered tiles and a copy of it that slides underneath while a row of small numbers fills in; then two long rows of letters, each with the tiles sliding along under it: the upper tiles step one place at a time and keep going back, the lower tiles jump ahead and finish first; yellow bars mark where the word was found"></canvas>
+<button id="sound" type="button">Click for sound</button>
+<script>
+'use strict';
+/* ==========================================================================
+   PIECE — KMP: Never Step Back.
+   Knuth-Morris-Pratt string search. Before searching, the pattern is
+   compared with itself: fail[i] is the length of the longest proper prefix
+   of P[0..i] that is also a suffix of it (its border). The table is built
+   with the same walk it will later be used for: on a mismatch the matched
+   length falls back to fail[len - 1] instead of to zero.
+   The search compares T[i] with P[j]; on a match both advance, on a
+   mismatch with j > 0 only j falls back to fail[j - 1] (the pattern slides
+   right by j - fail[j - 1]), with j = 0 only i advances. i never decreases.
+   The naive search runs beside it: for every shift, compare from the first
+   letter until a mismatch, then slide by one and start over.
+   The text comes from a fixed seed; the table, every comparison of both
+   searches, every match and every backward step of the text pointer are
+   computed once at load. A frame maps to a step of that record, so seek(i)
+   is pure in i.
+   ========================================================================== */
+const W = 1920, H = 1080, FPS = 30;
+const cv = document.getElementById('stage');
+const ctx = cv.getContext('2d', { willReadFrequently: true });   // CPU raster: identical pixels on every redraw
+const FONT = 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
+const MONO = 'ui-monospace, "Cascadia Code", Consolas, Menlo, monospace';
+
+// ---- helpers -------------------------------------------------------------
+function mulberry32(a) { return function () { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a);
+  t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const lerp = (a, b, t) => a + (b - a) * t;
+const prog = (f, a, b) => clamp((f - a) / (b - a));
+const smooth = t => t * t * (3 - 2 * t);
+const E = {
+  inCubic: t => t * t * t,
+  outCubic: t => 1 - Math.pow(1 - t, 3),
+  inOutCubic: t => t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2,
+  outExpo: t => t === 1 ? 1 : 1 - Math.pow(2, -10 * t),
+  inExpo: t => t === 0 ? 0 : Math.pow(2, 10 * t - 10),
+  inOutExpo: t => t === 0 ? 0 : t === 1 ? 1 : t < .5 ? Math.pow(2, 20 * t - 10) / 2 : (2 - Math.pow(2, -20 * t + 10)) / 2,
+  outBack: t => 1 + 2.70158 * Math.pow(t - 1, 3) + 1.70158 * Math.pow(t - 1, 2),
+};
+/** Canvas text; `max` shrinks the size until the line fits. Returns the width drawn. */
+function text(g, str, x, y, { size = 40, weight = 600, color = '#fff', alpha = 1, spacing = 0, align = 'left', fam = FONT, base = 'alphabetic', max = 0 } = {}) {
+  if (alpha <= 0.002 || !str) return 0;
+  g.font = `${weight} ${size}px ${fam}`; g.letterSpacing = spacing + 'px';
+  if (max) { const w0 = g.measureText(str).width; if (w0 > max) { size *= max / w0; g.font = `${weight} ${size}px ${fam}`; } }
+  g.textAlign = align; g.textBaseline = base;
+  const a0 = g.globalAlpha; g.globalAlpha = a0 * alpha; g.fillStyle = color;
+  g.fillText(str, x, y);
+  const w = g.measureText(str).width;
+  g.globalAlpha = a0; g.letterSpacing = '0px';
+  return w;
+}
+const measure = (g, str, size, weight = 800, fam = FONT, spacing = 0) => { g.font = `${weight} ${size}px ${fam}`; g.letterSpacing = spacing + 'px'; const w = g.measureText(str).width; g.letterSpacing = '0px'; return w; };
+const env = (f, a, b, fin = 12, fout = 10) => {
+  const i = E.outCubic(prog(f, a, a + fin)), o = 1 - E.inCubic(prog(f, b - fout, b));
+  return [Math.min(i, o), (1 - i) * 24 - (1 - o) * 10];
+};
+
+
+// ---- palette -------------------------------------------------------------
+const C = {
+  bg: '#0B0D14', bgRGB: '11,13,20', paper: '#F1EEE6', paperRGB: '241,238,230', dim: 'rgba(241,238,230,0.62)', faint: 'rgba(241,238,230,0.16)',
+  accent: '#FFC857', accentRGB: '255,200,87', go: '#5CD6CB', goRGB: '92,214,203', no: '#FF5E6C', noRGB: '255,94,108', node: '#151A28',
+  naive: '#8FA8FF', naiveRGB: '143,168,255',
+};
+
+// ---- the pattern, the text, the table and both searches, computed once ----------------------
+const P = 'ABABCABAB', M = P.length, N = 44;
+const TXT = (function () {
+  // pieces of the pattern's own prefixes, so the text is full of near misses
+  const R = mulberry32(0x59D6); let s = '';
+  while (s.length < N) { const r = R(); if (r < 0.16) s += P; else if (r < 0.8) s += P.slice(0, 2 + Math.floor(R() * (M - 3))); else s += 'ABC'[Math.floor(R() * 3)]; }
+  return s.slice(0, N);
+})();
+// the failure table, one comparison at a time: { i, len, ok, set?, jump? }
+const FAIL = new Array(M).fill(0), BUILD = [];
+(function () {
+  let len = 0, i = 1;
+  while (i < M) {
+    const e = { i, len, ok: P[i] === P[len] };
+    if (e.ok) { len++; FAIL[i] = len; e.set = len; i++; }
+    else if (len > 0) { e.jump = FAIL[len - 1]; len = e.jump; }
+    else { FAIL[i] = 0; e.set = 0; i++; }
+    e.ni = i; e.nlen = len; BUILD.push(e);
+  }
+})();
+const BUILD_JUMPS = BUILD.filter(e => e.jump !== undefined).length;
+// KMP: one event per comparison { ti, pj, ok, shift, next shift, match?, via? (the table entry used after) }
+function runKMP() {
+  const ev = [], found = []; let i = 0, j = 0;
+  while (i < N) {
+    const e = { ti: i, pj: j, ok: TXT[i] === P[j], shift: i - j };
+    if (e.ok) { i++; j++; if (j === M) { e.match = i - M; found.push(i - M); e.via = M - 1; j = FAIL[M - 1]; } }
+    else if (j > 0) { e.via = j - 1; j = FAIL[j - 1]; }
+    else i++;
+    e.nshift = i - j; ev.push(e);
+  }
+  return { ev, found };
+}
+function runNaive() {
+  const ev = [], found = [];
+  for (let s = 0; s <= N - M; s++) {
+    for (let k = 0; k < M; k++) {
+      const e = { ti: s + k, pj: k, ok: TXT[s + k] === P[k], shift: s, nshift: s };
+      ev.push(e);
+      if (!e.ok) { e.nshift = s + 1; break; }
+      if (k === M - 1) { e.match = s; found.push(s); e.nshift = s + 1; }
+    }
+  }
+  return { ev, found };
+}
+const KMP = runKMP(), NAI = runNaive();
+const backSteps = ev => { let b = 0; for (let q = 1; q < ev.length; q++) b += Math.max(0, ev[q - 1].ti - ev[q].ti); return b; };
+KMP.back = backSteps(KMP.ev); NAI.back = backSteps(NAI.ev);
+const KC = KMP.ev.length, NC = NAI.ev.length, MK = KMP.found;
+const SAME = MK.length === NAI.found.length && MK.every((x, q) => x === NAI.found[q]);
+const OVERLAP = MK.some((x, q) => q > 0 && x - MK[q - 1] < M);
+const WORDS = ['no', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten'];
+const word = n => WORDS[n] || String(n);
+
+// ---- timeline -------------------------------------------------------------------------------
+// hook until a0; the pattern appears at p0; the table is built one event per `step` from a0;
+// it moves into place (a1..r0); both searches run one comparison per `tick` from r0 to r1.
+function buildTL(o) {
+  const TL = Object.assign({}, o);
+  TL.a1 = TL.a0 + BUILD.length * TL.step;
+  TL.m0 = TL.a1 + TL.holdA; TL.r0 = TL.m0 + TL.moveT;
+  TL.k1 = TL.r0 + KC * TL.tick; TL.r1 = TL.r0 + NC * TL.tick;
+  TL.calm = TL.r1 + TL.hold; TL.end = Math.round(TL.calm + TL.calmT);
+  const firstJump = BUILD.findIndex(e => e.jump !== undefined);
+  const cj = TL.a0 + Math.max(firstJump, 2) * TL.step;
+  const mid = Math.round(TL.r0 + Math.min(KC * 0.55, NC * 0.4) * TL.tick);
+  TL.caps = [
+    [TL.p0, cj - 2, `The failure table: for each prefix of ${P},|the longest start that is also its end.`],
+    [cj, TL.a1 + 4, `On a mismatch, never back to zero:|fall back to fail[len − 1] and compare again.`],
+    [TL.a1 + 6, TL.r0 - 2, `fail = ${FAIL.join(' ')}|${BUILD.length} comparisons to build it.`],
+    [TL.r0, mid - 2, `Search a ${N}-letter text. Naive:|on a mismatch, slide one and start over.`],
+    [mid, TL.r1 + 2, `KMP slides by the table instead:|its text pointer never moves back.`],
+    [TL.r1 + 4, TL.calm - 2, `Same ${word(MK.length)} matches, at ${MK.join(', ')}.|${KC} comparisons against ${NC}.`],
+  ];
+  return TL;
+}
+
+// ---- drawing ------------------------------------------------------------------------------
+function cell(g, x, y, w, h, ch, { size = 30, fill = C.node, stroke = C.faint, lw = 2, ink = C.paper, alpha = 1, ring = null, r = 8 } = {}) {
+  if (alpha <= 0.01) return;
+  g.save(); g.globalAlpha = alpha; g.fillStyle = fill; g.beginPath(); g.roundRect(x - w / 2, y - h / 2, w, h, r); g.fill();
+  g.strokeStyle = ring || stroke; g.lineWidth = ring ? Math.max(3.5, lw) : lw; g.stroke(); g.restore();
+  if (ch !== null && ch !== undefined) text(g, String(ch), x, y + size * 0.04, { size, weight: 800, color: ink, align: 'center', base: 'middle', fam: MONO, alpha });
+}
+function pill(g, str, x, y, size, col, alpha, align = 'left') {
+  if (alpha <= 0.01) return;
+  const w = measure(g, str, size, 800, MONO) + 28, h = size + 18, x0 = align === 'right' ? x - w : x;
+  g.save(); g.globalAlpha = alpha; g.fillStyle = C.bg; g.beginPath(); g.roundRect(x0, y - h / 2, w, h, h / 2); g.fill(); g.strokeStyle = col; g.lineWidth = 2.5; g.stroke(); g.restore();
+  text(g, str, x0 + 14, y + 1, { size, weight: 800, color: col, base: 'middle', fam: MONO, alpha });
+}
+/** Phase A: the pattern against a sliding copy of itself, and the table filling in. */
+function tableBuild(g, G, f) {
+  const TL = G.TL, A = G.A;
+  const [a] = env(f, TL.p0, TL.r0 + 4, 14, 22);
+  if (a <= 0) return;
+  const out = E.inOutCubic(prog(f, TL.m0, TL.r0)), aa = a * (1 - out), lift = -out * 60;
+  const X = k => A.x0 + (k + 0.5) * A.cw;
+  const u = (f - TL.a0) / TL.step, q = clamp(Math.floor(u), 0, BUILD.length - 1), p = u - Math.floor(u);
+  const e = u < 0 ? null : u >= BUILD.length ? null : BUILD[q];
+  // offset of the copy (i - len), eased from one event's state to the next
+  const offOf = k => k < 0 ? 1 : k >= BUILD.length ? BUILD[BUILD.length - 1].ni - BUILD[BUILD.length - 1].nlen : BUILD[k].i - BUILD[k].len;
+  let off = offOf(0);
+  if (u >= 0) { const qq = Math.min(Math.floor(u), BUILD.length); off = qq >= BUILD.length ? offOf(BUILD.length) : lerp(offOf(qq), BUILD[qq].ni - BUILD[qq].nlen, E.inOutCubic(prog(p, 0.55, 0.95))); }
+  const ia = E.outCubic(prog(f, TL.p0, TL.p0 + 16));
+  // index labels and the pattern
+  for (let k = 0; k < M; k++) {
+    text(g, String(k), X(k), A.yA - A.ch / 2 - 18 + lift, { size: 28, weight: 700, color: C.dim, align: 'center', fam: MONO, alpha: aa * ia });
+    const cmp = e && e.i === k && p < 0.7, done = u >= 0 && (k < (e ? e.i : M) || u >= BUILD.length);
+    const border = e && k >= e.i - e.len && k < e.i && p < 0.7;
+    cell(g, X(k), A.yA + lift + (1 - ia) * 30, A.cw - 12, A.ch, P[k], { size: A.letter, alpha: aa * ia, fill: border ? `rgba(${C.goRGB},0.2)` : C.node,
+      stroke: done ? 'rgba(241,238,230,0.4)' : C.faint, ring: cmp ? (e.ok ? C.go : C.no) : null });
+  }
+  text(g, 'pattern', A.x0 - 24, A.yA + lift + 10, { size: 30, weight: 700, color: C.dim, align: 'right', alpha: aa * ia });
+  // the copy, sliding: its first `len` letters are the border being extended
+  const ca = aa * E.outCubic(prog(f, TL.a0 - 16, TL.a0 + 2));
+  if (ca > 0) {
+    g.save(); g.beginPath(); g.rect(A.x0 - 8, A.yB - A.ch, M * A.cw + 2, A.ch * 2); g.clip();
+    for (let k = 0; k < M; k++) {
+      const x = X(k + off); if (x > A.x0 + M * A.cw + A.cw) continue;
+      const inB = e && k < e.len && p < 0.7, cmp = e && k === e.len && p < 0.7;
+      cell(g, x, A.yB + lift, A.cw - 12, A.ch, P[k], { size: A.letter, alpha: ca * (x > A.x0 + M * A.cw ? 0.3 : 1), fill: inB ? `rgba(${C.goRGB},0.2)` : 'rgba(255,200,87,0.08)',
+        stroke: 'rgba(255,200,87,0.45)', ring: cmp ? (e.ok ? C.go : C.no) : null });
+    }
+    g.restore();
+    text(g, 'itself', A.x0 - 24, A.yB + lift + 10, { size: 30, weight: 700, color: C.dim, align: 'right', alpha: ca });
+  }
+  // the comparison in words
+  if (e && ca > 0) {
+    const lab = e.ok ? `P[${e.i}] = P[${e.len}]  →  fail[${e.i}] = ${e.set}` : e.jump !== undefined ? `P[${e.i}] ≠ P[${e.len}]  →  len = fail[${e.len - 1}] = ${e.jump}` : `P[${e.i}] ≠ P[0]  →  fail[${e.i}] = 0`;
+    const al = ca * Math.min(E.outCubic(prog(p, 0, 0.2)), 1 - E.inCubic(prog(p, 0.85, 1)));
+    pill(g, lab, G.A.px, A.py + lift, G.pill, e.ok ? C.go : C.no, al, G.A.pAlign);
+  }
+}
+/** The table itself: in phase A under the pattern, then moved next to the KMP lane. */
+function failRow(g, G, f, used) {
+  const TL = G.TL, A = G.A, F = G.F;
+  const [a] = env(f, TL.a0 - 10, TL.end + 14, 14, 20);
+  if (a <= 0) return;
+  const mv = E.inOutCubic(prog(f, TL.m0, TL.r0));
+  const cw = lerp(A.cw, F.cw, mv), ch = lerp(A.ch * 0.8, F.ch, mv), x0 = lerp(A.x0, F.x0, mv), y = lerp(A.yF, F.y, mv), size = lerp(A.letter * 0.8, F.size, mv);
+  text(g, 'fail', x0 - 24, y + 10, { size: lerp(30, 28, mv), weight: 700, color: C.accent, align: 'right', alpha: a });
+  for (let k = 0; k < M; k++) {
+    // fail[0] = 0 by definition; fail[i] appears when the event that sets it lands
+    let at = k === 0 ? TL.a0 - 6 : TL.a0 + (BUILD.findIndex(e => e.i === k && e.set !== undefined) + 0.5) * TL.step;
+    const k2 = E.outBack(prog(f, at, at + 10)), x = x0 + (k + 0.5) * cw;
+    const hot = used === k;
+    cell(g, x, y, cw - 10, ch, null, { alpha: a, fill: hot ? `rgba(${C.accentRGB},0.3)` : C.node, stroke: 'rgba(255,200,87,0.35)', ring: hot ? C.accent : null });
+    if (mv > 0) text(g, P[k], x, y - ch / 2 - 16, { size: 28, weight: 800, color: C.dim, align: 'center', fam: MONO, alpha: a * mv });
+    if (k2 > 0) text(g, String(FAIL[k]), x, y + 2 + (1 - clamp(k2)) * -20, { size: size * (0.6 + 0.4 * k2), weight: 850, color: C.accent, align: 'center', base: 'middle', fam: MONO, alpha: a * clamp(k2) });
+  }
+}
+/** Where a search is at frame f: the event index, its progress and the shift and camera, eased. */
+function laneState(G, S, f) {
+  const TL = G.TL, u = (f - TL.r0) / TL.tick, n = S.ev.length;
+  const q = Math.floor(u), p = u - q;
+  const shiftAt = k => k < 0 ? 0 : k >= n ? S.ev[n - 1].nshift : S.ev[k].shift;
+  let shift, e = null;
+  if (u < 0) shift = 0;
+  else if (q >= n) shift = Math.min(S.ev[n - 1].nshift, N - M);
+  else { e = S.ev[q]; shift = lerp(e.shift, Math.min(e.nshift, N - M), E.inOutCubic(prog(p, 0.55, 0.95))); }
+  // the camera follows the compared letter (portrait only)
+  let cam = 0;
+  if (G.win) {
+    const camAt = k => clamp((k < 0 ? 0 : S.ev[Math.min(k, n - 1)].ti) - G.win * 0.55 + 0.5, 0, N - G.win);
+    cam = u < 0 ? 0 : lerp(camAt(q), camAt(q + 1), E.inOutCubic(prog(p, 0.3, 1)));
+  }
+  const done = Math.min(n, Math.max(0, q + 1)), found = S.found.filter((s, k) => { const qi = S.ev.findIndex(x => x.match === s); return qi >= 0 && qi <= q; });
+  let back = 0; for (let k = 1; k <= Math.min(q, n - 1); k++) back += Math.max(0, S.ev[k - 1].ti - S.ev[k].ti);
+  return { u, q, p, e: q < n ? e : null, shift, cam, done, found, back, finished: q >= n };
+}
+function lane(g, G, f, S, L, name, col, colRGB) {
+  const TL = G.TL, [a] = env(f, TL.m0 + 6, TL.end + 14, 16, 20);
+  if (a <= 0) return null;
+  const st = laneState(G, S, f), X = j => G.tx0 + (j - st.cam + 0.5) * G.cw;
+  const ia = E.outCubic(prog(f, TL.m0 + 6, TL.r0));
+  const al = a * ia, dy = (1 - ia) * 30;
+  // label and counters
+  text(g, name, G.tx0, L.ly + dy, { size: 32, weight: 850, color: col, spacing: 2, alpha: al });
+  const w1 = text(g, `${st.done} compared`, G.cx, L.ly + dy, { size: 30, weight: 800, color: C.paper, align: 'right', fam: MONO, alpha: al });
+  text(g, `${st.back} back  ·  `, G.cx - w1, L.ly + dy, { size: 30, weight: 800, color: st.back ? C.no : C.go, align: 'right', fam: MONO, alpha: al });
+  // letters of the text
+  g.save(); g.beginPath(); g.rect(G.clip[0], L.y - G.ch, G.clip[1] - G.clip[0], G.ch * 3.2); g.clip();
+  const j0 = Math.max(0, Math.floor(st.cam) - 1), j1 = Math.min(N - 1, Math.ceil(st.cam + (G.win || N)) + 1);
+  st.found.forEach((s, mi) => {                                 // matches found so far (overlapping ones alternate their bar)
+    const x0 = X(s) - G.cw / 2 + 3, x1 = X(s + M - 1) + G.cw / 2 - 3;
+    g.save(); g.globalAlpha = al; g.fillStyle = `rgba(${C.accentRGB},0.22)`; g.beginPath(); g.roundRect(x0, L.y - G.ch / 2 - 6, x1 - x0, G.ch + 12, 10); g.fill();
+    g.fillStyle = C.accent; g.fillRect(x0, L.y + G.ch / 2 + 7 + (MK.indexOf(s) % 2) * 7, x1 - x0, 4); g.restore();
+  });
+  const e = st.e, cmpOn = e && st.p < 0.62;
+  for (let j = j0; j <= j1; j++) {
+    const hot = cmpOn && e.ti === j;
+    cell(g, X(j), L.y + dy, G.cw - 5, G.ch, TXT[j], { size: G.letter, alpha: al, ring: hot ? (e.ok ? C.go : C.no) : null, r: 6 });
+  }
+  // the pattern under it, at its shift
+  for (let k = 0; k < M; k++) {
+    const x = X(st.shift + k), known = e && k < e.pj && st.p < 0.62, hot = cmpOn && e.pj === k;
+    cell(g, x, L.py + dy, G.cw - 5, G.ch, P[k], { size: G.letter, alpha: al, fill: known ? `rgba(${C.goRGB},0.22)` : `rgba(${colRGB},0.12)`, stroke: `rgba(${colRGB},0.55)`, ring: hot ? (e.ok ? C.go : C.no) : null, r: 6 });
+  }
+  // the text pointer: a caret under the compared letter
+  if (e || st.finished) {
+    const ti = e ? e.ti : N - 1, x = X(ti), yy = L.py + G.ch / 2 + 16 + dy;
+    g.save(); g.globalAlpha = al * (st.finished ? 0.4 : 1); g.fillStyle = col; g.beginPath(); g.moveTo(x, yy); g.lineTo(x - 10, yy + 14); g.lineTo(x + 10, yy + 14); g.closePath(); g.fill(); g.restore();
+  }
+  g.restore();
+  // what just happened
+  if (e) {
+    const t = TXT[e.ti], pc = P[e.pj];
+    let lab;
+    if (e.ok && e.match !== undefined) lab = `match at ${e.match}`;
+    else if (e.ok) lab = `${t} = ${pc}`;
+    else if (S === KMP) lab = e.pj > 0 ? `${t} ≠ ${pc}  ·  j = fail[${e.pj - 1}] = ${FAIL[e.pj - 1]}` : `${t} ≠ ${pc}  ·  next letter`;
+    else lab = `${t} ≠ ${pc}  ·  slide 1, start over`;
+    const pa = al * Math.min(E.outCubic(prog(st.p, 0, 0.2)), 1 - E.inCubic(prog(st.p, 0.85, 1)));
+    pill(g, lab, L.px, L.pyL + dy, G.pill, e.ok ? (e.match !== undefined ? C.accent : C.go) : C.no, pa, G.pAlign);
+  } else if (st.finished && f < TL.calm + 10) {
+    pill(g, `done: ${S.found.length} matches`, L.px, L.pyL + dy, G.pill, C.accent, al * E.outCubic(prog(st.u, S.ev.length, S.ev.length + 1.5)), G.pAlign);
+  }
+  return st;
+}
+function caption(g, G, f) {
+  for (const [t0, t1, str] of G.TL.caps) {
+    const [a, dy] = env(f, t0, t1, 10, 8); if (a <= 0) continue;
+    const [p1, p2] = str.split('|');
+    if (G.capTwo) {
+      text(g, p1, G.capX, G.capY + dy, { size: G.cap, weight: 850, color: C.paper, spacing: -1, alpha: a, max: G.capMax });
+      text(g, p2, G.capX, G.capY + G.cap * 1.14 + dy, { size: G.cap, weight: 850, color: C.accent, spacing: -1, alpha: a, max: G.capMax });
+    } else {
+      const w1 = measure(g, p1 + ' ', G.cap, 850, FONT, -1), w2 = measure(g, p2, G.cap, 850, FONT, -1), sc = Math.min(1, G.capMax / (w1 + w2));
+      const w = text(g, p1 + ' ', G.capX, G.capY + dy, { size: G.cap * sc, weight: 850, color: C.paper, spacing: -1, alpha: a });
+      text(g, p2, G.capX + w, G.capY + dy, { size: G.cap * sc, weight: 850, color: C.accent, spacing: -1, alpha: a });
+    }
+  }
+}
+function readout(g, G, f, kst) {
+  const TL = G.TL, [a] = env(f, TL.p0, TL.calm, 12, 10);
+  if (a <= 0) return;
+  let l1, l2;
+  if (f < TL.m0) {
+    const u = (f - TL.a0) / TL.step, q = clamp(Math.floor(u), 0, BUILD.length);
+    const e = BUILD[Math.min(q, BUILD.length - 1)];
+    l1 = `pattern ${P}  ·  ${M} letters`;
+    l2 = u < 0 ? 'len = 0' : q >= BUILD.length ? `table built in ${BUILD.length} comparisons` : `i = ${e.i}  ·  len = ${e.len}`;
+  } else {
+    l1 = `text ${N} letters  ·  pattern ${M}`;
+    l2 = kst ? `matches ${kst.found.length} of ${MK.length}` : '';
+  }
+  text(g, l1, G.foX, G.foY, { size: G.fo, weight: 700, color: C.paper, fam: MONO, alpha: a, align: G.foAlign });
+  text(g, l2, G.foX2, G.foY2, { size: G.fo, weight: 700, color: C.dim, fam: MONO, alpha: a, align: G.foAlign2 });
+}
+function finale(g, G, f) {
+  const TL = G.TL, k1 = E.outCubic(prog(f, TL.calm, TL.calm + 18)), k2 = E.outCubic(prog(f, TL.calm + 10, TL.calm + 28));
+  if (k1 <= 0) return;
+  const out = 1 - E.inCubic(prog(f, TL.end - 6, TL.end + 12));
+  g.save(); g.fillStyle = `rgba(${C.bgRGB},${0.86 * k1 * out})`; g.fillRect(0, G.fnY - G.fn * 1.2, G.w, G.fn * 2.9); g.restore();
+  text(g, `${KC} comparisons, not ${NC}.`, G.fnX, G.fnY, { size: G.fn, weight: 900, color: C.paper, spacing: -2, align: G.fnAlign, alpha: k1 * out, max: G.fnMax });
+  text(g, `text pointer steps back: KMP ${KMP.back}, naive ${NAI.back}`, G.fnX, G.fnY + G.fn * 1.05, { size: G.fn * 0.5, weight: 850, color: C.accent, spacing: -1, align: G.fnAlign, alpha: k2 * out, max: G.fnMax });
+}
+function scene(g, G, f) {
+  const TL = G.TL;
+  tableBuild(g, G, f);
+  const kst = f >= TL.m0 ? laneState(G, KMP, f) : null;
+  const used = kst && kst.e && kst.e.via !== undefined && kst.p > 0.3 ? kst.e.via : -1;
+  failRow(g, G, f, used);
+  lane(g, G, f, NAI, G.L[0], 'NAIVE', C.naive, C.naiveRGB);
+  lane(g, G, f, KMP, G.L[1], 'KMP', C.accent, C.accentRGB);
+  caption(g, G, f); readout(g, G, f, kst); finale(g, G, f);
+}
+
+// ---- landscape picture ------------------------------------------------------------------
+const TLL = buildTL({ p0: 44, a0: 72, step: 17, holdA: 26, moveT: 30, tick: 2.9, hold: 22, calmT: 112 });
+const FRAMES = TLL.end + 72;
+const GL = { TL: TLL, w: W, h: H, pill: 28,
+  A: { x0: 960 - M * 60, cw: 120, ch: 104, yA: 420, yB: 548, yF: 700, py: 800, letter: 64, px: 960 - M * 60, pAlign: 'left' },
+  F: { x0: 1800 - M * 56, cw: 56, ch: 52, y: 880, size: 30 },
+  tx0: 1800 - N * 38, cw: 38, ch: 50, letter: 28, win: 0, clip: [100, 1820], cx: 1800,
+  L: [{ ly: 312, y: 382, py: 442, px: 1800 - N * 38 + 190, pyL: 300 }, { ly: 560, y: 630, py: 690, px: 1800 - N * 38 + 150, pyL: 548 }],
+  pAlign: 'left',
+  capX: 120, capY: 216, cap: 50, capTwo: false, capMax: 1680,
+  fo: 30, foX: 120, foY: 1004, foAlign: 'left', foX2: 1800, foY2: 1004, foAlign2: 'right',
+  fn: 100, fnX: W / 2, fnY: 560, fnAlign: 'center', fnMax: 1680 };
+function hookL(f) {
+  const o = 1 - E.inCubic(prog(f, TLL.p0 - 14, TLL.p0 + 4));
+  if (o <= 0) return;
+  const k = E.outExpo(prog(f, -8, 10)), k2 = E.outBack(prog(f, -6, 12));
+  ctx.save(); ctx.fillStyle = `rgba(${C.bgRGB},${0.8 * o})`; ctx.fillRect(0, 400, W, 330); ctx.restore();
+  text(ctx, 'Find a word in a text', W / 2, 540 + (1 - k) * 30, { size: 108, weight: 900, color: C.paper, spacing: -3, align: 'center', alpha: o * Math.max(0.3, k), max: 1700 });
+  text(ctx, 'without ever stepping back.', W / 2, 670 + (1 - clamp(k2)) * 30, { size: 108, weight: 900, color: C.accent, spacing: -3, align: 'center', alpha: o * Math.max(0.3, clamp(k2)), max: 1700 });
+}
+function draw(f) {
+  if (ctx.reset) ctx.reset();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; ctx.filter = 'none'; ctx.shadowBlur = 0;
+  ctx.fillStyle = C.bg; ctx.fillRect(0, 0, W, H);
+  const T = TLL, endK = E.inOutCubic(prog(f, T.end, T.end + 20)), a = 1 - endK;
+  scene(ctx, GL, f);
+  text(ctx, 'ALGORITHMS  ·  STRING SEARCH', 120, 104, { size: 26, weight: 600, color: C.dim, spacing: 5, alpha: a });
+  text(ctx, 'BYTEPATTERNS', 1800, 104, { size: 26, weight: 600, color: C.dim, spacing: 5, align: 'right', alpha: a });
+  hookL(f);
+  if (endK > 0) {
+    ctx.fillStyle = `rgba(${C.bgRGB},${0.86 * endK})`; ctx.fillRect(0, 0, W, H);
+    const k1 = E.outCubic(prog(f, T.end + 6, T.end + 28)), k2 = E.outCubic(prog(f, T.end + 16, T.end + 38)), k3 = E.outCubic(prog(f, T.end + 26, T.end + 48));
+    text(ctx, 'KMP: Never Step Back', W / 2, 500 + (1 - k1) * 30, { size: 132, weight: 850, color: C.paper, spacing: -3, align: 'center', alpha: k1, max: 1680 });
+    text(ctx, `pattern ${M}  ·  text ${N}  ·  ${MK.length} matches  ·  ${KC} comparisons instead of ${NC}`, W / 2, 580 + (1 - k2) * 20, { size: 42, weight: 500, color: C.accent, align: 'center', alpha: k2, max: 1680 });
+    text(ctx, 'drawn in code  ·  bytepatterns.com', W / 2, 1000, { size: 32, weight: 600, color: C.paper, spacing: 3, align: 'center', alpha: k3 * 0.8 });
+  }
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.letterSpacing = '0px';
+}
+
+// ---- sound: a tick per comparison (bright on a match, dull on a mismatch), a chord per match ----
+async function renderAudio(TL = TLL, frames = FRAMES) {
+  const SR = 48000, dur = frames / FPS, LEN = Math.round(SR * dur);
+  const ac = new OfflineAudioContext(2, LEN, SR);
+  const at = fr => fr / FPS;
+  const comp = ac.createDynamicsCompressor();
+  comp.threshold.value = -16; comp.ratio.value = 3; comp.attack.value = 0.005; comp.release.value = 0.25;
+  const master = ac.createGain(); master.gain.value = 0.9; master.connect(comp).connect(ac.destination);
+  master.gain.setValueAtTime(0.9, dur - 1.0); master.gain.linearRampToValueAtTime(0.0001, dur - 0.02);
+  const rnd = mulberry32(0x59A0D);
+  const ir = ac.createBuffer(2, SR * 2, SR);
+  for (let c = 0; c < 2; c++) { const d = ir.getChannelData(c); for (let k = 0; k < d.length; k++) d[k] = (rnd() * 2 - 1) * Math.pow(1 - k / d.length, 3); }
+  const verb = ac.createConvolver(); verb.buffer = ir; const vg = ac.createGain(); vg.gain.value = 0.28; verb.connect(vg).connect(master);
+  const hz = m => 440 * Math.pow(2, (m - 69) / 12);
+  const pluck = (t0, m, amp, pan, dec = 0.35, type = 'triangle') => {
+    const o = ac.createOscillator(), g = ac.createGain(), p = ac.createStereoPanner(); o.type = type; o.frequency.value = hz(m);
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(amp, t0 + 0.004); g.gain.exponentialRampToValueAtTime(0.0001, t0 + dec);
+    p.pan.value = pan; o.connect(g).connect(p); p.connect(master); p.connect(verb); o.start(t0); o.stop(t0 + dec + 0.05);
+  };
+  const pad = (t0, t1, notes, amp, cutoff) => {
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = cutoff; lp.Q.value = 1; lp.connect(master); lp.connect(verb);
+    notes.forEach((m, i) => { for (const det of [-6, 6]) {
+      const o = ac.createOscillator(), g = ac.createGain(), p = ac.createStereoPanner(); o.type = 'sawtooth'; o.frequency.value = hz(m); o.detune.value = det;
+      p.pan.value = (i / Math.max(1, notes.length - 1) - 0.5) * 0.8 * Math.sign(det);
+      g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(amp, t0 + 0.8); g.gain.setValueAtTime(amp, Math.max(t0 + 0.8, t1 - 0.6)); g.gain.exponentialRampToValueAtTime(0.0001, t1 + 0.4);
+      o.connect(g).connect(p).connect(lp); o.start(t0); o.stop(t1 + 0.45); } });
+  };
+  const PENTA = [0, 2, 4, 7, 9, 12, 14, 16, 19, 21, 24, 26, 28];
+  pad(0, at(TL.r0 + 4), [45, 52, 57, 60], 0.012, 900);
+  pad(at(TL.r0), at(TL.calm + 4), [41, 48, 53, 57, 60], 0.012, 1100);
+  pad(at(TL.calm), at(TL.end + 50), [48, 55, 60, 64, 67], 0.014, 1400);
+  // the table: a rising note per extended border, a drop on a fall back
+  for (let k = 0; k < M; k++) pluck(at(TL.p0 + 2 + k * 1.2), 67 + PENTA[k % 5], 0.02, (k / M - 0.5), 0.2, 'sine');
+  BUILD.forEach((e, q) => {
+    const t = at(TL.a0 + q * TL.step + 1);
+    if (e.ok) { pluck(t, 72 + PENTA[e.len], 0.05, 0, 0.35); pluck(at(TL.a0 + (q + 0.5) * TL.step), 84 + PENTA[e.set], 0.03, 0.2, 0.4, 'sine'); }
+    else if (e.jump !== undefined) { pluck(t, 57, 0.05, 0, 0.25, 'square'); pluck(t + 0.12, 64 + PENTA[e.jump], 0.04, 0, 0.3); }
+    else { pluck(t, 55, 0.05, 0, 0.18, 'square'); pluck(at(TL.a0 + (q + 0.5) * TL.step), 72, 0.025, 0.2, 0.3, 'sine'); }
+  });
+  // the race: naive on the left, KMP on the right
+  for (const [S, pan, base] of [[NAI, -0.55, 69], [KMP, 0.55, 76]]) {
+    S.ev.forEach((e, q) => {
+      const t = at(TL.r0 + q * TL.tick + 0.5);
+      if (e.match !== undefined) [0, 4, 7, 12].forEach((m, i) => pluck(t + i * 0.05, base + 3 + m, 0.05, pan, 1.0, 'sine'));
+      else if (e.ok) pluck(t, base + PENTA[Math.min(e.pj, 8)], 0.035, pan, 0.16);
+      else pluck(t, base - 26, 0.04, pan, 0.08, 'square');
+    });
+  }
+  [69, 72, 76, 81].forEach((m, i) => pluck(at(TL.calm) + i * 0.09, m, 0.06, -0.3 + i * 0.2, 1.6, 'sine'));
+  [76, 81, 84, 88].forEach((m, i) => pluck(at(TL.end + 10 + i * 6), m, 0.05, -0.45 + i * 0.3, 1.8, 'sine'));
+  const buf = await ac.startRendering();
+  let peak = 0; for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let k = 0; k < d.length; k++) peak = Math.max(peak, Math.abs(d[k])); }
+  const norm = 0.85 / Math.max(peak, 1e-6);                          // every piece peaks at the same level
+  for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let k = 0; k < d.length; k++) d[k] *= norm; }
+  return buf;
+}
+
+/* ==========================================================================
+   VERTICAL CUT — shared block, identical in every piece.
+   1080x1920 for Reels, Shorts and TikTok (__motion.variants.vertical). The
+   piece's own scene code is re-used and recomposed for a phone: everything a
+   viewer must read stays inside the area no platform covers (x 60..900,
+   y 230..1400); outside it there is only dimmed texture.
+   ========================================================================== */
+const VW = 1080, VH = 1920, SAFE = { x: 60, y: 230, w: 840, h: 1170, r: 900, b: 1400 };
+const vcv = document.createElement('canvas'); vcv.width = VW; vcv.height = VH;
+const vx = vcv.getContext('2d', { willReadFrequently: true });   // CPU raster: identical pixels on every redraw
+const VL = 96, VR = 864;                                          // text column inside the safe area
+
+function vReset() {
+  vx.setTransform(1, 0, 0, 1, 0, 0); vx.globalAlpha = 1; vx.globalCompositeOperation = 'source-over';
+  vx.filter = 'none'; vx.shadowBlur = 0; vx.shadowColor = 'transparent'; vx.letterSpacing = '0px'; vx.setLineDash([]);
+  vx.textAlign = 'left'; vx.textBaseline = 'alphabetic'; vx.lineCap = 'butt'; vx.lineJoin = 'miter';
+}
+/** Canvas text on the vertical frame; `max` shrinks the size until the line fits. */
+function vText(str, x, y, { size = 40, weight = 700, color = '#FFFFFF', align = 'left', spacing = 0, alpha = 1, fam = FONT, max = 0 } = {}) {
+  if (alpha <= 0.002 || !str) return size;
+  vx.font = `${weight} ${size}px ${fam}`; vx.letterSpacing = spacing + 'px';
+  if (max) { const w = vx.measureText(str).width; if (w > max) { size = size * max / w; vx.font = `${weight} ${size}px ${fam}`; } }
+  vx.textAlign = align; vx.textBaseline = 'alphabetic';
+  const a0 = vx.globalAlpha; vx.globalAlpha = a0 * alpha; vx.fillStyle = color;
+  vx.fillText(str, x + (align === 'center' ? spacing / 2 : align === 'right' ? spacing : 0), y);   // tracking is added after the last glyph too
+  vx.globalAlpha = a0; vx.letterSpacing = '0px';
+  return size;
+}
+/** Word-wraps with the given font; returns the lines. */
+function vWrap(str, maxW, size, weight = 700, fam = FONT) {
+  vx.font = `${weight} ${size}px ${fam}`; vx.letterSpacing = '0px';
+  const words = str.split(' '), lines = []; let cur = '';
+  for (const w of words) { const t = cur ? cur + ' ' + w : w; if (vx.measureText(t).width > maxW && cur) { lines.push(cur); cur = w; } else cur = t; }
+  if (cur) lines.push(cur);
+  return lines;
+}
+/** Fade envelope with a small rise: [alpha, dy]. */
+function vEnv(v, a, b, fin = 8, fout = 8) {
+  const i = E.outCubic(prog(v, a, a + fin)), o = 1 - E.inCubic(prog(v, b - fout, b));
+  return [Math.min(i, o), (1 - i) * 22 - (1 - o) * 10];
+}
+/** Which segment of a cut list a vertical frame is in: segs = [{ at, src, len }] in frames. */
+function vSeg(segs, v) {
+  let k = 0; while (k < segs.length - 1 && v >= segs[k + 1].at) k++;
+  const s = segs[k];
+  return { k, s, local: v - s.at, src: s.src + (v - s.at) };
+}
+/** Dims everything outside the safe area to a quiet texture (brightness x 0.2), with a soft inner edge. */
+function vShade(rgb, a = 0.8, feather = 40) {
+  vx.save(); vx.setTransform(1, 0, 0, 1, 0, 0); vx.globalAlpha = 1; vx.globalCompositeOperation = 'source-over';
+  vx.fillStyle = `rgba(${rgb},${a})`;
+  vx.beginPath(); vx.rect(0, 0, VW, VH); vx.rect(SAFE.x, SAFE.y, SAFE.w, SAFE.h); vx.fill('evenodd');
+  const strip = (x0, y0, x1, y1, rx, ry, rw, rh) => {
+    const g = vx.createLinearGradient(x0, y0, x1, y1);
+    g.addColorStop(0, `rgba(${rgb},${a})`); g.addColorStop(1, `rgba(${rgb},0)`);
+    vx.fillStyle = g; vx.fillRect(rx, ry, rw, rh);
+  };
+  strip(SAFE.x, 0, SAFE.x + feather, 0, SAFE.x, SAFE.y, feather, SAFE.h);
+  strip(SAFE.r, 0, SAFE.r - feather, 0, SAFE.r - feather, SAFE.y, feather, SAFE.h);
+  strip(0, SAFE.y, 0, SAFE.y + feather, SAFE.x, SAFE.y, SAFE.w, feather);
+  strip(0, SAFE.b, 0, SAFE.b - feather, SAFE.x, SAFE.b - feather, SAFE.w, feather);
+  vx.restore();
+}
+/** Series tag at the top of the safe area, e.g. MADE IN CODE · 04. */
+function vTag(label, color, alpha = 1) {
+  vText('MADE IN CODE', VL, 292, { size: 28, weight: 800, color, spacing: 5, alpha });
+  vx.font = `800 28px ${FONT}`; vx.letterSpacing = '5px';
+  const w = vx.measureText('MADE IN CODE').width; vx.letterSpacing = '0px';
+  vText('·  ' + label, VL + w + 14, 292, { size: 28, weight: 600, color: 'rgba(255,255,255,0.72)', spacing: 3, alpha, max: VR - VL - w - 14 });
+}
+/** Big hook lines, left-aligned from y0; visible from frame 0, settles in a few frames. */
+function vHook(v, lines, y0, { size = 84, lh = 1.08, color = '#FFFFFF', accent = null, weight = 800, spacing = -1.5, alpha = 1 } = {}) {
+  const k = E.outExpo(prog(v, -6, 12));
+  lines.forEach((ln, i) => {
+    const kk = E.outExpo(prog(v, -12 + i * 2, 8 + i * 2));
+    vText(ln, VL, y0 + i * size * lh + (1 - kk) * 30, { size, weight, spacing, color: accent && i === lines.length - 1 ? accent : color, alpha: alpha * Math.max(0.25, kk), max: VR - VL });
+  });
+  return k;
+}
+/** Closing card, the last 60 frames: piece title, "drawn in code · bytepatterns.com". l = frames into the card. */
+function vEndCard(l, { title, line = '', ink = '#FFFFFF', dim = 'rgba(255,255,255,0.66)', accent = '#FFFFFF', scrim = '0,0,0', a = 0.84 }) {
+  const k = E.outCubic(prog(l, 0, 12));
+  vx.save(); vx.setTransform(1, 0, 0, 1, 0, 0);
+  vx.fillStyle = `rgba(${scrim},${a * k})`; vx.fillRect(0, 0, VW, VH);
+  vx.restore();
+  const t1 = E.outExpo(prog(l, 3, 19)), t2 = E.outExpo(prog(l, 11, 27)), t3 = E.outExpo(prog(l, 19, 35));
+  vx.fillStyle = accent; vx.globalAlpha = t1; vx.fillRect(VL, 742, 88 * t1, 7); vx.globalAlpha = 1;
+  const size = vText(title, VL, 850 + (1 - t1) * 40, { size: 92, weight: 800, color: ink, spacing: -2, alpha: t1, max: VR - VL });
+  const y2 = 850 + Math.max(size, 60) * 0.25 + 70;
+  vx.font = `600 44px ${FONT}`;
+  const lead = 'drawn in code  ·  ', lw = vx.measureText(lead).width;
+  vText(lead, VL, y2 + (1 - t2) * 24, { size: 44, weight: 600, color: dim, alpha: t2 });
+  vText('bytepatterns.com', VL + lw, y2 + (1 - t2) * 24, { size: 44, weight: 800, color: accent, alpha: t2 });
+  if (line) vText(line, VL, y2 + 72 + (1 - t3) * 18, { size: 32, weight: 500, color: dim, alpha: t3, max: VR - VL });
+}
+/** Seeks a cut. The first frame a page draws is drawn twice: the very first read of a
+ *  GPU-backed source canvas can come out a shade different from every later one. */
+let vWarm = false;
+function vSeek(draw, i, frames) {
+  const f = Math.max(0, Math.min(frames - 1, Math.floor(i)));
+  if (!vWarm) { vWarm = true; draw(f); }
+  draw(f);
+}
+/** The soundtrack of a cut: the piece's own audio() spliced to the same segments as the picture. */
+async function vAudio(segs, frames, { xf = 0.025, fadeOut = 0.6, extra = null } = {}) {
+  const src = await renderAudio();
+  const SR = 48000, dur = frames / FPS, ac = new OfflineAudioContext(2, Math.round(SR * dur), SR);
+  const out = ac.createGain(); out.connect(ac.destination);
+  out.gain.setValueAtTime(1, 0); out.gain.setValueAtTime(1, dur - fadeOut); out.gain.linearRampToValueAtTime(0, dur - 0.01);
+  segs.forEach((s, k) => {
+    const at = s.at / FPS, off = s.src / FPS, d = s.len / FPS;
+    const pre = k === 0 ? 0 : Math.min(xf, off), post = k === segs.length - 1 ? 0 : xf;
+    const b = ac.createBufferSource(), g = ac.createGain(); b.buffer = src;
+    g.gain.setValueAtTime(pre ? 0 : 1, at - pre);
+    if (pre) g.gain.linearRampToValueAtTime(1, at + pre);
+    if (post) { g.gain.setValueAtTime(1, at + d - post); g.gain.linearRampToValueAtTime(0, at + d + post); }
+    b.connect(g).connect(out); b.start(at - pre, off - pre, d + pre + post);
+  });
+  if (extra) extra(ac, out);
+  const buf = await ac.startRendering();
+  let peak = 0; for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) peak = Math.max(peak, Math.abs(d[i])); }
+  if (peak > 0.9) for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) d[i] *= 0.9 / peak; }
+  return buf;
+}
+/** A soft three-partial bell, for the closing card. */
+function vChime(ac, dest, at, freq, vol = 0.08) {
+  for (const [mul, v, dec] of [[1, 1, 1.8], [2.01, 0.35, 0.8], [3.02, 0.12, 0.4]]) {
+    const o = ac.createOscillator(), g = ac.createGain(); o.type = 'sine'; o.frequency.value = freq * mul;
+    g.gain.setValueAtTime(0.0001, at); g.gain.exponentialRampToValueAtTime(vol * v, at + 0.006); g.gain.exponentialRampToValueAtTime(0.0001, at + dec);
+    o.connect(g).connect(dest); o.start(at); o.stop(at + dec + 0.05);
+  }
+}
+
+/* VERTICAL CUT — this piece */
+// The same table and the same two searches on a 1080 x 1920 stage and a faster clock; the text
+// is too long for a phone's width, so each lane shows a window of it that follows its own pointer.
+const TLV = buildTL({ p0: 34, a0: 52, step: 13, holdA: 18, moveT: 24, tick: 2.0, hold: 16, calmT: 52 });
+const VFR = TLV.end + 60, VEND = VFR - 60;
+const GV = { TL: TLV, w: VW, h: VH, pill: 28,
+  A: { x0: VR - M * 72, cw: 72, ch: 80, yA: 640, yB: 760, yF: 900, py: 1030, letter: 48, px: VL, pAlign: 'left' },
+  F: { x0: VR - M * 60, cw: 60, ch: 52, y: 1236, size: 30 },
+  tx0: VL, cw: 54, ch: 58, letter: 32, win: 14, clip: [VL - 6, VR + 6], cx: VR,
+  L: [{ ly: 560, y: 640, py: 706, px: VL, pyL: 790 }, { ly: 870, y: 950, py: 1016, px: VL, pyL: 1100 }],
+  pAlign: 'left',
+  capX: VL, capY: 390, cap: 46, capTwo: true, capMax: VR - VL,
+  fo: 28, foX: VL, foY: 1346, foAlign: 'left', foX2: VL, foY2: 1384, foAlign2: 'left',
+  fn: 72, fnX: VL, fnY: 800, fnAlign: 'left', fnMax: VR - VL };
+function hookV(v) {
+  const o = 1 - E.inCubic(prog(v, TLV.p0 - 10, TLV.p0 + 4));
+  if (o <= 0) return;
+  vx.save(); vx.fillStyle = `rgba(${C.bgRGB},${0.86 * o})`; vx.fillRect(SAFE.x, 400, SAFE.w, 560); vx.restore();
+  vHook(v, ['Find a word', 'in a text', 'and never', 'step back.'], 510, { size: 104, accent: C.accent, color: C.paper, weight: 900, spacing: -2, alpha: o });
+}
+function vDraw(v) {
+  if (vx.reset) vx.reset();
+  vReset();
+  vx.fillStyle = C.bg; vx.fillRect(0, 0, VW, VH);
+  scene(vx, GV, v);
+  hookV(v);
+  vReset();
+  vShade(C.bgRGB, 0.86);
+  vTag('KMP STRING SEARCH', C.accent);
+  if (v >= VEND) vEndCard(v - VEND, { title: 'KMP: Never Step Back', line: `pattern ${M}  ·  text ${N}  ·  ${KC} comparisons, not ${NC}`,
+    ink: C.paper, dim: 'rgba(241,238,230,0.72)', accent: C.accent, scrim: C.bgRGB, a: 0.88 });
+  vReset();
+}
+
+// The player asks for a frame on every display refresh; at 30 fps on a 60 Hz screen every other call
+// asks for the frame already on the canvas, which is then left as it is (same frame, same pixels).
+const shown = { L: -1, V: -1 };
+window.__motion = {
+  title: 'KMP: Never Step Back',
+  description: `The ${M}-letter pattern ${P} builds its failure table (${FAIL.join(' ')}) in ${BUILD.length} comparisons, then both searches scan a ${N}-letter text: naive slides one letter and starts over, stepping its text pointer back ${NAI.back} letters in ${NC} comparisons, while KMP slides by the table, never steps back and ${SAME ? 'finds the same' : 'finds'} ${word(MK.length)} matches (at ${MK.join(', ')}${OVERLAP ? ', two of them overlapping' : ''}) in ${KC}.`,
+  fps: FPS, width: W, height: H, frames: FRAMES,
+  poster: Math.round(TLL.r0 + TLL.tick * KC * 0.62),
+  gifStart: Math.floor(TLL.r0 / FPS),
+  seek(i) { const f = Math.max(0, Math.min(FRAMES - 1, Math.floor(i))); if (f !== shown.L) { shown.L = f; draw(f); } },
+  audio: () => renderAudio(TLL, FRAMES),
+  variants: {
+    vertical: {
+      width: VW, height: VH, frames: VFR, canvas: vcv,
+      poster: Math.round(TLV.r0 + TLV.tick * KC * 0.62), gifStart: Math.floor(TLV.r0 / FPS),
+      seek(i) { const v = Math.max(0, Math.min(VFR - 1, Math.floor(i))); if (v !== shown.V) { shown.V = v; vSeek(vDraw, v, VFR); } },
+      audio: () => renderAudio(TLV, VFR),
+    },
+  },
+};
+
+
+/* ==========================================================================
+   PLAYER — identical in every piece; keep as is.
+   Autoplays and loops, starts sound on the first click, ?frame=N pauses on a
+   frame, ?variant=vertical plays the vertical cut (if the piece has one).
+   When the renderer sets window.__MOTION_RENDER__ it stays out of the way.
+   ========================================================================== */
+(function player() {
+  const btn = document.getElementById('sound'), q = new URLSearchParams(location.search);
+  let M = window.__motion;
+  const V = !window.__MOTION_RENDER__ && M.variants && M.variants[q.get('variant')];
+  if (V) {                                                // show the variant's own canvas instead
+    M = Object.assign({}, M, V);
+    V.canvas.style.cssText = `width:min(100vw,calc(100vh*${V.width}/${V.height}));height:auto;aspect-ratio:${V.width}/${V.height}`;
+    document.querySelector('canvas').replaceWith(V.canvas);
+  }
+  const dur = M.frames / M.fps;
+  if (window.__MOTION_RENDER__) { btn.hidden = true; M.seek(0); return; }
+  if (q.has('frame')) { btn.hidden = true; M.seek(+q.get('frame') || 0); return; }
+  let t0 = performance.now(), ac = null, src = null, buf = null, paused = false, pausedAt = 0;
+  const clock = () => ac && src ? (ac.currentTime - t0) : (performance.now() - t0) / 1000;
+  function loop() {
+    if (!paused) M.seek(Math.floor(((clock() % dur) + dur) % dur * M.fps));
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+  btn.addEventListener('click', async () => {
+    if (src) { src.stop(); src = null; btn.textContent = 'Click for sound'; t0 = performance.now(); return; }
+    btn.textContent = 'Loading sound…';
+    ac = ac || new AudioContext({ sampleRate: 48000 });
+    buf = buf || await M.audio();
+    await ac.resume();
+    src = ac.createBufferSource(); src.buffer = buf; src.loop = true; src.connect(ac.destination);
+    t0 = ac.currentTime + 0.05; src.start(t0);        // picture restarts from frame 0 in sync with the sound
+    btn.textContent = 'Sound on — click to mute';
+  });
+  addEventListener('keydown', e => {
+    if (e.code !== 'Space') return;
+    e.preventDefault(); paused = !paused;
+    if (ac) paused ? ac.suspend() : ac.resume();
+    if (!ac) { if (paused) pausedAt = performance.now(); else t0 += performance.now() - pausedAt; }
+  });
+})();
+</script>
+</body>
+</html>

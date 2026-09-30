@@ -1,0 +1,597 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="author" content="teambytepatterns">
+<meta name="description" content="Forty thousand visits are hashed into 64 five-bit registers: the first six bits of each hash pick a register, which keeps the longest run of leading zeros it has seen, and the harmonic mean of the registers estimates the number of distinct visitors within a few percent from 40 bytes, where an exact list would take over a hundred kilobytes.">
+<title>HyperLogLog: Count Without Remembering — motion-lab</title>
+<style>
+  /* Player chrome. The piece itself lives entirely in the canvas. */
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  body { display: grid; place-items: center; font: 500 15px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #fff; }
+  canvas { display: block; width: min(100vw, calc(100vh * 16 / 9)); height: auto; aspect-ratio: 16 / 9; }
+  #sound { position: fixed; left: 16px; bottom: 16px; padding: 8px 14px; border: 1px solid rgba(255,255,255,.35); border-radius: 999px;
+           background: rgba(0,0,0,.55); color: #fff; font: inherit; cursor: pointer; }
+  #sound[hidden] { display: none; }
+</style>
+</head>
+<body>
+<canvas id="stage" width="1920" height="1080" aria-label="An eight by eight grid of numbered cells; a visitor id turns into a row of thirty-two bits, the first six pick a cell, a run of leading zeros in the rest sets its number; then tens of thousands of ids stream in, the cells brighten, and a yellow estimate line tracks a white line of the true count inside a shaded band"></canvas>
+<button id="sound" type="button">Click for sound</button>
+<script>
+'use strict';
+/* ==========================================================================
+   PIECE — HyperLogLog: Count Without Remembering.
+   How many distinct visitors are in a stream, without keeping a list of
+   them? Hash every id to 32 bits. The first p = 6 bits pick one of m = 64
+   registers; in the other 26 bits count the leading zeros and add one: the
+   rank. A run of k zeros turns up about once in 2^k hashes, so the longest
+   run a register has seen says roughly how many distinct ids reached it.
+   Each register keeps the largest rank it has seen (5 bits each); a repeat
+   of an id hashes the same and changes nothing. The count is the
+   bias-corrected harmonic mean  E = 0.709 * m^2 / sum(2^-register),  with
+   linear counting (m * ln(m / empty registers)) while E <= 2.5 m.
+   The stream comes from a fixed seed; every hash, every register change,
+   the exact distinct count and the estimate after every event are computed
+   once at load. A frame maps to a position in that record, so seek(i) is
+   pure in i.
+   ========================================================================== */
+const W = 1920, H = 1080, FPS = 30;
+const cv = document.getElementById('stage');
+const ctx = cv.getContext('2d', { willReadFrequently: true });   // CPU raster: identical pixels on every redraw
+const FONT = 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
+const MONO = 'ui-monospace, "Cascadia Code", Consolas, Menlo, monospace';
+
+// ---- helpers -------------------------------------------------------------
+function mulberry32(a) { return function () { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a);
+  t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const lerp = (a, b, t) => a + (b - a) * t;
+const prog = (f, a, b) => clamp((f - a) / (b - a));
+const smooth = t => t * t * (3 - 2 * t);
+const E = {
+  inCubic: t => t * t * t,
+  outCubic: t => 1 - Math.pow(1 - t, 3),
+  inOutCubic: t => t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2,
+  outExpo: t => t === 1 ? 1 : 1 - Math.pow(2, -10 * t),
+  inExpo: t => t === 0 ? 0 : Math.pow(2, 10 * t - 10),
+  inOutExpo: t => t === 0 ? 0 : t === 1 ? 1 : t < .5 ? Math.pow(2, 20 * t - 10) / 2 : (2 - Math.pow(2, -20 * t + 10)) / 2,
+  outBack: t => 1 + 2.70158 * Math.pow(t - 1, 3) + 1.70158 * Math.pow(t - 1, 2),
+};
+/** Canvas text; `max` shrinks the size until the line fits. Returns the width drawn. */
+function text(g, str, x, y, { size = 40, weight = 600, color = '#fff', alpha = 1, spacing = 0, align = 'left', fam = FONT, base = 'alphabetic', max = 0 } = {}) {
+  if (alpha <= 0.002 || !str) return 0;
+  g.font = `${weight} ${size}px ${fam}`; g.letterSpacing = spacing + 'px';
+  if (max) { const w0 = g.measureText(str).width; if (w0 > max) { size *= max / w0; g.font = `${weight} ${size}px ${fam}`; } }
+  g.textAlign = align; g.textBaseline = base;
+  const a0 = g.globalAlpha; g.globalAlpha = a0 * alpha; g.fillStyle = color;
+  g.fillText(str, x, y);
+  const w = g.measureText(str).width;
+  g.globalAlpha = a0; g.letterSpacing = '0px';
+  return w;
+}
+const measure = (g, str, size, weight = 800, fam = FONT, spacing = 0) => { g.font = `${weight} ${size}px ${fam}`; g.letterSpacing = spacing + 'px'; const w = g.measureText(str).width; g.letterSpacing = '0px'; return w; };
+const env = (f, a, b, fin = 12, fout = 10) => {
+  const i = E.outCubic(prog(f, a, a + fin)), o = 1 - E.inCubic(prog(f, b - fout, b));
+  return [Math.min(i, o), (1 - i) * 24 - (1 - o) * 10];
+};
+
+
+// ---- palette -------------------------------------------------------------
+const C = {
+  bg: '#0B0D14', bgRGB: '11,13,20', paper: '#F1EEE6', paperRGB: '241,238,230', dim: 'rgba(241,238,230,0.62)', faint: 'rgba(241,238,230,0.16)',
+  accent: '#FFC857', accentRGB: '255,200,87', idx: '#5CD6CB', idxRGB: '92,214,203', zero: '#FF8FA3', zeroRGB: '255,143,163', node: '#151A28',
+};
+
+// ---- the stream, the registers and the estimate, computed once --------------------------------
+const P = 6, M = 1 << P, TOTAL = 40000, ALPHA = 0.7213 / (1 + 1.079 / M), RB = 32 - P;
+const fmt = n => Math.round(n).toLocaleString('en-US');
+/** 32-bit hash of a string: FNV-1a, then the murmur3 finaliser to spread the bits. */
+function hash32(str) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 0x01000193); }
+  h ^= h >>> 16; h = Math.imul(h, 0x85ebca6b); h ^= h >>> 13; h = Math.imul(h, 0xc2b2ae35); h ^= h >>> 16;
+  return h >>> 0;
+}
+const IDS = (function () {
+  // visitors with favourites: low ids come back far more often than high ones
+  const R = mulberry32(0x6100), a = new Array(TOTAL);
+  for (let i = 0; i < TOTAL; i++) a[i] = 'u-' + (1000 + Math.floor(90000 * R() * R()));
+  a[4] = a[1];                                         // a returning visitor among the first few
+  return a;
+})();
+const HASH = new Uint32Array(TOTAL), REGI = new Uint8Array(TOTAL), RANK = new Uint8Array(TOTAL);
+const DIST = new Int32Array(TOTAL + 1), EST = new Float64Array(TOTAL + 1);
+const CH = [];                                         // register changes: { n (events so far), j, v, prev }
+const estimate = (sum, zeros) => { const e = ALPHA * M * M / sum; return e <= 2.5 * M && zeros > 0 ? M * Math.log(M / zeros) : e; };
+(function () {
+  const reg = new Uint8Array(M), seen = new Set();
+  let sum = M, zeros = M;
+  EST[0] = 0;
+  for (let i = 0; i < TOTAL; i++) {
+    const h = hash32(IDS[i]), j = h >>> RB, rest = (h << P) >>> 0, r = Math.min(Math.clz32(rest) + 1, RB + 1);
+    HASH[i] = h; REGI[i] = j; RANK[i] = r;
+    seen.add(IDS[i]); DIST[i + 1] = seen.size;
+    if (r > reg[j]) { CH.push({ n: i + 1, j, v: r, prev: reg[j] }); sum += Math.pow(2, -r) - Math.pow(2, -reg[j]); if (!reg[j]) zeros--; reg[j] = r; }
+    EST[i + 1] = estimate(sum, zeros);
+  }
+})();
+const TRUE = DIST[TOTAL], FINAL = EST[TOTAL], ERR = (FINAL / TRUE - 1) * 100, SE = 104 / Math.sqrt(M);
+const BITS = Math.ceil(Math.log2(RB + 2));            // a register must hold any rank 0..RB + 1
+const BYTES = M * BITS / 8, EXACT_KB = Math.round(TRUE * 4 / 1024);
+function regAt(n) { const r = new Uint8Array(M); for (const c of CH) { if (c.n > n) break; r[c.j] = c.v; } return r; }
+const bits = h => h.toString(2).padStart(32, '0');
+const SHOW = 6;                                        // events shown one by one
+const SHOWN = Array.from({ length: SHOW }, (_, k) => {
+  const before = regAt(k)[REGI[k]], rep = IDS.indexOf(IDS[k]) < k;
+  return { id: IDS[k], h: HASH[k], j: REGI[k], r: RANK[k], z: RANK[k] - 1, before, write: RANK[k] > before, rep };
+});
+
+// ---- timeline -------------------------------------------------------------------------------
+// grid at g0; event k shown over [a0 + k * it, a0 + (k + 1) * it); the stream runs c0..c1,
+// events processed growing exponentially from SHOW to TOTAL.
+function buildTL(o) {
+  const TL = Object.assign({}, o);
+  TL.a1 = TL.a0 + SHOW * TL.it; TL.c0 = TL.a1 + TL.gapC; TL.c1 = TL.c0 + TL.stream;
+  TL.calm = TL.c1 + TL.hold; TL.end = Math.round(TL.calm + TL.calmT);
+  const rep = SHOWN.findIndex(s => s.rep);
+  TL.caps = [
+    [TL.g0, TL.a0 + TL.it - 2, `Count distinct visitors without a list:|${M} registers, each one small number.`],
+    [TL.a0 + TL.it, TL.a0 + 3 * TL.it - 2, `Hash each id. The first ${P} bits pick a register;|in the rest, count the leading zeros, plus one.`],
+    [TL.a0 + 3 * TL.it, TL.a0 + rep * TL.it - 2, `A register keeps the longest run it has seen:|a run of k zeros turns up once in 2^k hashes.`],
+    [TL.a0 + rep * TL.it, TL.c0 - 2, `A returning visitor hashes the same way:|same register, same rank, nothing changes.`],
+    [TL.c0, Math.round(TL.c0 + TL.stream * 0.55) - 2, `${fmt(TOTAL)} events stream in; the harmonic mean|of 2^register turns the grid into a count.`],
+    [Math.round(TL.c0 + TL.stream * 0.55), TL.calm - 2, `Estimate ${fmt(FINAL)} for ${fmt(TRUE)} distinct:|off by ${Math.abs(ERR).toFixed(1)}%, from ${BYTES} bytes.`],
+  ];
+  return TL;
+}
+/** Events processed by frame f. */
+function eventsAt(TL, f) {
+  if (f < TL.a0) return 0;
+  if (f < TL.c0) return Math.min(SHOW, Math.floor((f - TL.a0) / TL.it + 1 - TL.wr));
+  const u = prog(f, TL.c0, TL.c1);
+  return Math.round(SHOW * Math.pow(TOTAL / SHOW, u));
+}
+
+// ---- drawing ------------------------------------------------------------------------------
+function grid(g, G, f, n, n0) {
+  const TL = G.TL, [a] = env(f, TL.g0, TL.end + 14, 16, 20);
+  if (a <= 0) return;
+  const reg = regAt(n), old = regAt(n0);
+  const k = f >= TL.a0 && f < TL.a1 ? Math.floor((f - TL.a0) / TL.it) : -1, l = k >= 0 ? (f - TL.a0) - k * TL.it : 0;
+  const hot = k >= 0 && l >= TL.it * 0.42 ? SHOWN[k].j : -1;
+  text(g, `${M} REGISTERS  ·  ${BITS} BITS EACH`, G.gx, G.gy - 22, { size: 28, weight: 700, color: C.dim, spacing: 3, alpha: a });
+  for (let j = 0; j < M; j++) {
+    const cx = G.gx + (j % 8) * G.cw, cy = G.gy + Math.floor(j / 8) * G.chh, v = reg[j];
+    const ia = a * E.outCubic(prog(f, TL.g0 + (j % 8 + Math.floor(j / 8)) * 0.8, TL.g0 + 14 + (j % 8 + Math.floor(j / 8)) * 0.8));
+    const flash = v !== old[j] ? 1 : 0, isHot = j === hot;
+    g.save(); g.globalAlpha = ia;
+    g.fillStyle = v ? `rgba(${C.accentRGB},${Math.min(0.62, 0.05 + v * 0.04)})` : C.node;
+    if (flash) g.fillStyle = `rgba(${C.accentRGB},0.85)`;
+    g.beginPath(); g.roundRect(cx + 3, cy + 3, G.cw - 6, G.chh - 6, 8); g.fill();
+    g.strokeStyle = isHot ? C.idx : C.faint; g.lineWidth = isHot ? 4 : 1.5; g.stroke(); g.restore();
+    text(g, String(v), cx + G.cw / 2, cy + G.chh / 2 + 1, { size: 28, weight: 800, color: flash ? C.bg : v ? C.paper : 'rgba(241,238,230,0.35)', align: 'center', base: 'middle', fam: MONO, alpha: ia });
+  }
+}
+function oneByOne(g, G, f) {
+  const TL = G.TL;
+  if (f < TL.a0 - 4 || f >= TL.a1 + 6) return;
+  const k = clamp(Math.floor((f - TL.a0) / TL.it), 0, SHOW - 1), l = (f - TL.a0) - k * TL.it, s = SHOWN[k], it = TL.it;
+  const a = Math.min(E.outCubic(prog(l, 0, 6)), 1 - E.inCubic(prog(l, it - 6, it)));
+  if (a <= 0) return;
+  const B = G.B, bs = bits(s.h);
+  // the id
+  const w = text(g, s.id, B.x, B.idY, { size: B.id, weight: 800, color: C.paper, fam: MONO, alpha: a });
+  text(g, s.rep ? '  seen before' : '  →  hash', B.x + w, B.idY, { size: 30, weight: 700, color: s.rep ? C.zero : C.dim, alpha: a * E.outCubic(prog(l, 4, 10)) });
+  // the bits, in a cascade
+  const zi = P + s.z;                                   // position of the first 1 after the index bits
+  for (let q = 0; q < 32; q++) {
+    const ka = E.outCubic(prog(l, 6 + q * 0.3, 10 + q * 0.3)); if (ka <= 0) continue;
+    const x = B.x + q * B.bw + (q >= P ? B.gap : 0), isIdx = q < P && l >= it * 0.42, isZ = q >= P && q < zi && l >= it * 0.6, isOne = q === zi && l >= it * 0.6;
+    g.save(); g.globalAlpha = a * ka;
+    g.fillStyle = isIdx ? `rgba(${C.idxRGB},0.3)` : isZ ? `rgba(${C.zeroRGB},0.3)` : isOne ? `rgba(${C.accentRGB},0.35)` : C.node;
+    g.beginPath(); g.roundRect(x + 1.5, B.y - B.bh / 2, B.bw - 3, B.bh, 5); g.fill();
+    g.strokeStyle = isIdx ? C.idx : isZ ? C.zero : isOne ? C.accent : C.faint; g.lineWidth = isIdx || isZ || isOne ? 2.5 : 1.2; g.stroke(); g.restore();
+    text(g, bs[q], x + B.bw / 2, B.y + 1 + (1 - ka) * -10, { size: 28, weight: 800, color: C.paper, align: 'center', base: 'middle', fam: MONO, alpha: a * ka });
+  }
+  // what the bits say
+  const la = a * E.outCubic(prog(l, it * 0.42, it * 0.42 + 6)), lb = a * E.outCubic(prog(l, it * 0.6, it * 0.6 + 6)), lc = a * E.outCubic(prog(l, it * 0.76, it * 0.76 + 6));
+  text(g, `register ${s.j}`, B.x, B.labY, { size: 30, weight: 800, color: C.idx, fam: MONO, alpha: la });
+  text(g, `${s.z} ${s.z === 1 ? 'zero' : 'zeros'} → rank ${s.r}`, B.x + P * B.bw + B.gap, B.labY2, { size: 30, weight: 800, color: C.zero, fam: MONO, alpha: lb });
+  const res = s.write ? `rank ${s.r} > ${s.before}:  register ${s.j} ← ${s.r}` : `rank ${s.r} ≤ ${s.before}:  no change`;
+  text(g, res, B.x, B.resY, { size: B.res, weight: 850, color: s.write ? C.accent : C.dim, alpha: lc, max: B.max });
+}
+function chart(g, G, f, n) {
+  const TL = G.TL, K = G.K, [a] = env(f, TL.c0 - 10, TL.end + 14, 18, 20);
+  if (a <= 0 || n < 1) return;
+  // the axes zoom out with the stream
+  const xm = Math.max(40, n * 1.04);
+  let ym = 10; for (let s = 0; s <= 60; s++) { const i = Math.round(n * s / 60); ym = Math.max(ym, DIST[i] * (1 + SE / 100), EST[i]); }
+  ym *= 1.12;
+  const X = v => K.x + v / xm * K.w, Y = v => K.y + K.h - v / ym * K.h;
+  const nice = v => { const p = Math.pow(10, Math.floor(Math.log10(v))), r = v / p; return (r <= 1 ? 1 : r <= 2 ? 2 : r <= 5 ? 5 : 10) * p; };
+  const yStep = nice(ym / 3.2), xStep = nice(xm / (G.T ? 2.6 : 3.6));
+  g.save(); g.globalAlpha = a;
+  g.strokeStyle = C.faint; g.lineWidth = 1.5;
+  for (let v = yStep; v < ym; v += yStep) { g.beginPath(); g.moveTo(K.x, Y(v)); g.lineTo(K.x + K.w, Y(v)); g.stroke(); }
+  g.strokeStyle = 'rgba(241,238,230,0.4)'; g.beginPath(); g.moveTo(K.x, K.y); g.lineTo(K.x, K.y + K.h); g.lineTo(K.x + K.w, K.y + K.h); g.stroke();
+  g.restore();
+  for (let v = yStep; v < ym; v += yStep) text(g, fmt(v), K.x - 14, Y(v) + 10, { size: 28, weight: 700, color: C.dim, align: 'right', fam: MONO, alpha: a });
+  for (let v = xStep; v < xm * 0.86; v += xStep) text(g, fmt(v), X(v), K.y + K.h + 38, { size: 28, weight: 700, color: C.dim, align: 'center', fam: MONO, alpha: a });
+  text(g, 'events', K.x + K.w, K.y + K.h + 38, { size: 28, weight: 700, color: C.dim, align: 'right', alpha: a * 0.9 });
+  // the expected band, the true count and the estimate
+  const S = 160, pts = Array.from({ length: S + 1 }, (_, s) => Math.round(n * s / S));
+  g.save(); g.globalAlpha = a; g.fillStyle = 'rgba(241,238,230,0.08)'; g.beginPath();
+  pts.forEach((i, s) => { const y = Y(DIST[i] * (1 + SE / 100)); s ? g.lineTo(X(i), y) : g.moveTo(X(i), y); });
+  for (let s = S; s >= 0; s--) g.lineTo(X(pts[s]), Y(DIST[pts[s]] * (1 - SE / 100)));
+  g.closePath(); g.fill();
+  g.lineJoin = 'round'; g.lineCap = 'round';
+  g.strokeStyle = C.paper; g.lineWidth = 3.5; g.beginPath(); pts.forEach((i, s) => { s ? g.lineTo(X(i), Y(DIST[i])) : g.moveTo(X(i), Y(DIST[i])); }); g.stroke();
+  g.strokeStyle = C.accent; g.lineWidth = 4.5; g.beginPath(); pts.forEach((i, s) => { s ? g.lineTo(X(i), Y(EST[i])) : g.moveTo(X(i), Y(EST[i])); }); g.stroke();
+  g.fillStyle = C.accent; g.beginPath(); g.arc(X(n), Y(EST[n]), 8, 0, Math.PI * 2); g.fill();
+  g.fillStyle = C.paper; g.beginPath(); g.arc(X(n), Y(DIST[n]), 6, 0, Math.PI * 2); g.fill();
+  g.restore();
+  // legend
+  const ly = K.y + 6;
+  text(g, `estimate ${fmt(EST[n])}`, K.x + 24, ly + 24, { size: 32, weight: 850, color: C.accent, fam: MONO, alpha: a });
+  text(g, `true ${fmt(DIST[n])}`, K.x + 24, ly + 64, { size: 32, weight: 850, color: C.paper, fam: MONO, alpha: a });
+  text(g, `band ±${SE.toFixed(0)}%`, K.x + 24, ly + 100, { size: 28, weight: 700, color: C.dim, fam: MONO, alpha: a });
+}
+function caption(g, G, f) {
+  for (const [t0, t1, str] of G.TL.caps) {
+    const [a, dy] = env(f, t0, t1, 10, 8); if (a <= 0) continue;
+    const [p1, p2] = str.split('|');
+    if (G.capTwo) {
+      text(g, p1, G.capX, G.capY + dy, { size: G.cap, weight: 850, color: C.paper, spacing: -1, alpha: a, max: G.capMax });
+      text(g, p2, G.capX, G.capY + G.cap * 1.14 + dy, { size: G.cap, weight: 850, color: C.accent, spacing: -1, alpha: a, max: G.capMax });
+    } else {
+      const w1 = measure(g, p1 + ' ', G.cap, 850, FONT, -1), w2 = measure(g, p2, G.cap, 850, FONT, -1), sc = Math.min(1, G.capMax / (w1 + w2));
+      const w = text(g, p1 + ' ', G.capX, G.capY + dy, { size: G.cap * sc, weight: 850, color: C.paper, spacing: -1, alpha: a });
+      text(g, p2, G.capX + w, G.capY + dy, { size: G.cap * sc, weight: 850, color: C.accent, spacing: -1, alpha: a });
+    }
+  }
+}
+function readout(g, G, f, n) {
+  const TL = G.TL, [a] = env(f, TL.g0, TL.calm, 12, 10);
+  if (a <= 0) return;
+  text(g, `events ${fmt(n)}  ·  distinct ${fmt(DIST[n])}`, G.foX, G.foY, { size: G.fo, weight: 700, color: C.paper, fam: MONO, alpha: a, align: G.foAlign });
+  text(g, `estimate ${fmt(EST[n])}  ·  ${BYTES} bytes`, G.foX2, G.foY2, { size: G.fo, weight: 700, color: C.dim, fam: MONO, alpha: a, align: G.foAlign2 });
+}
+function finale(g, G, f) {
+  const TL = G.TL, k1 = E.outCubic(prog(f, TL.calm, TL.calm + 18)), k2 = E.outCubic(prog(f, TL.calm + 10, TL.calm + 28));
+  if (k1 <= 0) return;
+  const out = 1 - E.inCubic(prog(f, TL.end - 6, TL.end + 12));
+  g.save(); g.fillStyle = `rgba(${C.bgRGB},${0.86 * k1 * out})`; g.fillRect(0, G.fnY - G.fn * 1.2, G.w, G.fn * 2.9); g.restore();
+  text(g, `${BYTES} bytes, not ${EXACT_KB} KB.`, G.fnX, G.fnY, { size: G.fn, weight: 900, color: C.paper, spacing: -2, align: G.fnAlign, alpha: k1 * out, max: G.fnMax });
+  text(g, `${fmt(TRUE)} distinct, estimated ${fmt(FINAL)}  ·  off by ${Math.abs(ERR).toFixed(1)}%`, G.fnX, G.fnY + G.fn * 1.05, { size: G.fn * 0.5, weight: 850, color: C.accent, spacing: -1, align: G.fnAlign, alpha: k2 * out, max: G.fnMax });
+}
+function scene(g, G, f) {
+  const n = eventsAt(G.TL, f), n0 = eventsAt(G.TL, f - 3);
+  grid(g, G, f, n, n0); oneByOne(g, G, f); chart(g, G, f, n);
+  caption(g, G, f); readout(g, G, f, n); finale(g, G, f);
+}
+
+// ---- landscape picture ------------------------------------------------------------------
+// wr: fraction of an event's slot after which its register is written
+const TLL = buildTL({ g0: 40, a0: 62, it: 44, wr: 0.76, gapC: 8, stream: 300, hold: 22, calmT: 80 });
+const FRAMES = TLL.end + 72;
+const GL = { TL: TLL, w: W, h: H, T: false, gx: 120, gy: 340, cw: 68, chh: 66,
+  B: { x: 790, idY: 420, id: 60, y: 540, bw: 30, bh: 50, gap: 16, labY: 620, labY2: 664, resY: 760, res: 46, max: 1000 },
+  K: { x: 900, y: 320, w: 880, h: 520 },
+  capX: 120, capY: 216, cap: 50, capTwo: false, capMax: 1680,
+  fo: 30, foX: 120, foY: 1004, foAlign: 'left', foX2: 1800, foY2: 1004, foAlign2: 'right',
+  fn: 100, fnX: W / 2, fnY: 600, fnAlign: 'center', fnMax: 1680 };
+function hookL(f) {
+  const o = 1 - E.inCubic(prog(f, TLL.g0 - 14, TLL.g0 + 4));
+  if (o <= 0) return;
+  const k = E.outExpo(prog(f, -8, 10)), k2 = E.outBack(prog(f, -6, 12));
+  ctx.save(); ctx.fillStyle = `rgba(${C.bgRGB},${0.8 * o})`; ctx.fillRect(0, 400, W, 330); ctx.restore();
+  text(ctx, 'Count distinct visitors', W / 2, 540 + (1 - k) * 30, { size: 108, weight: 900, color: C.paper, spacing: -3, align: 'center', alpha: o * Math.max(0.3, k), max: 1700 });
+  text(ctx, `in ${BYTES} bytes of memory.`, W / 2, 670 + (1 - clamp(k2)) * 30, { size: 108, weight: 900, color: C.accent, spacing: -3, align: 'center', alpha: o * Math.max(0.3, clamp(k2)) });
+}
+function draw(f) {
+  if (ctx.reset) ctx.reset();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; ctx.filter = 'none'; ctx.shadowBlur = 0;
+  ctx.fillStyle = C.bg; ctx.fillRect(0, 0, W, H);
+  const T = TLL, endK = E.inOutCubic(prog(f, T.end, T.end + 20)), a = 1 - endK;
+  scene(ctx, GL, f);
+  text(ctx, 'SYSTEMS  ·  PROBABILISTIC COUNTING', 120, 104, { size: 26, weight: 600, color: C.dim, spacing: 5, alpha: a });
+  text(ctx, 'BYTEPATTERNS', 1800, 104, { size: 26, weight: 600, color: C.dim, spacing: 5, align: 'right', alpha: a });
+  hookL(f);
+  if (endK > 0) {
+    ctx.fillStyle = `rgba(${C.bgRGB},${0.86 * endK})`; ctx.fillRect(0, 0, W, H);
+    const k1 = E.outCubic(prog(f, T.end + 6, T.end + 28)), k2 = E.outCubic(prog(f, T.end + 16, T.end + 38)), k3 = E.outCubic(prog(f, T.end + 26, T.end + 48));
+    text(ctx, 'HyperLogLog: Count Without Remembering', W / 2, 500 + (1 - k1) * 30, { size: 112, weight: 850, color: C.paper, spacing: -3, align: 'center', alpha: k1, max: 1680 });
+    text(ctx, `${fmt(TOTAL)} events  ·  ${fmt(TRUE)} distinct  ·  estimated ${fmt(FINAL)} from ${M} registers, ${BYTES} bytes`, W / 2, 580 + (1 - k2) * 20, { size: 42, weight: 500, color: C.accent, align: 'center', alpha: k2, max: 1680 });
+    text(ctx, 'drawn in code  ·  bytepatterns.com', W / 2, 1000, { size: 32, weight: 600, color: C.paper, spacing: 3, align: 'center', alpha: k3 * 0.8 });
+  }
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.letterSpacing = '0px';
+}
+
+// ---- sound: bits ticking in, a chime per register write, then a patter of writes as the stream runs ----
+async function renderAudio(TL = TLL, frames = FRAMES) {
+  const SR = 48000, dur = frames / FPS, LEN = Math.round(SR * dur);
+  const ac = new OfflineAudioContext(2, LEN, SR);
+  const at = fr => fr / FPS;
+  const comp = ac.createDynamicsCompressor();
+  comp.threshold.value = -16; comp.ratio.value = 3; comp.attack.value = 0.005; comp.release.value = 0.25;
+  const master = ac.createGain(); master.gain.value = 0.9; master.connect(comp).connect(ac.destination);
+  master.gain.setValueAtTime(0.9, dur - 1.0); master.gain.linearRampToValueAtTime(0.0001, dur - 0.02);
+  const rnd = mulberry32(0x61AD);
+  const ir = ac.createBuffer(2, SR * 2, SR);
+  for (let c = 0; c < 2; c++) { const d = ir.getChannelData(c); for (let k = 0; k < d.length; k++) d[k] = (rnd() * 2 - 1) * Math.pow(1 - k / d.length, 3); }
+  const verb = ac.createConvolver(); verb.buffer = ir; const vg = ac.createGain(); vg.gain.value = 0.28; verb.connect(vg).connect(master);
+  const hz = m => 440 * Math.pow(2, (m - 69) / 12);
+  const pluck = (t0, m, amp, pan, dec = 0.35, type = 'triangle') => {
+    const o = ac.createOscillator(), g = ac.createGain(), p = ac.createStereoPanner(); o.type = type; o.frequency.value = hz(m);
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(amp, t0 + 0.004); g.gain.exponentialRampToValueAtTime(0.0001, t0 + dec);
+    p.pan.value = pan; o.connect(g).connect(p); p.connect(master); p.connect(verb); o.start(t0); o.stop(t0 + dec + 0.05);
+  };
+  const pad = (t0, t1, notes, amp, cutoff) => {
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = cutoff; lp.Q.value = 1; lp.connect(master); lp.connect(verb);
+    notes.forEach((m, i) => { for (const det of [-6, 6]) {
+      const o = ac.createOscillator(), g = ac.createGain(), p = ac.createStereoPanner(); o.type = 'sawtooth'; o.frequency.value = hz(m); o.detune.value = det;
+      p.pan.value = (i / Math.max(1, notes.length - 1) - 0.5) * 0.8 * Math.sign(det);
+      g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(amp, t0 + 0.8); g.gain.setValueAtTime(amp, Math.max(t0 + 0.8, t1 - 0.6)); g.gain.exponentialRampToValueAtTime(0.0001, t1 + 0.4);
+      o.connect(g).connect(p).connect(lp); o.start(t0); o.stop(t1 + 0.45); } });
+  };
+  const PENTA = [0, 2, 4, 7, 9, 12, 14, 16, 19, 21, 24, 26, 28, 31, 33, 36];
+  pad(0, at(TL.c0 + 4), [45, 52, 57, 60], 0.012, 900);
+  pad(at(TL.c0), at(TL.calm + 4), [41, 48, 53, 57, 60], 0.012, 1200);
+  pad(at(TL.calm), at(TL.end + 50), [48, 55, 60, 64, 67], 0.014, 1400);
+  for (let j = 0; j < M; j += 4) pluck(at(TL.g0 + 4 + j * 0.25), 76 + PENTA[(j / 4) % 8], 0.015, (j % 8 / 8 - 0.5), 0.2, 'sine');
+  SHOWN.forEach((s, k) => {
+    const t0 = TL.a0 + k * TL.it;
+    for (let q = 0; q < 32; q += 2) pluck(at(t0 + 7 + q * 0.3), s.h >>> (31 - q) & 1 ? 88 : 81, 0.012, (q / 32 - 0.5), 0.05, 'sine');
+    pluck(at(t0 + TL.it * 0.42 + 1), 67, 0.04, 0, 0.3);
+    for (let z = 0; z <= s.z; z++) pluck(at(t0 + TL.it * 0.6 + 1) + z * 0.05, 64 + PENTA[z + 1], 0.035, 0.2, 0.25, 'sine');
+    if (s.write) [0, 4, 7].forEach((m, i) => pluck(at(t0 + TL.it * 0.76 + 1) + i * 0.04, 72 + m + PENTA[Math.min(s.r, 8)] - 12, 0.04, 0, 0.8, 'sine'));
+    else pluck(at(t0 + TL.it * 0.76 + 1), 57, 0.04, 0, 0.3, 'triangle');
+  });
+  // the stream: a note per register write, at the frame the write shows up
+  let q = 0;
+  for (let f = Math.ceil(TL.c0); f <= TL.c1 && q < CH.length; f++) {
+    const n = eventsAt(TL, f); let c = 0;
+    while (q < CH.length && CH[q].n <= n) { if (CH[q].n > SHOW && c < 3) { pluck(at(f) + c * 0.011, 60 + PENTA[Math.min(CH[q].v, 15)], 0.022, (CH[q].j % 8 / 7 - 0.5) * 1.2, 0.18, 'sine'); c++; } q++; }
+  }
+  [69, 72, 76, 81].forEach((m, i) => pluck(at(TL.calm) + i * 0.09, m, 0.06, -0.3 + i * 0.2, 1.6, 'sine'));
+  [76, 81, 84, 88].forEach((m, i) => pluck(at(TL.end + 10 + i * 6), m, 0.05, -0.45 + i * 0.3, 1.8, 'sine'));
+  const buf = await ac.startRendering();
+  let peak = 0; for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let k = 0; k < d.length; k++) peak = Math.max(peak, Math.abs(d[k])); }
+  const norm = 0.85 / Math.max(peak, 1e-6);                          // every piece peaks at the same level
+  for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let k = 0; k < d.length; k++) d[k] *= norm; }
+  return buf;
+}
+
+/* ==========================================================================
+   VERTICAL CUT — shared block, identical in every piece.
+   1080x1920 for Reels, Shorts and TikTok (__motion.variants.vertical). The
+   piece's own scene code is re-used and recomposed for a phone: everything a
+   viewer must read stays inside the area no platform covers (x 60..900,
+   y 230..1400); outside it there is only dimmed texture.
+   ========================================================================== */
+const VW = 1080, VH = 1920, SAFE = { x: 60, y: 230, w: 840, h: 1170, r: 900, b: 1400 };
+const vcv = document.createElement('canvas'); vcv.width = VW; vcv.height = VH;
+const vx = vcv.getContext('2d', { willReadFrequently: true });   // CPU raster: identical pixels on every redraw
+const VL = 96, VR = 864;                                          // text column inside the safe area
+
+function vReset() {
+  vx.setTransform(1, 0, 0, 1, 0, 0); vx.globalAlpha = 1; vx.globalCompositeOperation = 'source-over';
+  vx.filter = 'none'; vx.shadowBlur = 0; vx.shadowColor = 'transparent'; vx.letterSpacing = '0px'; vx.setLineDash([]);
+  vx.textAlign = 'left'; vx.textBaseline = 'alphabetic'; vx.lineCap = 'butt'; vx.lineJoin = 'miter';
+}
+/** Canvas text on the vertical frame; `max` shrinks the size until the line fits. */
+function vText(str, x, y, { size = 40, weight = 700, color = '#FFFFFF', align = 'left', spacing = 0, alpha = 1, fam = FONT, max = 0 } = {}) {
+  if (alpha <= 0.002 || !str) return size;
+  vx.font = `${weight} ${size}px ${fam}`; vx.letterSpacing = spacing + 'px';
+  if (max) { const w = vx.measureText(str).width; if (w > max) { size = size * max / w; vx.font = `${weight} ${size}px ${fam}`; } }
+  vx.textAlign = align; vx.textBaseline = 'alphabetic';
+  const a0 = vx.globalAlpha; vx.globalAlpha = a0 * alpha; vx.fillStyle = color;
+  vx.fillText(str, x + (align === 'center' ? spacing / 2 : align === 'right' ? spacing : 0), y);   // tracking is added after the last glyph too
+  vx.globalAlpha = a0; vx.letterSpacing = '0px';
+  return size;
+}
+/** Word-wraps with the given font; returns the lines. */
+function vWrap(str, maxW, size, weight = 700, fam = FONT) {
+  vx.font = `${weight} ${size}px ${fam}`; vx.letterSpacing = '0px';
+  const words = str.split(' '), lines = []; let cur = '';
+  for (const w of words) { const t = cur ? cur + ' ' + w : w; if (vx.measureText(t).width > maxW && cur) { lines.push(cur); cur = w; } else cur = t; }
+  if (cur) lines.push(cur);
+  return lines;
+}
+/** Fade envelope with a small rise: [alpha, dy]. */
+function vEnv(v, a, b, fin = 8, fout = 8) {
+  const i = E.outCubic(prog(v, a, a + fin)), o = 1 - E.inCubic(prog(v, b - fout, b));
+  return [Math.min(i, o), (1 - i) * 22 - (1 - o) * 10];
+}
+/** Which segment of a cut list a vertical frame is in: segs = [{ at, src, len }] in frames. */
+function vSeg(segs, v) {
+  let k = 0; while (k < segs.length - 1 && v >= segs[k + 1].at) k++;
+  const s = segs[k];
+  return { k, s, local: v - s.at, src: s.src + (v - s.at) };
+}
+/** Dims everything outside the safe area to a quiet texture (brightness x 0.2), with a soft inner edge. */
+function vShade(rgb, a = 0.8, feather = 40) {
+  vx.save(); vx.setTransform(1, 0, 0, 1, 0, 0); vx.globalAlpha = 1; vx.globalCompositeOperation = 'source-over';
+  vx.fillStyle = `rgba(${rgb},${a})`;
+  vx.beginPath(); vx.rect(0, 0, VW, VH); vx.rect(SAFE.x, SAFE.y, SAFE.w, SAFE.h); vx.fill('evenodd');
+  const strip = (x0, y0, x1, y1, rx, ry, rw, rh) => {
+    const g = vx.createLinearGradient(x0, y0, x1, y1);
+    g.addColorStop(0, `rgba(${rgb},${a})`); g.addColorStop(1, `rgba(${rgb},0)`);
+    vx.fillStyle = g; vx.fillRect(rx, ry, rw, rh);
+  };
+  strip(SAFE.x, 0, SAFE.x + feather, 0, SAFE.x, SAFE.y, feather, SAFE.h);
+  strip(SAFE.r, 0, SAFE.r - feather, 0, SAFE.r - feather, SAFE.y, feather, SAFE.h);
+  strip(0, SAFE.y, 0, SAFE.y + feather, SAFE.x, SAFE.y, SAFE.w, feather);
+  strip(0, SAFE.b, 0, SAFE.b - feather, SAFE.x, SAFE.b - feather, SAFE.w, feather);
+  vx.restore();
+}
+/** Series tag at the top of the safe area, e.g. MADE IN CODE · 04. */
+function vTag(label, color, alpha = 1) {
+  vText('MADE IN CODE', VL, 292, { size: 28, weight: 800, color, spacing: 5, alpha });
+  vx.font = `800 28px ${FONT}`; vx.letterSpacing = '5px';
+  const w = vx.measureText('MADE IN CODE').width; vx.letterSpacing = '0px';
+  vText('·  ' + label, VL + w + 14, 292, { size: 28, weight: 600, color: 'rgba(255,255,255,0.72)', spacing: 3, alpha, max: VR - VL - w - 14 });
+}
+/** Big hook lines, left-aligned from y0; visible from frame 0, settles in a few frames. */
+function vHook(v, lines, y0, { size = 84, lh = 1.08, color = '#FFFFFF', accent = null, weight = 800, spacing = -1.5, alpha = 1 } = {}) {
+  const k = E.outExpo(prog(v, -6, 12));
+  lines.forEach((ln, i) => {
+    const kk = E.outExpo(prog(v, -12 + i * 2, 8 + i * 2));
+    vText(ln, VL, y0 + i * size * lh + (1 - kk) * 30, { size, weight, spacing, color: accent && i === lines.length - 1 ? accent : color, alpha: alpha * Math.max(0.25, kk), max: VR - VL });
+  });
+  return k;
+}
+/** Closing card, the last 60 frames: piece title, "drawn in code · bytepatterns.com". l = frames into the card. */
+function vEndCard(l, { title, line = '', ink = '#FFFFFF', dim = 'rgba(255,255,255,0.66)', accent = '#FFFFFF', scrim = '0,0,0', a = 0.84 }) {
+  const k = E.outCubic(prog(l, 0, 12));
+  vx.save(); vx.setTransform(1, 0, 0, 1, 0, 0);
+  vx.fillStyle = `rgba(${scrim},${a * k})`; vx.fillRect(0, 0, VW, VH);
+  vx.restore();
+  const t1 = E.outExpo(prog(l, 3, 19)), t2 = E.outExpo(prog(l, 11, 27)), t3 = E.outExpo(prog(l, 19, 35));
+  vx.fillStyle = accent; vx.globalAlpha = t1; vx.fillRect(VL, 742, 88 * t1, 7); vx.globalAlpha = 1;
+  const size = vText(title, VL, 850 + (1 - t1) * 40, { size: 92, weight: 800, color: ink, spacing: -2, alpha: t1, max: VR - VL });
+  const y2 = 850 + Math.max(size, 60) * 0.25 + 70;
+  vx.font = `600 44px ${FONT}`;
+  const lead = 'drawn in code  ·  ', lw = vx.measureText(lead).width;
+  vText(lead, VL, y2 + (1 - t2) * 24, { size: 44, weight: 600, color: dim, alpha: t2 });
+  vText('bytepatterns.com', VL + lw, y2 + (1 - t2) * 24, { size: 44, weight: 800, color: accent, alpha: t2 });
+  if (line) vText(line, VL, y2 + 72 + (1 - t3) * 18, { size: 32, weight: 500, color: dim, alpha: t3, max: VR - VL });
+}
+/** Seeks a cut. The first frame a page draws is drawn twice: the very first read of a
+ *  GPU-backed source canvas can come out a shade different from every later one. */
+let vWarm = false;
+function vSeek(draw, i, frames) {
+  const f = Math.max(0, Math.min(frames - 1, Math.floor(i)));
+  if (!vWarm) { vWarm = true; draw(f); }
+  draw(f);
+}
+/** The soundtrack of a cut: the piece's own audio() spliced to the same segments as the picture. */
+async function vAudio(segs, frames, { xf = 0.025, fadeOut = 0.6, extra = null } = {}) {
+  const src = await renderAudio();
+  const SR = 48000, dur = frames / FPS, ac = new OfflineAudioContext(2, Math.round(SR * dur), SR);
+  const out = ac.createGain(); out.connect(ac.destination);
+  out.gain.setValueAtTime(1, 0); out.gain.setValueAtTime(1, dur - fadeOut); out.gain.linearRampToValueAtTime(0, dur - 0.01);
+  segs.forEach((s, k) => {
+    const at = s.at / FPS, off = s.src / FPS, d = s.len / FPS;
+    const pre = k === 0 ? 0 : Math.min(xf, off), post = k === segs.length - 1 ? 0 : xf;
+    const b = ac.createBufferSource(), g = ac.createGain(); b.buffer = src;
+    g.gain.setValueAtTime(pre ? 0 : 1, at - pre);
+    if (pre) g.gain.linearRampToValueAtTime(1, at + pre);
+    if (post) { g.gain.setValueAtTime(1, at + d - post); g.gain.linearRampToValueAtTime(0, at + d + post); }
+    b.connect(g).connect(out); b.start(at - pre, off - pre, d + pre + post);
+  });
+  if (extra) extra(ac, out);
+  const buf = await ac.startRendering();
+  let peak = 0; for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) peak = Math.max(peak, Math.abs(d[i])); }
+  if (peak > 0.9) for (let c = 0; c < 2; c++) { const d = buf.getChannelData(c); for (let i = 0; i < d.length; i++) d[i] *= 0.9 / peak; }
+  return buf;
+}
+/** A soft three-partial bell, for the closing card. */
+function vChime(ac, dest, at, freq, vol = 0.08) {
+  for (const [mul, v, dec] of [[1, 1, 1.8], [2.01, 0.35, 0.8], [3.02, 0.12, 0.4]]) {
+    const o = ac.createOscillator(), g = ac.createGain(); o.type = 'sine'; o.frequency.value = freq * mul;
+    g.gain.setValueAtTime(0.0001, at); g.gain.exponentialRampToValueAtTime(vol * v, at + 0.006); g.gain.exponentialRampToValueAtTime(0.0001, at + dec);
+    o.connect(g).connect(dest); o.start(at); o.stop(at + dec + 0.05);
+  }
+}
+
+/* VERTICAL CUT — this piece */
+// The same stream on a 1080 x 1920 stage and a faster clock: the bits and then the chart above, the grid below.
+const TLV = buildTL({ g0: 32, a0: 46, it: 32, wr: 0.76, gapC: 6, stream: 214, hold: 14, calmT: 56 });
+const VFR = TLV.end + 60, VEND = VFR - 60;
+const GV = { TL: TLV, w: VW, h: VH, T: true, gx: VL, gy: 858, cw: 96, chh: 54,
+  B: { x: VL, idY: 560, id: 52, y: 650, bw: 23.5, bh: 44, gap: 8, labY: 722, labY2: 766, resY: 800, res: 36, max: VR - VL },
+  K: { x: VL + 110, y: 494, w: VR - VL - 110, h: 250 },
+  capX: VL, capY: 390, cap: 46, capTwo: true, capMax: VR - VL,
+  fo: 28, foX: VL, foY: 1346, foAlign: 'left', foX2: VL, foY2: 1384, foAlign2: 'left',
+  fn: 72, fnX: VL, fnY: 800, fnAlign: 'left', fnMax: VR - VL };
+function hookV(v) {
+  const o = 1 - E.inCubic(prog(v, TLV.g0 - 10, TLV.g0 + 4));
+  if (o <= 0) return;
+  vx.save(); vx.fillStyle = `rgba(${C.bgRGB},${0.86 * o})`; vx.fillRect(SAFE.x, 400, SAFE.w, 560); vx.restore();
+  vHook(v, ['Count', 'distinct', 'visitors in', `${BYTES} bytes.`], 510, { size: 104, accent: C.accent, color: C.paper, weight: 900, spacing: -2, alpha: o });
+}
+function vDraw(v) {
+  if (vx.reset) vx.reset();
+  vReset();
+  vx.fillStyle = C.bg; vx.fillRect(0, 0, VW, VH);
+  scene(vx, GV, v);
+  hookV(v);
+  vReset();
+  vShade(C.bgRGB, 0.86);
+  vTag('HYPERLOGLOG', C.accent);
+  if (v >= VEND) vEndCard(v - VEND, { title: 'HyperLogLog: Count Without Remembering', line: `${fmt(TRUE)} distinct, estimated ${fmt(FINAL)}  ·  ${M} registers, ${BYTES} bytes`,
+    ink: C.paper, dim: 'rgba(241,238,230,0.72)', accent: C.accent, scrim: C.bgRGB, a: 0.88 });
+  vReset();
+}
+
+// The player asks for a frame on every display refresh; at 30 fps on a 60 Hz screen every other call
+// asks for the frame already on the canvas, which is then left as it is (same frame, same pixels).
+const shown = { L: -1, V: -1 };
+window.__motion = {
+  title: 'HyperLogLog: Count Without Remembering',
+  description: `${fmt(TOTAL)} visits are hashed by visitor id into ${M} registers of ${BITS} bits (${BYTES} bytes): the first ${P} bits of each hash pick a register, which keeps the longest run of leading zeros it has seen, a returning visitor changes nothing, and the harmonic mean of the registers estimates ${fmt(FINAL)} distinct visitors against the true ${fmt(TRUE)}, off by ${Math.abs(ERR).toFixed(1)}% where about ±${SE.toFixed(0)}% is expected, while an exact list of 32-bit hashes would take ${EXACT_KB} KB.`,
+  fps: FPS, width: W, height: H, frames: FRAMES,
+  poster: Math.round(TLL.c0 + TLL.stream * 0.8),
+  gifStart: Math.floor(TLL.c0 / FPS) - 1,
+  seek(i) { const f = Math.max(0, Math.min(FRAMES - 1, Math.floor(i))); if (f !== shown.L) { shown.L = f; draw(f); } },
+  audio: () => renderAudio(TLL, FRAMES),
+  variants: {
+    vertical: {
+      width: VW, height: VH, frames: VFR, canvas: vcv,
+      poster: Math.round(TLV.c0 + TLV.stream * 0.8), gifStart: Math.floor(TLV.c0 / FPS) - 1,
+      seek(i) { const v = Math.max(0, Math.min(VFR - 1, Math.floor(i))); if (v !== shown.V) { shown.V = v; vSeek(vDraw, v, VFR); } },
+      audio: () => renderAudio(TLV, VFR),
+    },
+  },
+};
+
+
+/* ==========================================================================
+   PLAYER — identical in every piece; keep as is.
+   Autoplays and loops, starts sound on the first click, ?frame=N pauses on a
+   frame, ?variant=vertical plays the vertical cut (if the piece has one).
+   When the renderer sets window.__MOTION_RENDER__ it stays out of the way.
+   ========================================================================== */
+(function player() {
+  const btn = document.getElementById('sound'), q = new URLSearchParams(location.search);
+  let M = window.__motion;
+  const V = !window.__MOTION_RENDER__ && M.variants && M.variants[q.get('variant')];
+  if (V) {                                                // show the variant's own canvas instead
+    M = Object.assign({}, M, V);
+    V.canvas.style.cssText = `width:min(100vw,calc(100vh*${V.width}/${V.height}));height:auto;aspect-ratio:${V.width}/${V.height}`;
+    document.querySelector('canvas').replaceWith(V.canvas);
+  }
+  const dur = M.frames / M.fps;
+  if (window.__MOTION_RENDER__) { btn.hidden = true; M.seek(0); return; }
+  if (q.has('frame')) { btn.hidden = true; M.seek(+q.get('frame') || 0); return; }
+  let t0 = performance.now(), ac = null, src = null, buf = null, paused = false, pausedAt = 0;
+  const clock = () => ac && src ? (ac.currentTime - t0) : (performance.now() - t0) / 1000;
+  function loop() {
+    if (!paused) M.seek(Math.floor(((clock() % dur) + dur) % dur * M.fps));
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+  btn.addEventListener('click', async () => {
+    if (src) { src.stop(); src = null; btn.textContent = 'Click for sound'; t0 = performance.now(); return; }
+    btn.textContent = 'Loading sound…';
+    ac = ac || new AudioContext({ sampleRate: 48000 });
+    buf = buf || await M.audio();
+    await ac.resume();
+    src = ac.createBufferSource(); src.buffer = buf; src.loop = true; src.connect(ac.destination);
+    t0 = ac.currentTime + 0.05; src.start(t0);        // picture restarts from frame 0 in sync with the sound
+    btn.textContent = 'Sound on — click to mute';
+  });
+  addEventListener('keydown', e => {
+    if (e.code !== 'Space') return;
+    e.preventDefault(); paused = !paused;
+    if (ac) paused ? ac.suspend() : ac.resume();
+    if (!ac) { if (paused) pausedAt = performance.now(); else t0 += performance.now() - pausedAt; }
+  });
+})();
+</script>
+</body>
+</html>
